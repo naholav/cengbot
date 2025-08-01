@@ -182,7 +182,7 @@ training_data (
 
 ### Development Environment
 ```bash
-./scripts/dev_mode.sh      # Start development services
+./scripts/start_system.sh  # Start development services
 ./scripts/health_check.sh  # Monitor system health
 ```
 
@@ -197,14 +197,14 @@ training_data (
 
 ### Planned Features
 - Multi-model support
-- Advanced analytics dashboard
+- Analytics dashboard
 - Automated training pipeline
 - Real-time performance metrics
 
 ### Technical Improvements
 - Kubernetes orchestration
 - Redis caching layer
-- Advanced monitoring with Prometheus
+- Monitoring with Prometheus
 - CI/CD pipeline integration
 
-This architecture provides a robust, scalable foundation for CengBot while maintaining simplicity and maintainability.
+This architecture provides a scalable foundation for CengBot while maintaining simplicity and maintainability.

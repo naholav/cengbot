@@ -1,0 +1,8 @@
+# This directory is for application logs
+# Log files are excluded from git for security and size
+# Application will create these files automatically:
+# - admin.log
+# - bot.log  
+# - worker.log
+# - error.log
+# - system_monitor.log

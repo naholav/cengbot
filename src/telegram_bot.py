@@ -13,7 +13,7 @@ Features:
 - RabbitMQ integration for AI processing
 - SQLite database integration
 
-Author: Çukurova University Computer Engineering Department
+Author: naholav
 """
 
 import logging
@@ -65,7 +65,7 @@ def detect_language(text: str) -> str:
         return 'TR' if detected_lang == 'tr' else 'EN'
     except LangDetectException:
         logger.warning(f"Could not detect language for text: {text[:50]}...")
-        return 'TR'  # Default to Turkish for Çukurova University
+        return 'TR'  # Default to Turkish for Cukurova University
 
 
 def check_similarity(db: Session, question: str) -> List[tuple]:
@@ -74,7 +74,7 @@ def check_similarity(db: Session, question: str) -> List[tuple]:
     
     This function performs a basic similarity check by looking for questions
     that contain similar text patterns. In production, this could be enhanced
-    with more sophisticated similarity algorithms.
+    with other similarity algorithms.
     
     Args:
         db: Database session

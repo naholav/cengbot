@@ -30,7 +30,7 @@ chmod +x scripts/setup_system.sh
 ./scripts/setup_system.sh
 
 # 3. Configure environment
-cp config/env/.env.production .env
+cp .env.example .env
 nano .env  # Edit with your values
 
 # 4. Start system
@@ -91,7 +91,7 @@ cd ..
 #### Step 5: Configuration
 ```bash
 # Create environment file
-cp config/env/.env.production .env
+cp .env.example .env
 
 # Edit configuration
 nano .env
@@ -506,4 +506,14 @@ if ! ./scripts/health_check.sh; then
 fi
 ```
 
-This deployment guide provides a comprehensive approach to deploying CengBot in production environments with proper security, monitoring, and maintenance procedures.
+## 📝 Recent Updates
+
+### August 2025
+- **Model Version**: Active model updated to v1.2 with enhanced training on 22,000+ examples
+- **Training Configuration**: Updated training parameters for optimal performance with larger dataset
+- **Inference Enhancement**: System prompts updated to allow up to 4 sentences for more detailed responses
+- **Logging**: Training logs now organized in version-specific directories
+
+---
+
+This deployment guide provides an approach to deploying CengBot in production environments with security, monitoring, and maintenance procedures.

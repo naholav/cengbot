@@ -1,10 +1,14 @@
 import pika
 import json
 import logging
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from datetime import datetime
 from sqlalchemy.orm import Session
 from database_models import SessionLocal, RawData
 from llama_model_handler import model_instance
+from config.env_loader import load_config
 import time
 
 logging.basicConfig(
@@ -15,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 class RabbitMQWorker:
     def __init__(self):
+        self.config = load_config()
         self.connection = None
         self.channel = None
         self.connect()
@@ -23,13 +28,16 @@ class RabbitMQWorker:
         """Connect to RabbitMQ"""
         try:
             self.connection = pika.BlockingConnection(
-                pika.ConnectionParameters('localhost')
+                pika.ConnectionParameters(
+                    host=self.config.rabbitmq_host,
+                    port=self.config.rabbitmq_port
+                )
             )
             self.channel = self.connection.channel()
             
             # Declare queues
-            self.channel.queue_declare(queue='questions', durable=True)
-            self.channel.queue_declare(queue='answers', durable=True)
+            self.channel.queue_declare(queue=self.config.questions_queue, durable=True)
+            self.channel.queue_declare(queue=self.config.answers_queue, durable=True)
             
             logger.info("Connected to RabbitMQ")
         except Exception as e:
@@ -45,10 +53,17 @@ class RabbitMQWorker:
             
             db = SessionLocal()
             try:
-                # Get the raw data record
-                raw_data = db.query(RawData).filter(RawData.id == data['raw_data_id']).first()
+                # Get the raw data record with retry mechanism
+                raw_data = None
+                for attempt in range(5):  # Try up to 5 times
+                    raw_data = db.query(RawData).filter(RawData.id == data['raw_data_id']).first()
+                    if raw_data:
+                        break
+                    logger.warning(f"RawData with id {data['raw_data_id']} not found, attempt {attempt + 1}/5")
+                    time.sleep(0.1)  # Wait 100ms before retry
+                    
                 if not raw_data:
-                    logger.error(f"RawData with id {data['raw_data_id']} not found")
+                    logger.error(f"RawData with id {data['raw_data_id']} not found after 5 attempts")
                     ch.basic_ack(delivery_tag=method.delivery_tag)
                     return
                 

@@ -1,473 +1,553 @@
-import React, { useState, useEffect } from 'react';
-import { Table, Button, Modal, Input, message, Card, Statistic, Row, Col, Space, Tag, Tabs } from 'antd';
-import { CheckOutlined, EditOutlined, LikeOutlined, DislikeOutlined, DeleteOutlined, ExclamationCircleOutlined } from '@ant-design/icons';
-import axios from 'axios';
+import React, { useState } from 'react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
+import { Table, Button, Modal, Input, Card, Statistic, Row, Col, Space, Tag, Tabs, Popconfirm } from 'antd';
+import { 
+  CheckOutlined, 
+  EditOutlined, 
+  DeleteOutlined, 
+  ExclamationCircleOutlined,
+  LikeOutlined,
+  DislikeOutlined,
+  LogoutOutlined
+} from '@ant-design/icons';
+import type { ColumnsType } from 'antd/es/table';
+import { 
+  useRawData, 
+  useTrainingData, 
+  useStats, 
+  useUpdateAnswer,
+  useDeleteRawData,
+  useApproveToTraining,
+  useDeleteTrainingData
+} from './hooks/useApiQueries';
+import { RawDataItem, TrainingDataItem } from './types/api';
+import { AuthProvider, useAuth } from './contexts/AuthContext';
+import Login from './components/Login';
+import DocumentViewer from './components/DocumentViewer';
 import './App.css';
 
-const API_URL = 'http://localhost:8001';
+// Create a client
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: 1,
+      refetchOnWindowFocus: false,
+    },
+  },
+});
 
-interface RawData {
-  id: number;
-  telegram_id: number;
-  username: string;
-  question: string;
-  answer: string;
-  like: number | null;
-  admin_approved: number;
-  is_duplicate: boolean;
-  duplicate_of_id: number | null;
-  created_at: string;
-  answered_at: string;
-}
-
-interface TrainingData {
-  id: number;
-  question: string;
-  answer: string;
-  created_at: string;
-}
-
-interface Stats {
-  total_questions: number;
-  approved_questions: number;
-  liked_questions: number;
-  disliked_questions: number;
-  training_data_count: number;
-  duplicate_count: number;
-  approval_rate: string;
-}
-
-function App() {
-  const [data, setData] = useState<RawData[]>([]);
-  const [trainingData, setTrainingData] = useState<TrainingData[]>([]);
-  const [stats, setStats] = useState<Stats | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [trainingLoading, setTrainingLoading] = useState(false);
+function AppContent() {
+  const { isAuthenticated, logout } = useAuth();
+  const [activeTab, setActiveTab] = useState<string>('rawdata');
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editAnswer, setEditAnswer] = useState('');
-  const [activeTab, setActiveTab] = useState('rawdata');
+  
+  // Pagination states
+  const [rawDataPage, setRawDataPage] = useState(1);
+  const [rawDataPageSize, setRawDataPageSize] = useState(20);
+  const [trainingDataPage, setTrainingDataPage] = useState(1);
+  const [trainingDataPageSize, setTrainingDataPageSize] = useState(20);
+  
+  // Query hooks
+  const { data: rawDataResponse, isLoading: rawDataLoading } = useRawData(rawDataPage, rawDataPageSize, false);
+  const { data: trainingDataResponse, isLoading: trainingDataLoading } = useTrainingData(trainingDataPage, trainingDataPageSize);
+  const { data: stats } = useStats();
+  
+  // Mutation hooks
+  const updateAnswerMutation = useUpdateAnswer();
+  const deleteRawDataMutation = useDeleteRawData();
+  const approveToTrainingMutation = useApproveToTraining();
+  const deleteTrainingDataMutation = useDeleteTrainingData();
+  
+  if (!isAuthenticated) {
+    return <Login />;
+  }
 
-  useEffect(() => {
-    fetchData();
-    fetchStats();
-    fetchTrainingData();
-    // Auto refresh every 30 seconds
-    const interval = setInterval(() => {
-      fetchData();
-      fetchStats();
-      fetchTrainingData();
-    }, 30000);
-    return () => clearInterval(interval);
-  }, []);
-
-  const fetchData = async () => {
-    setLoading(true);
-    try {
-      const response = await axios.get(`${API_URL}/raw-data`);
-      setData(response.data);
-    } catch (error) {
-      message.error('Failed to load data!');
-      console.error(error);
-    }
-    setLoading(false);
-  };
-
-  const fetchTrainingData = async () => {
-    setTrainingLoading(true);
-    try {
-      const response = await axios.get(`${API_URL}/training-data`);
-      setTrainingData(response.data);
-    } catch (error) {
-      message.error('Failed to load training data!');
-      console.error(error);
-    }
-    setTrainingLoading(false);
-  };
-
-  const fetchStats = async () => {
-    try {
-      const response = await axios.get(`${API_URL}/stats`);
-      setStats(response.data);
-    } catch (error) {
-      console.error('Failed to load stats:', error);
-    }
-  };
-
-  const handleEdit = (record: RawData) => {
+  const handleEdit = (record: RawDataItem) => {
     setEditingId(record.id);
-    setEditAnswer(record.answer || '');
+    setEditAnswer(record.answer);
   };
 
   const handleSaveEdit = async () => {
-    if (!editingId) return;
+    if (editingId === null) return;
     
-    try {
-      await axios.put(`${API_URL}/raw-data/${editingId}`, {
-        answer: editAnswer
-      });
-      message.success('Answer updated successfully!');
-      setEditingId(null);
-      fetchData();
-    } catch (error) {
-      message.error('Update failed!');
-      console.error(error);
-    }
+    await updateAnswerMutation.mutateAsync({ id: editingId, answer: editAnswer });
+    setEditingId(null);
+    setEditAnswer('');
   };
 
-  const handleApprove = async (id: number) => {
-    Modal.confirm({
-      title: 'Approve Question',
-      content: 'Are you sure about the quality of this question-answer pair? It will be added to training data.',
-      okText: 'Yes, I\'m sure',
-      cancelText: 'Cancel',
-      onOk: async () => {
-        try {
-          await axios.post(`${API_URL}/approve/${id}`);
-          message.success('Added to training data!');
-          fetchData();
-          fetchStats();
-          fetchTrainingData();
-        } catch (error: any) {
-          message.error(error.response?.data?.detail || 'Approval failed!');
-        }
-      }
-    });
+  const handleCancelEdit = () => {
+    setEditingId(null);
+    setEditAnswer('');
   };
 
-  const handleDeleteTrainingData = async (id: number) => {
-    Modal.confirm({
-      title: 'Delete Training Data',
-      content: 'Are you sure you want to delete this training data? This action cannot be undone.',
-      okText: 'Yes, Delete',
-      cancelText: 'Cancel',
-      icon: <ExclamationCircleOutlined />,
-      okType: 'danger',
-      onOk: async () => {
-        try {
-          await axios.delete(`${API_URL}/training-data/${id}`);
-          message.success('Training data deleted successfully!');
-          fetchTrainingData();
-          fetchStats();
-        } catch (error: any) {
-          message.error(error.response?.data?.detail || 'Delete failed!');
-        }
-      }
-    });
+  const handleApprove = async (record: RawDataItem) => {
+    await approveToTrainingMutation.mutateAsync(record.id);
   };
 
-  const columns = [
+  const handleDeleteRawData = async (id: number) => {
+    await deleteRawDataMutation.mutateAsync(id);
+  };
+
+  const handleRemoveFromTraining = async (id: number) => {
+    await deleteTrainingDataMutation.mutateAsync(id);
+  };
+
+
+  const rawDataColumns: ColumnsType<RawDataItem> = [
     {
       title: 'ID',
       dataIndex: 'id',
       key: 'id',
-      width: 60,
-      sorter: (a: RawData, b: RawData) => a.id - b.id,
+      width: 50,
+      fixed: 'left',
     },
     {
       title: 'User',
       dataIndex: 'username',
       key: 'username',
-      width: 120,
-      render: (text: string) => text || 'Anonymous',
+      width: 100,
+      ellipsis: true,
+      render: (username: string) => username || <Tag color="default">Anon</Tag>,
+    },
+    {
+      title: 'T.ID',
+      dataIndex: 'telegram_id',
+      key: 'telegram_id',
+      width: 80,
+      ellipsis: true,
+    },
+    {
+      title: 'M.ID',
+      dataIndex: 'telegram_message_id',
+      key: 'telegram_message_id',
+      width: 70,
+      ellipsis: true,
     },
     {
       title: 'Question',
       dataIndex: 'question',
       key: 'question',
-      width: 300,
+      width: 250,
       ellipsis: true,
+      onCell: (record: RawDataItem) => ({
+        onDoubleClick: () => {
+          Modal.info({
+            title: 'Full Question',
+            content: record.question,
+            width: 600,
+          });
+        },
+      }),
     },
     {
       title: 'Answer',
       dataIndex: 'answer',
       key: 'answer',
-      width: 400,
+      width: 300,
       ellipsis: true,
-      render: (text: string, record: RawData) => {
+      render: (text: string, record: RawDataItem) => {
         if (editingId === record.id) {
           return (
-            <Space direction="vertical" style={{ width: '100%' }}>
-              <Input.TextArea
-                value={editAnswer}
-                onChange={(e) => setEditAnswer(e.target.value)}
-                rows={4}
-                placeholder="Edit the answer..."
-              />
-              <Space>
-                <Button size="small" type="primary" onClick={handleSaveEdit}>Save</Button>
-                <Button size="small" onClick={() => setEditingId(null)}>Cancel</Button>
-              </Space>
-            </Space>
+            <Input.TextArea
+              value={editAnswer}
+              onChange={(e) => setEditAnswer(e.target.value)}
+              autoSize={{ minRows: 2, maxRows: 6 }}
+            />
           );
         }
-        return text || <span style={{ color: '#999' }}>Waiting for answer...</span>;
-      }
+        return <span>{text || <Tag color="warning">No answer</Tag>}</span>;
+      },
+      onCell: (record: RawDataItem) => ({
+        onDoubleClick: () => {
+          if (record.answer) {
+            Modal.info({
+              title: 'Full Answer',
+              content: record.answer,
+              width: 600,
+            });
+          }
+        },
+      }),
     },
     {
-      title: 'Rating',
-      dataIndex: 'like',
-      key: 'like',
+      title: 'Votes',
+      key: 'votes',
       width: 80,
-      align: 'center' as const,
-      render: (like: number | null) => {
-        if (like === 1) return <LikeOutlined style={{ color: '#52c41a', fontSize: 18 }} />;
-        if (like === -1) return <DislikeOutlined style={{ color: '#f5222d', fontSize: 18 }} />;
-        return '-';
-      },
-      sorter: (a: RawData, b: RawData) => (a.like || -1) - (b.like || -1),
+      render: (_: any, record: RawDataItem) => (
+        <Space direction="vertical" size="small">
+          <Space>
+            <span style={{ color: '#52c41a' }}>👍 {record.likes || 0}</span>
+            <span style={{ color: '#f5222d' }}>👎 {record.dislikes || 0}</span>
+          </Space>
+          <span style={{ fontWeight: 'bold' }}>
+            Score: {record.vote_score || 0}
+          </span>
+        </Space>
+      ),
     },
     {
       title: 'Status',
       key: 'status',
-      width: 150,
-      render: (record: RawData) => (
-        <Space>
-          {record.admin_approved === 1 && <Tag color="green">Approved</Tag>}
-          {record.is_duplicate && <Tag color="orange">Duplicate</Tag>}
-          {!record.answer && <Tag color="red">Unanswered</Tag>}
-        </Space>
-      ),
+      width: 80,
       filters: [
         { text: 'Approved', value: 'approved' },
-        { text: 'Pending Approval', value: 'pending' },
-        { text: 'Duplicate', value: 'duplicate' },
+        { text: 'Pending', value: 'pending' },
       ],
-      onFilter: (value: any, record: RawData) => {
+      onFilter: (value: any, record: RawDataItem) => {
         if (value === 'approved') return record.admin_approved === 1;
-        if (value === 'pending') return record.admin_approved === 0;
-        if (value === 'duplicate') return record.is_duplicate;
-        return false;
+        return record.admin_approved === 0;
       },
+      render: (_: any, record: RawDataItem) => (
+        record.admin_approved === 1 ? 
+          <Tag color="success">OK</Tag> : 
+          <Tag color="default">Pending</Tag>
+      ),
+    },
+    {
+      title: 'Duplicates',
+      key: 'duplicates',
+      width: 120,
+      filters: [
+        { text: 'Duplicate', value: 'duplicate' },
+        { text: 'Original', value: 'original' },
+      ],
+      onFilter: (value: any, record: RawDataItem) => {
+        if (value === 'duplicate') return record.is_duplicate === true;
+        return record.is_duplicate === false;
+      },
+      render: (_: any, record: RawDataItem) => {
+        if (record.is_duplicate) {
+          return (
+            <Space direction="vertical" size="small">
+              <Tag color="warning">Duplicate</Tag>
+              <Tag color="blue">→ ID: {record.duplicate_of_id}</Tag>
+            </Space>
+          );
+        }
+        return <Tag color="default">Original</Tag>;
+      },
+    },
+    {
+      title: 'Created',
+      dataIndex: 'created_at',
+      key: 'created_at',
+      width: 130,
+      render: (text: string) => new Date(text).toLocaleString('tr-TR', { 
+        day: '2-digit', 
+        month: '2-digit', 
+        year: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit'
+      }),
+      sorter: (a: RawDataItem, b: RawDataItem) => 
+        new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
     },
     {
       title: 'Actions',
       key: 'actions',
-      width: 200,
-      fixed: 'right' as const,
-      render: (record: RawData) => (
-        <Space>
-          <Button
-            icon={<EditOutlined />}
-            size="small"
-            onClick={() => handleEdit(record)}
-            disabled={!record.answer}
-          >
-            Edit
-          </Button>
-          <Button
-            icon={<CheckOutlined />}
-            size="small"
-            type="primary"
-            onClick={() => handleApprove(record.id)}
-            disabled={record.admin_approved === 1 || !record.answer}
-          >
-            Approve
-          </Button>
+      width: 180,
+      fixed: 'right',
+      render: (_: any, record: RawDataItem) => (
+        <Space size="small">
+          {editingId === record.id ? (
+            <>
+              <Button size="small" type="primary" onClick={handleSaveEdit}>
+                Save
+              </Button>
+              <Button size="small" onClick={handleCancelEdit}>
+                Cancel
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button
+                size="small"
+                icon={<EditOutlined />}
+                onClick={() => handleEdit(record)}
+                disabled={!record.answer}
+              />
+              <Popconfirm
+                title="Approve to training data"
+                description="Are you sure you want to approve this data for training?"
+                onConfirm={() => handleApprove(record)}
+                okText="Yes"
+                cancelText="No"
+              >
+                <Button
+                  size="small"
+                  type="primary"
+                  icon={<CheckOutlined />}
+                  disabled={record.admin_approved === 1 || !record.answer}
+                />
+              </Popconfirm>
+              <Popconfirm
+                title="Delete raw data"
+                description="Are you sure you want to delete this data?"
+                onConfirm={() => handleDeleteRawData(record.id)}
+                okText="Yes"
+                cancelText="No"
+              >
+                <Button
+                  size="small"
+                  danger
+                  icon={<DeleteOutlined />}
+                />
+              </Popconfirm>
+            </>
+          )}
         </Space>
-      )
+      ),
     },
-    {
-      title: 'Date',
-      dataIndex: 'created_at',
-      key: 'created_at',
-      width: 150,
-      render: (date: string) => new Date(date).toLocaleString('en-US'),
-      sorter: (a: RawData, b: RawData) => 
-        new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
-      defaultSortOrder: 'descend' as const,
-    }
   ];
 
-  const trainingColumns = [
+  const trainingDataColumns: ColumnsType<TrainingDataItem> = [
     {
       title: 'ID',
       dataIndex: 'id',
       key: 'id',
       width: 60,
-      sorter: (a: TrainingData, b: TrainingData) => a.id - b.id,
     },
     {
       title: 'Question',
       dataIndex: 'question',
       key: 'question',
-      width: 400,
+      width: 350,
       ellipsis: true,
+      onCell: (record: TrainingDataItem) => ({
+        onDoubleClick: () => {
+          Modal.info({
+            title: 'Full Question',
+            content: record.question,
+            width: 600,
+          });
+        },
+      }),
     },
     {
       title: 'Answer',
       dataIndex: 'answer',
       key: 'answer',
-      width: 400,
+      width: 450,
       ellipsis: true,
+      onCell: (record: TrainingDataItem) => ({
+        onDoubleClick: () => {
+          Modal.info({
+            title: 'Full Answer',
+            content: record.answer,
+            width: 600,
+          });
+        },
+      }),
     },
     {
-      title: 'Date',
+      title: 'Rating',
+      dataIndex: 'point',
+      key: 'point',
+      width: 100,
+      render: (point: number | null) => {
+        if (point === 1) return <Tag color="success">Liked</Tag>;
+        if (point === -1) return <Tag color="error">Disliked</Tag>;
+        return <Tag>No rating</Tag>;
+      },
+    },
+    {
+      title: 'Duplicates',
+      key: 'duplicates',
+      width: 150,
+      filters: [
+        { text: 'Duplicate', value: 'duplicate' },
+        { text: 'Original', value: 'original' },
+      ],
+      onFilter: (value: any, record: TrainingDataItem) => {
+        if (value === 'duplicate') return record.is_answer_duplicate === true;
+        return record.is_answer_duplicate === false;
+      },
+      render: (_: any, record: TrainingDataItem) => {
+        if (record.is_answer_duplicate) {
+          return (
+            <Space direction="vertical" size="small">
+              <Tag color="warning">Duplicate</Tag>
+              <Tag color="blue">→ ID: {record.duplicate_answer_of_id}</Tag>
+            </Space>
+          );
+        }
+        return <Tag color="default">Original</Tag>;
+      },
+    },
+    {
+      title: 'Created',
       dataIndex: 'created_at',
       key: 'created_at',
       width: 150,
-      render: (date: string) => new Date(date).toLocaleString('en-US'),
-      sorter: (a: TrainingData, b: TrainingData) => 
-        new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
-      defaultSortOrder: 'descend' as const,
+      render: (text: string) => new Date(text).toLocaleString(),
     },
     {
       title: 'Actions',
       key: 'actions',
-      width: 100,
-      fixed: 'right' as const,
-      render: (record: TrainingData) => (
-        <Button
-          icon={<DeleteOutlined />}
-          size="small"
-          danger
-          onClick={() => handleDeleteTrainingData(record.id)}
+      width: 120,
+      render: (_: any, record: TrainingDataItem) => (
+        <Popconfirm
+          title="Remove from training data"
+          description="Are you sure you want to remove this from training data?"
+          onConfirm={() => handleRemoveFromTraining(record.id)}
+          okText="Yes"
+          cancelText="No"
         >
-          Delete
-        </Button>
-      )
-    }
+          <Button size="small" danger icon={<DeleteOutlined />}>
+            Remove
+          </Button>
+        </Popconfirm>
+      ),
+    },
   ];
 
   return (
     <div className="App">
-      <div className="header">
-        <h1>🤖 CengBot Admin Panel</h1>
-        <p>Çukurova University Computer Engineering Bot Management System</p>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
+        <h1>University Bot Admin Panel</h1>
+        <Button 
+          type="primary" 
+          danger 
+          icon={<LogoutOutlined />}
+          onClick={logout}
+        >
+          Logout
+        </Button>
       </div>
       
       {stats && (
-        <div className="stats-container">
-          <Row gutter={[16, 16]}>
-            <Col xs={24} sm={12} md={8} lg={4}>
-              <Card className="stat-card">
-                <Statistic 
-                  title="Total Questions" 
-                  value={stats.total_questions} 
-                  valueStyle={{ color: '#1890ff' }}
-                />
-              </Card>
-            </Col>
-            <Col xs={24} sm={12} md={8} lg={4}>
-              <Card className="stat-card">
-                <Statistic 
-                  title="Approved" 
-                  value={stats.approved_questions} 
-                  valueStyle={{ color: '#52c41a' }}
-                />
-              </Card>
-            </Col>
-            <Col xs={24} sm={12} md={8} lg={4}>
-              <Card className="stat-card">
-                <Statistic 
-                  title="Liked" 
-                  value={stats.liked_questions} 
-                  prefix={<LikeOutlined />}
-                  valueStyle={{ color: '#52c41a' }}
-                />
-              </Card>
-            </Col>
-            <Col xs={24} sm={12} md={8} lg={4}>
-              <Card className="stat-card">
-                <Statistic 
-                  title="Disliked" 
-                  value={stats.disliked_questions} 
-                  prefix={<DislikeOutlined />}
-                  valueStyle={{ color: '#f5222d' }}
-                />
-              </Card>
-            </Col>
-            <Col xs={24} sm={12} md={8} lg={4}>
-              <Card className="stat-card">
-                <Statistic 
-                  title="Training Data" 
-                  value={stats.training_data_count} 
-                  valueStyle={{ color: '#722ed1' }}
-                />
-              </Card>
-            </Col>
-            <Col xs={24} sm={12} md={8} lg={4}>
-              <Card className="stat-card">
-                <Statistic 
-                  title="Approval Rate" 
-                  value={stats.approval_rate} 
-                  valueStyle={{ color: '#fa8c16' }}
-                />
-              </Card>
-            </Col>
-          </Row>
-        </div>
+        <Row gutter={16} style={{ marginBottom: 24 }}>
+          <Col span={4}>
+            <Card>
+              <Statistic title="Total Questions" value={stats.total_questions} />
+            </Card>
+          </Col>
+          <Col span={4}>
+            <Card>
+              <Statistic 
+                title="Approved" 
+                value={stats.approved_questions} 
+                valueStyle={{ color: '#3f8600' }}
+              />
+            </Card>
+          </Col>
+          <Col span={4}>
+            <Card>
+              <Statistic 
+                title="Liked" 
+                value={stats.liked_questions} 
+                prefix={<LikeOutlined />}
+                valueStyle={{ color: '#3f8600' }}
+              />
+            </Card>
+          </Col>
+          <Col span={4}>
+            <Card>
+              <Statistic 
+                title="Disliked" 
+                value={stats.disliked_questions} 
+                prefix={<DislikeOutlined />}
+                valueStyle={{ color: '#cf1322' }}
+              />
+            </Card>
+          </Col>
+          <Col span={4}>
+            <Card>
+              <Statistic title="Training Data" value={stats.training_data_count} />
+            </Card>
+          </Col>
+          <Col span={4}>
+            <Card>
+              <Statistic 
+                title="Duplicates" 
+                value={stats.duplicate_count} 
+                valueStyle={{ color: '#faad14' }}
+              />
+            </Card>
+          </Col>
+        </Row>
       )}
-      
-      <div className="table-container">
-        <Tabs
-          activeKey={activeTab}
-          onChange={setActiveTab}
-          items={[
-            {
-              key: 'rawdata',
-              label: '📋 Question-Answer List',
-              children: (
-                <div>
-                  <div className="table-header">
-                    <h2>📋 Question-Answer List</h2>
-                    <Button type="primary" onClick={fetchData} loading={loading}>
-                      Refresh
-                    </Button>
-                  </div>
-                  
-                  <Table
-                    columns={columns}
-                    dataSource={data}
-                    rowKey="id"
-                    loading={loading}
-                    scroll={{ x: 1500 }}
-                    pagination={{
-                      pageSize: 20,
-                      showSizeChanger: true,
-                      showTotal: (total) => `Total ${total} records`,
-                      pageSizeOptions: ['10', '20', '50', '100']
-                    }}
-                    rowClassName={(record) => {
-                      if (record.admin_approved === 1) return 'approved-row';
-                      if (!record.answer) return 'no-answer-row';
-                      return '';
-                    }}
-                  />
-                </div>
-              )
-            },
-            {
-              key: 'training',
-              label: '🎓 Training Data',
-              children: (
-                <div>
-                  <div className="table-header">
-                    <h2>🎓 Training Data</h2>
-                    <Button type="primary" onClick={fetchTrainingData} loading={trainingLoading}>
-                      Refresh
-                    </Button>
-                  </div>
-                  
-                  <Table
-                    columns={trainingColumns}
-                    dataSource={trainingData}
-                    rowKey="id"
-                    loading={trainingLoading}
-                    scroll={{ x: 1000 }}
-                    pagination={{
-                      pageSize: 20,
-                      showSizeChanger: true,
-                      showTotal: (total) => `Total ${total} training records`,
-                      pageSizeOptions: ['10', '20', '50', '100']
-                    }}
-                  />
-                </div>
-              )
-            }
-          ]}
-        />
-      </div>
+
+      <Tabs
+        activeKey={activeTab}
+        onChange={setActiveTab}
+        items={[
+          {
+            key: 'rawdata',
+            label: 'Raw Data',
+            children: (
+              <Table
+                columns={rawDataColumns}
+                dataSource={rawDataResponse?.data || []}
+                rowKey="id"
+                loading={rawDataLoading}
+                scroll={{ x: 1400 }}
+                pagination={{
+                  current: rawDataPage,
+                  pageSize: rawDataPageSize,
+                  total: rawDataResponse?.total || 0,
+                  showSizeChanger: true,
+                  showTotal: (total, range) => `${range[0]}-${range[1]} of ${total} items`,
+                  pageSizeOptions: ['10', '20', '50', '100'],
+                  onChange: (page, pageSize) => {
+                    setRawDataPage(page);
+                    setRawDataPageSize(pageSize);
+                  },
+                }}
+                rowClassName={(record) => {
+                  if (record.admin_approved === 1) return 'approved-row';
+                  if (!record.answer) return 'unanswered-row';
+                  return '';
+                }}
+              />
+            ),
+          },
+          {
+            key: 'training',
+            label: 'Training Data',
+            children: (
+              <Table
+                columns={trainingDataColumns}
+                dataSource={trainingDataResponse?.data || []}
+                rowKey="id"
+                loading={trainingDataLoading}
+                scroll={{ x: 1400 }}
+                pagination={{
+                  current: trainingDataPage,
+                  pageSize: trainingDataPageSize,
+                  total: trainingDataResponse?.total || 0,
+                  showSizeChanger: true,
+                  showTotal: (total, range) => `${range[0]}-${range[1]} of ${total} items`,
+                  pageSizeOptions: ['10', '20', '50', '100'],
+                  onChange: (page, pageSize) => {
+                    setTrainingDataPage(page);
+                    setTrainingDataPageSize(pageSize);
+                  },
+                }}
+              />
+            ),
+          },
+          {
+            key: 'docs',
+            label: 'Documentation',
+            children: <DocumentViewer />,
+          },
+        ]}
+      />
     </div>
+  );
+}
+
+function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <AuthProvider>
+        <AppContent />
+        <ReactQueryDevtools initialIsOpen={false} />
+      </AuthProvider>
+    </QueryClientProvider>
   );
 }
 

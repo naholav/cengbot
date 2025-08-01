@@ -1,11 +1,26 @@
-# Environment variables
+# Environment files - NEVER commit these!
 .env
 .env.local
-.env.development.local
-.env.test.local
-.env.production.local
-config/env/.env.production
-config/env/.env.development
+.env.development
+.env.production
+config/env/
+
+# Sensitive data directories (keep .gitkeep files)
+data/*
+!data/.gitkeep
+logs/*
+!logs/.gitkeep
+model_cache/*
+!model_cache/.gitkeep
+models/*
+!models/.gitkeep
+excel/*
+!excel/.gitkeep
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
 
 # Python
 __pycache__/
@@ -32,30 +47,14 @@ share/python-wheels/
 MANIFEST
 
 # Virtual environments
+.env/
 .venv/
+env/
 venv/
 ENV/
-env/
-
-# Node.js
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Logs
-logs/
-*.log
-
-# Database
-*.db
-*.sqlite
-*.sqlite3
-
-# Model cache and checkpoints
-model_cache/
-models/*/
-checkpoints/
+env.bak/
+venv.bak/
+miniconda3/
 
 # IDE
 .vscode/
@@ -64,20 +63,139 @@ checkpoints/
 *.swo
 *~
 
-# OS
+# OS files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 
-# Temporary files
-*.tmp
-*.temp
-.cache/
+# Node.js
+admin_frontend/node_modules/
+admin_frontend/npm-debug.log*
+admin_frontend/yarn-debug.log*
+admin_frontend/yarn-error.log*
+admin_frontend/lerna-debug.log*
+admin_frontend/.pnpm-debug.log*
+admin_frontend/build/
+admin_frontend/dist/
+
+# Process IDs
+.pids
+.production_pids
+*.pid
+*.pid.lock
 
 # Coverage reports
 htmlcov/
+.tox/
+.nox/
 .coverage
 .coverage.*
+.cache
+nosetests.xml
 coverage.xml
 *.cover
+*.py,cover
 .hypothesis/
 .pytest_cache/
+cover/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# PyCharm
+.idea/
+
+# Training artifacts
+*.safetensors
+*.bin
+training_logs/
+checkpoints/
+runs/
+wandb/
+
+# System monitoring
+monitoring/
+*.jsonl
+
+# Backup files
+backup/
+*.backup
+*.bak
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Lock files
+*.lock
+
+# Service files (these should be created during deployment)
+*.service
+
+# SSL certificates
+*.pem
+*.key
+*.crt
+*.csr
+
+# Local configuration overrides
+local_config.*
+
+# Hugging Face cache
+.cache/
+transformers_cache/
+
+# CUDA files
+*.ptx
+*.cubin
+
+# Model files (too large for git)
+*.pth
+*.pt
+*.onnx
+*.tflite
+
+# Conda
+.conda/

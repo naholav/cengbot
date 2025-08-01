@@ -6,10 +6,11 @@
 
 **LLaMA 3.2 3B + LoRA** fine-tuned AI chatbot for Çukurova University Computer Engineering Department with dynamic learning capabilities.
 
-🤖 **Try the Bot**: [@cu_ceng_v1_bot](https://t.me/cu_ceng_v1_bot)  
-🤗 **HuggingFace**: [Naholav](https://huggingface.co/Naholav)  
-📧 **Contact**: arda.mulayim@outlook.com  
-📅 **Date**: July 2025
+🤖 **Try the Bot**: [CU_CengBOT Telegram Group](https://t.me/CU_CengBOT)  
+🤗 **Model**: [Naholav/cengbot-lora-tr-en-cukurova](https://huggingface.co/Naholav/cengbot-lora-tr-en-cukurova)  
+📊 **Dataset**: [Naholav/cukurova_university_chatbot](https://huggingface.co/datasets/Naholav/cukurova_university_chatbot)  
+👨‍💻 **Developer**: naholav  
+📅 **Date**: August 2025
 
 [![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=flat&logo=python&logoColor=white)](https://python.org)
 [![React](https://img.shields.io/badge/React-18+-61DAFB?style=flat&logo=react&logoColor=black)](https://reactjs.org)
@@ -24,24 +25,145 @@
 
 ## 🚀 Overview
 
-CengBot is a revolutionary AI-powered chatbot system designed specifically for Çukurova University's Computer Engineering Department. Built with cutting-edge technologies including LLaMA 3.2 3B language model and LoRA fine-tuning, it provides intelligent responses to student inquiries about courses, programs, and department information.
+CengBot is an AI-powered chatbot system for Çukurova University's Computer Engineering Department. Built with LLaMA 3.2 3B language model and LoRA fine-tuning, it provides intelligent responses to student inquiries about courses, programs, and department information.
+
+> **⚠️ Important Note**: This bot only works in the specific Telegram group and does not respond to private messages. Join the official group to interact with the bot.
 
 ### 🌟 What Makes CengBot Special?
 
-**Dynamic Learning System**: CengBot is not just a static chatbot - it's a continuously evolving AI system that learns and improves from every interaction. Starting with ~600 English and ~600 Turkish question-answer pairs, the system used Claude API for advanced paraphrasing to expand the dataset to over 18,000 training pairs. As users interact with the bot, new question-answer pairs are collected, reviewed by administrators, and integrated into the training data for future model improvements.
+- **🔒 Secure Admin Panel**: Password-protected admin interface with authentication
+- **📊 TanStack Query Integration**: Efficient data fetching with automatic caching and pagination
+- **📁 Documentation Viewer**: Built-in viewer for README files, logs, and system documentation
+- **🚀 Rate Limiting**: Anti-spam protection with intelligent user rate limiting
+- **⚡ Optimized Database**: Enhanced with proper indexing and query optimization
+- **🛡️ Production Security**: Hashed passwords and secure token management
+
+**Dynamic Learning System**: CengBot continuously evolves through user interactions. Starting with ~600 English and ~600 Turkish question-answer pairs, the system expanded to over 22,000+ training pairs through AI-powered data augmentation. The system collects new interactions, allows admin review, and supports model retraining for continuous improvement.
 
 ### ✨ Key Features
 
-- **🧠 Advanced AI**: LLaMA 3.2 3B model with custom LoRA fine-tuning
+- **🧠 AI Model**: LLaMA 3.2 3B model with custom LoRA fine-tuning
 - **🌍 Multi-language Support**: Automatic Turkish/English detection and response
-- **📱 Telegram Integration**: Seamless bot experience with interactive feedback system
-- **🔧 Modern Admin Panel**: React-based administrative interface with real-time updates
-- **📊 Advanced Analytics**: Comprehensive performance monitoring and statistics
+- **📱 Telegram Integration**: Bot with interactive feedback system
+  - **/start** - Welcome message and bot introduction
+  - **/stats** - Display bot statistics and performance metrics
+- **🔧 Admin Panel**: React-based interface for question management and analytics
 - **🔄 Message Queue Architecture**: RabbitMQ for scalable asynchronous processing
 - **💾 Dual Database System**: Raw data collection + curated training data
-- **🎯 Dynamic Training**: Continuous model improvement through user interactions
-- **📈 Real-time Monitoring**: System health checks and performance metrics
-- **🛡️ Security Features**: Input validation, rate limiting, and secure authentication
+- **🎯 Continuous Learning**: System for collecting and reviewing new training data
+- **🛡️ Security**: Environment-based configuration with proper secret management
+- **📊 Analytics**: Basic statistics and user feedback tracking
+- **🔄 Automated Training**: Scripts for model retraining and deployment
+- **📝 Training Log System**: Versioned training logs (v1.log, v2.log, etc.) with metadata
+- **📊 Database Export**: Automatic export of training data from database to JSONL format
+- **📋 Excel Export**: Complete database export to Excel format with timestamp and analytics
+- **🔄 Model Versioning**: Automatic model versioning (v1, v2, v3, etc.) with easy switching
+- **🤖 Data Augmentation**: AI-powered training data augmentation using Anthropic Claude API
+- **⚠️ Error Handling**: Centralized error handling and logging system
+- **📈 System Monitoring**: Resource usage monitoring and performance tracking
+
+---
+
+## 📁 Project Structure
+
+```
+cu_ceng_bot/
+├── 📂 src/                                    # Core Application Source
+│   ├── 🤖 telegram_bot.py                    # Main Telegram bot (standalone)
+│   ├── 🔄 telegram_bot_rabbitmq.py           # Telegram bot with RabbitMQ
+│   ├── 🚀 telegram_bot_standalone.py         # Standalone bot without queue
+│   ├── ⚡ ai_model_worker.py                 # AI processing worker
+│   ├── 🌐 admin_rest_api.py                  # FastAPI admin API
+│   ├── 🧠 llama_model_handler.py             # LLaMA model inference
+│   ├── 💾 database_models.py                 # SQLAlchemy models
+│   ├── 🎯 train_model.py                     # Model training script
+│   ├── 📊 database_to_training.py            # Database export to training format
+│   ├── 🤖 data_augmentation.py               # AI-powered data augmentation
+│   ├── 📋 export_to_excel.py                 # Database export to Excel format
+│   ├── ⚠️ error_handler.py                   # Error handling utilities
+│   └── 📈 system_monitor.py                  # System monitoring utilities
+│
+├── 📂 admin_frontend/                         # React Admin Panel
+│   ├── 📦 package.json                       # Node dependencies
+│   ├── ⚙️ tsconfig.json                      # TypeScript config
+│   ├── 📂 public/                           # Public assets
+│   │   └── 🌐 index.html                     # HTML template
+│   └── 📂 src/
+│       ├── 🎨 App.tsx                        # Main React app
+│       ├── 🎯 index.tsx                      # Entry point
+│       ├── 💅 App.css                        # Styles
+│       ├── 📂 components/                   # React components
+│       │   ├── 📖 DocumentViewer.tsx         # Document viewer component
+│       │   └── 🔒 Login.tsx                 # Login component
+│       ├── 📂 contexts/                     # React contexts
+│       │   └── 🔐 AuthContext.tsx           # Authentication context
+│       ├── 📂 hooks/                        # Custom React hooks
+│       │   └── 🅰️ useApiQueries.ts          # API query hooks
+│       ├── 📂 services/                     # Service layer
+│       │   └── 🌐 api.ts                    # API client
+│       └── 📂 types/                        # TypeScript types
+│           └── 📑 api.ts                    # API type definitions
+│
+├── 📂 scripts/                               # Automation Scripts
+│   ├── 🚀 train_model.sh                     # Automatic training
+│   ├── 🤖 augment_training_data.sh           # AI-powered data augmentation
+│   ├── 🧪 test_environment.sh                # Environment testing
+│   ├── 📊 view_training_history.sh           # Training history viewer
+│   ├── 📤 export_training_data.sh            # Database to training export
+│   ├── 🔄 switch_model.sh                    # Model version switcher
+│   ├── 📋 export_database.sh                 # Database export to Excel
+│   ├── 🏗️ setup_system.sh                    # System setup script
+│   ├── ▶️ start_system.sh                     # Start all services
+│   ├── ⏹️ stop_system.sh                      # Stop all services
+│   ├── 🏥 health_check.sh                    # System health monitoring
+│   ├── 🧹 cleanup_system.sh                  # System cleanup utilities
+│   ├── 🚢 deploy_production.sh               # Production deployment
+│   ├── ⚡ optimize_linux.sh                  # Linux optimization script
+│   ├── 💾 backup_data.sh                     # Data backup script
+│   └── 📖 README.md                          # Scripts documentation
+│
+├── 📂 models/                                # Model Storage
+│   ├── 🔗 active-model                       # Active model symlink
+│   ├── 📂 final-best-model-v1/              # Model version 1
+│   │   ├── 📂 method1/                       # LoRA adapter
+│   │   └── 📊 training_info.json             # Training metadata
+│   ├── 📂 final-best-model-v2/              # Model version 2 (auto-created)
+│   └── 📂 final-best-model-v3/              # Model version 3 (auto-created)
+│
+├── 📂 config/                                # Configuration
+│   ├── 📂 env/                               # Environment configs
+│   ├── 🐍 env_loader.py                      # Environment loader
+│   └── 📋 requirements.txt                   # Python dependencies
+│
+├── 📂 docs/                                  # Documentation
+│   ├── 📄 API.md                             # API documentation
+│   ├── 📄 ARCHITECTURE.md                    # Architecture guide
+│   ├── 📄 DEPLOYMENT.md                      # Deployment guide
+│   └── 📄 DEVELOPMENT.md                     # Development guide
+│
+├── 📂 logs/                                  # Application Logs
+│   ├── 📄 admin.log                          # Admin API logs
+│   ├── 📄 bot.log                            # Telegram bot logs
+│   ├── 📄 frontend.log                       # Frontend logs
+│   ├── 📄 worker.log                         # AI worker logs
+│   ├── 📄 error.log                          # Error logs
+│   ├── 📄 excel_export.log                   # Excel export logs
+│   └── 📄 system_monitor.log                 # System monitoring logs
+│
+├── 📂 data/                                  # Training Data
+│   └── 📄 merged_qa_data.jsonl              # Training dataset
+│
+├── 📂 excel/                                 # Excel Export Files
+│   └── 📄 cengbot_database_export_*.xlsx    # Database exports (timestamp)
+│
+├── 💾 university_bot.db                      # SQLite database
+├── 🔧 .env                                   # Environment variables
+├── 📄 .env.example                           # Environment template
+├── 📄 .pids                                  # Process ID tracking file
+├── 📂 .venv/                                 # Python virtual environment
+├── 🔐 PRODUCTION_SECURITY_CHECKLIST.md      # Production security checklist
+└── 📚 README.md                              # This documentation
+```
 
 ---
 
@@ -49,93 +171,250 @@ CengBot is a revolutionary AI-powered chatbot system designed specifically for �
 
 ### Environment Variables
 
-**IMPORTANT**: All sensitive information is stored in environment variables. Before running the system, copy `.env.example` to `.env` and configure your values:
+**IMPORTANT**: All sensitive information is stored in environment variables. Create a `.env` file in the project root:
 
 ```bash
-cp .env.example .env
+# Required Configuration
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+HUGGING_FACE_TOKEN=your_huggingface_token_here
+ADMIN_PASSWORD=your_admin_password_here
+SECRET_KEY=your_secret_key_here
+
+# Data Augmentation (Optional)
+# Note: CLAUDE_API_KEY is NOT stored here for security
+# It will be requested when running augmentation script
+CLAUDE_API_KEY=your_claude_api_key_here
 ```
 
-**Required Configuration**:
-- `TELEGRAM_BOT_TOKEN`: Your Telegram bot token from @BotFather
-- `HUGGING_FACE_TOKEN`: Your Hugging Face access token for model downloads
-- `ADMIN_PASSWORD`: Admin panel password (change from default)
-- `SECRET_KEY`: Application secret key (generate a strong one)
-
-**Note**: The `.env` file is excluded from version control. Never commit sensitive tokens to git.
-
-### GitHub Repository Setup
-
-This project is configured for secure deployment:
-- All sensitive data is in `.env` (gitignored)
-- Template configuration in `.env.example`
+**Security Features**:
+- All sensitive data in `.env` (gitignored)
 - No hardcoded credentials in source code
-- Comprehensive `.gitignore` for security
+- Complete `.gitignore` for security
+- Environment variable validation
+
+**⚠️ IMPORTANT SECURITY NOTICE**:
+- Replace ALL placeholder tokens in `.env` with real values before use
+- Never commit `.env` file to version control
+- See `PRODUCTION_SECURITY_CHECKLIST.md` for complete security guidelines
+- API keys in this repo are examples only - not functional
 
 ---
 
-## 🔄 Dynamic Training System
+## 🛠️ Installation & Setup
 
-### 📊 Dataset Evolution
+### 📁 Required Files & Directories Setup
 
-#### Initial Dataset Construction
-1. **Foundation Data**: 
-   - ~600 carefully curated English question-answer pairs
-   - ~600 Turkish question-answer pairs covering department topics
-   - Total: ~1,200 high-quality seed Q&A pairs
+After cloning the repository, you need to set up the following files and directories:
 
-2. **Advanced Data Augmentation**:
-   - **Claude API Integration**: Used for sophisticated paraphrasing
-   - **Semantic Preservation**: Maintained meaning while increasing diversity
-   - **Multiple Variations**: Generated 15+ variations per original question
-   - **Quality Control**: Automated filtering and manual review
-   - **Final Training Set**: 18,000+ question-answer pairs
+**📋 Essential Files to Create:**
+```bash
+# 1. Environment configuration (REQUIRED)
+cp .env.example .env
+# Edit .env file with your actual tokens:
+# - TELEGRAM_BOT_TOKEN=your_actual_bot_token
+# - HUGGING_FACE_TOKEN=your_actual_hf_token  
+# - ADMIN_PASSWORD_HASH=your_hashed_password
 
-#### Continuous Learning Pipeline
+# 2. Database file (will be created automatically)
+# university_bot.db - SQLite database file
+
+# 3. Process tracking (will be created automatically)  
+# .pids - Process ID tracking file
 ```
-User Interaction → Raw Database → Admin Review → Training Database → Model Retraining
+
+**🤗 Model Files to Download:**
+```bash
+# 1. Download the trained LoRA model from HuggingFace:
+# https://huggingface.co/Naholav/cengbot-lora-tr-en-cukurova
+# 
+# 2. Create directory structure:
+mkdir -p models/final-best-model-v1/method1/
+
+# 3. Extract downloaded model files to:
+# models/final-best-model-v1/method1/
+# - adapter_config.json
+# - adapter_model.safetensors
+# - tokenizer files
+# - training_info.json
+
+# 4. Create symlink for active model:
+cd models/
+ln -sf final-best-model-v1 active-model
+cd ..
+
+# 5. Verify structure:
+# models/
+# ├── active-model -> final-best-model-v1
+# └── final-best-model-v1/
+#     └── method1/
+#         ├── adapter_config.json
+#         ├── adapter_model.safetensors
+#         └── tokenizer files...
 ```
 
-### 🔄 Live Data Collection System
+**📊 Training Data Setup:**
+```bash
+# 1. Download dataset from HuggingFace:
+# https://huggingface.co/datasets/Naholav/cukurova_university_chatbot
+#
+# 2. Place the downloaded JSONL file in:
+# data/merged_qa_data.jsonl
+#
+# 3. Verify file format (each line should be a JSON object):
+# {"instruction": "question here", "output": "answer here", "language": "turkish/english"}
+#
+# 4. File structure should look like:
+# data/
+# └── merged_qa_data.jsonl  (your training dataset)
+```
 
-#### Real-time Data Flow
-1. **User Interaction**: Students ask questions via Telegram
-2. **Immediate Storage**: All questions instantly saved to `raw_data` table
-3. **AI Processing**: Questions processed through current model
-4. **Response Storage**: AI responses saved with timestamps
-5. **User Feedback**: Like/dislike system for quality assessment
-6. **Admin Review**: Administrators review and edit responses
-7. **Training Integration**: Approved data moves to `training_data` table
+**📂 Directory Structure (Auto-created but listed for reference):**
+- `logs/` - Application logs (auto-created)
+- `model_cache/` - HuggingFace model cache (auto-created)
+- `excel/` - Database exports (auto-created)
+- `admin_frontend/node_modules/` - NPM dependencies (after npm install)
+- `admin_frontend/build/` - React build output (after npm run build)
 
-#### Quality Control Mechanisms
-- **📝 Manual Review**: Admin panel for response editing
-- **👍 User Feedback**: -1/+1 rating system for responses
-- **🔍 Duplicate Detection**: Automatic identification of similar questions
-- **📊 Quality Metrics**: Response relevance and user satisfaction tracking
-- **🛡️ Content Filtering**: Automated inappropriate content detection
+### 🎯 Quick Start
 
-### 🎯 Automated Retraining Cycle
+```bash
+# 1. Clone the repository
+git clone https://github.com/naholav/cengbot.git
+cd cengbot
 
-#### Periodic Model Updates
-1. **Data Accumulation**: System collects new approved Q&A pairs
-2. **Threshold Monitoring**: Automatic retraining when dataset reaches threshold (e.g., 1000 new pairs)
-3. **Augmentation Pipeline**: New questions processed through Claude API for paraphrasing
-4. **LoRA Fine-tuning**: Incremental training on expanded dataset
-5. **Model Versioning**: A/B testing of new vs. current model
-6. **Deployment**: Seamless model updates with zero downtime
+# 2. Create environment file
+cp .env.example .env
+# Edit .env with your actual tokens
 
-#### Continuous Improvement Metrics
-- **Response Quality**: Measured by user feedback and admin ratings
-- **Coverage Expansion**: New topics and question types identified
-- **Language Evolution**: Adaptation to student communication patterns
-- **Performance Monitoring**: Response time and accuracy tracking
+# 3. Download and setup the trained model
+# Go to: https://huggingface.co/Naholav/cengbot-lora-tr-en-cukurova
+# Download all files and place in: models/final-best-model-v1/method1/
+mkdir -p models/final-best-model-v1/method1/
+# Extract model files to the above directory
+cd models/ && ln -sf final-best-model-v1 active-model && cd ..
+
+# 4. Download training data (optional)
+# Go to: https://huggingface.co/datasets/Naholav/cukurova_university_chatbot
+# Download and place as: data/merged_qa_data.jsonl
+
+# 5. Install Python dependencies
+pip install -r config/requirements.txt
+
+# 6. Install Node.js dependencies
+cd admin_frontend
+npm install
+cd ..
+
+# 7. Initialize database
+python3 -c "from src.database_models import init_db; init_db()"
+
+# 8. Start RabbitMQ
+sudo systemctl start rabbitmq-server
+
+# 9. Test environment
+./scripts/test_environment.sh
+```
+
+### 🚀 Running the System
+
+```bash
+# Quick Start - All services at once
+./scripts/start_system.sh
+
+# Stop all services
+./scripts/stop_system.sh
+
+# Check system health
+./scripts/health_check.sh
+
+# Manual start (separate terminals):
+# Terminal 1: AI Model Worker
+python3 src/ai_model_worker.py
+
+# Terminal 2: Telegram Bot
+python3 src/telegram_bot_rabbitmq.py
+
+# Terminal 3: Admin API
+python3 src/admin_rest_api.py
+
+# Terminal 4: Frontend (in admin_frontend/)
+npm start
+```
+
+### 🎯 Model Training
+
+```bash
+# Export training data from database
+./scripts/export_training_data.sh
+
+# Data augmentation (optional - requires Anthropic API key)
+./scripts/augment_training_data.sh
+
+# Automatic training with environment setup (creates v2.log, v3.log, etc.)
+./scripts/train_model.sh  # Creates final-best-model-v2, v3, etc.
+
+# Manual training
+python3 src/train_model.py
+
+# View training logs (when available)
+ls -la logs/
+
+# Analyze training sessions
+./scripts/view_training_history.sh list
+./scripts/view_training_history.sh view v1
+./scripts/view_training_history.sh compare v1 v2  # when v2 exists
+./scripts/view_training_history.sh best
+```
+
+### 🔄 Model Version Management
+
+```bash
+# List available model versions
+./scripts/switch_model.sh list
+
+# Switch to specific model version
+./scripts/switch_model.sh switch v2
+
+# Show current active model
+./scripts/switch_model.sh current
+
+# Auto-switch to next available version
+./scripts/switch_model.sh auto
+```
+
+### 📋 Database Export to Excel
+
+```bash
+# Export complete database to Excel format
+./scripts/export_database.sh
+
+# Export with verbose logging
+./scripts/export_database.sh -v
+
+# Export in quiet mode (only errors shown)
+./scripts/export_database.sh -q
+
+# View export help
+./scripts/export_database.sh -h
+```
+
+#### 📊 Export Features
+- **Complete Database Export**: All tables (raw_data, training_data, user_votes, user_analytics, system_metrics)
+- **Timestamped Files**: `cengbot_database_export_YYYYMMDD_HHMMSS.xlsx`
+- **Multiple Worksheets**: Each database table in separate worksheet
+- **Summary Sheet**: Export metadata and statistics
+- **Automatic Backup**: Previous exports backed up automatically
+- **Cleanup System**: Keeps only last 10 export files
+- **Complete Logging**: All export operations logged to `logs/excel_export.log`
+- **Error Recovery**: Error handling and recovery
+- **Export Statistics**: File count, database size, and timing information
 
 ---
 
-## 🏗️ Advanced Architecture
+## 🏗️ Architecture
 
-### 🔄 Message Queue System (RabbitMQ)
+### 🔄 Message Queue System
 
-#### Queue Architecture
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
 │   Telegram Bot  │───▶│  Questions      │───▶│  AI Worker      │
@@ -149,485 +428,40 @@ User Interaction → Raw Database → Admin Review → Training Database → Mod
 └─────────────────┘    └─────────────────┘    └─────────────────┘
 ```
 
-#### Queue Features
-- **🔄 Asynchronous Processing**: Non-blocking message handling
-- **📦 Message Persistence**: Durable queues survive system restarts
-- **⚡ Load Balancing**: Multiple workers process messages in parallel
-- **🛡️ Fault Tolerance**: Automatic retry mechanisms
-- **📊 Monitoring**: Queue depth and processing metrics
-- **🔧 Priority Queues**: Admin messages get higher priority
+### 💾 Database Schema
 
-#### Queue Types
-- **`questions`**: User questions waiting for AI processing
-- **`answers`**: AI responses ready for delivery
-- **`priority_questions`**: High-priority admin queries
-- **`feedback`**: User feedback and ratings
-- **`training_data`**: New data for model training
-- **`system_alerts`**: System health and error notifications
-
-### 🎨 Emoji System & User Experience
-
-#### 📱 Interactive Telegram Features
-- **🤖 Bot Commands**:
-  - `/start` - Welcome message with system information
-  - `/help` - Comprehensive help and usage instructions
-  - `/stats` - Real-time bot statistics and performance
-  - `/feedback` - Direct feedback submission to administrators
-  - `/language` - Switch between Turkish and English
-
-#### 🎯 Feedback System
-- **👍 Like Button**: Positive feedback (value: +1)
-- **👎 Dislike Button**: Negative feedback (value: -1)
-- **🔄 Real-time Updates**: Buttons update to show selection
-- **📊 Analytics**: Feedback data used for quality metrics
-- **🏆 Gamification**: User contribution tracking
-
-#### 📊 Status Indicators
-- **🟢 Online**: Bot is active and processing
-- **🟡 Processing**: Question being processed by AI
-- **🔴 Offline**: System maintenance or issues
-- **⚡ Quick Response**: Cached or duplicate question
-- **🧠 AI Processing**: Complex question requiring model inference
-
-#### 🎨 Response Formatting
-- **📝 Question Display**: User question with attribution
-- **🤖 AI Response**: Formatted AI answer with language indicator
-- **⏱️ Timestamps**: Message timing information
-- **🏷️ Language Tags**: TR/EN language indicators
-- **🎯 Relevance Score**: Internal quality metrics
-
-### 💾 Advanced Database Architecture
-
-#### Raw Data Collection (`raw_data` table)
+**Raw Data Table** - Stores all user interactions:
 ```sql
 CREATE TABLE raw_data (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    telegram_id BIGINT NOT NULL,              -- User identification
-    telegram_message_id BIGINT,               -- Message reference
-    username VARCHAR(100),                    -- Display name
-    question TEXT NOT NULL,                   -- Original question
-    answer TEXT,                              -- AI response
-    language VARCHAR(10),                     -- TR/EN detection
-    like INTEGER,                             -- User feedback (-1/+1)
-    admin_approved INTEGER DEFAULT 0,         -- Admin approval status
-    is_duplicate BOOLEAN DEFAULT FALSE,       -- Duplicate flag
-    duplicate_of_id INTEGER,                  -- Reference to original
+    telegram_id BIGINT NOT NULL,
+    username VARCHAR(100),
+    question TEXT NOT NULL,
+    answer TEXT,
+    language VARCHAR(10),
+    like INTEGER,                    -- User feedback (-1/1)
+    admin_approved INTEGER DEFAULT 0,
+    is_duplicate BOOLEAN DEFAULT FALSE,
+    duplicate_of_id INTEGER,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    answered_at DATETIME,                     -- Response timestamp
-    message_thread_id INTEGER,                -- Telegram topic
-    processing_time FLOAT,                    -- Response time metrics
-    similarity_score FLOAT,                   -- Duplicate detection score
-    model_version VARCHAR(50),                -- Model used for response
-    context_length INTEGER,                   -- Input token count
-    response_length INTEGER                   -- Output token count
+    answered_at DATETIME,
+    message_thread_id INTEGER,
+    processing_time FLOAT,
+    similarity_score FLOAT,
+    model_version VARCHAR(50),
+    context_length INTEGER,
+    response_length INTEGER,
+    quality_score FLOAT,
+    sentiment_score FLOAT,
+    complexity_score INTEGER,
+    topic_category VARCHAR(100),
+    keywords TEXT,
+    admin_notes TEXT,
+    last_updated DATETIME
 );
 ```
 
-#### Training Data (`training_data` table)
-```sql
-CREATE TABLE training_data (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_id INTEGER REFERENCES raw_data(id), -- Source reference
-    question TEXT NOT NULL,                     -- Approved question
-    answer TEXT NOT NULL,                       -- Approved answer
-    language VARCHAR(10),                       -- Language code
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    admin_notes TEXT,                           -- Admin comments
-    quality_score INTEGER,                      -- Quality rating
-    usage_count INTEGER DEFAULT 0,              -- Training usage
-    last_used_at DATETIME,                      -- Last training run
-    category VARCHAR(100),                      -- Question category
-    difficulty_level INTEGER,                   -- Question complexity
-    effectiveness_score FLOAT                   -- Training effectiveness
-);
-```
-
----
-
-## 📁 Complete Project Structure
-
-```
-university-bot/
-├── 📂 src/                                    # Core Application Source Code
-│   ├── 🤖 telegram_bot.py                     # Main Telegram bot with full documentation
-│   ├── 🔄 telegram_bot_rabbitmq.py            # RabbitMQ-enabled Telegram bot
-│   ├── 🏃 telegram_bot_standalone.py          # Standalone bot (direct model integration)
-│   ├── ⚡ ai_model_worker.py                  # RabbitMQ worker for AI processing
-│   ├── 🌐 admin_rest_api.py                   # FastAPI REST API for admin panel
-│   ├── 🧠 llama_model_handler.py              # LLaMA 3.2 3B model inference engine
-│   └── 💾 database_models.py                  # SQLAlchemy database models and schemas
-│
-├── 📂 admin_frontend/                          # React Admin Dashboard
-│   ├── 📦 package.json                        # Node.js dependencies and scripts
-│   ├── 📦 package-lock.json                   # Locked dependency versions
-│   ├── ⚙️ tsconfig.json                       # TypeScript configuration
-│   ├── 📂 node_modules/                       # Node.js dependencies (auto-generated)
-│   ├── 📂 public/                             # Static public assets
-│   │   └── 🏠 index.html                      # Main HTML template
-│   └── 📂 src/                                # React source code
-│       ├── 🎨 App.tsx                         # Main React application component
-│       ├── 🎯 index.tsx                       # Application entry point
-│       └── 💅 App.css                         # Global styles and themes
-│
-├── 📂 config/                                 # Configuration Management
-│   ├── 📂 env/                                # Environment Configuration (empty - ready for setup)
-│   ├── 🔧 env_loader.py                       # Environment configuration loader
-│   └── 📋 requirements.txt                    # Python package dependencies
-│
-├── 📂 scripts/                                # System Management Scripts
-│   ├── 🚀 start_system.sh                     # Production system startup script
-│   ├── 🛑 stop_system.sh                      # Graceful system shutdown script
-│   ├── 🔧 setup_system.sh                     # Initial system setup and installation
-│   ├── 🏥 health_check.sh                     # System health monitoring script
-│   └── 💻 dev_mode.sh                         # Development environment startup
-│
-├── 📂 models/                                 # AI Model Assets
-│   └── 📂 final-best-model-v1/                # Fine-tuned model version 1
-│       ├── 📂 method1/                        # Active LoRA adapter (method1)
-│       │   ├── 📄 README.md                   # Model documentation (Hugging Face format)
-│       │   ├── ⚙️ adapter_config.json         # LoRA adapter configuration
-│       │   ├── 🧠 adapter_model.safetensors   # LoRA adapter model weights
-│       │   ├── 🔤 special_tokens_map.json     # Special token mappings
-│       │   ├── 🔤 tokenizer.json              # Tokenizer configuration
-│       │   ├── 🔤 tokenizer_config.json       # Tokenizer settings
-│       │   └── 🎯 training_args.bin           # Training arguments and hyperparameters
-│       └── 📊 training_info.json              # Training statistics and metadata
-│
-├── 📂 model_cache/                            # Hugging Face Model Cache
-│   └── 📂 models--meta-llama--Llama-3.2-3B/  # Cached base model files
-│       ├── 📂 blobs/                          # Model binary blobs
-│       ├── 📂 refs/                           # Model references
-│       └── 📂 snapshots/                      # Model snapshots
-│           └── 📂 13afe5124825b4f3751f836b40dafda64c1ed062/
-│               ├── ⚙️ config.json             # Model configuration
-│               ├── 🎯 generation_config.json  # Generation parameters
-│               ├── 🧠 model-00001-of-00002.safetensors # Model weights part 1
-│               ├── 🧠 model-00002-of-00002.safetensors # Model weights part 2
-│               ├── 📋 model.safetensors.index.json # Model index
-│               ├── 🔤 special_tokens_map.json  # Special tokens
-│               ├── 🔤 tokenizer.json           # Tokenizer data
-│               └── 🔤 tokenizer_config.json    # Tokenizer configuration
-│
-├── 📂 logs/                                   # Application Log Files
-│   ├── 🤖 worker.log                          # AI model worker logs
-│   ├── 📱 bot.log                             # Telegram bot operation logs
-│   ├── 🌐 admin.log                           # Admin API request logs
-│   └── 💻 frontend.log                        # React frontend logs
-│
-├── 📂 docs/                                   # Documentation Directory
-│   ├── 📚 ARCHITECTURE.md                     # System architecture documentation
-│   ├── 🚀 DEPLOYMENT.md                       # Deployment and production guide
-│   ├── 🔧 DEVELOPMENT.md                      # Development setup and guidelines
-│   └── 📖 API.md                              # API documentation and examples
-│
-├── 💾 university_bot.db                       # SQLite production database
-├── 🔧 .env                                    # Environment configuration file
-└── 📚 README.md                               # This comprehensive documentation
-```
-
----
-
-## 🔧 File Descriptions
-
-### 🐍 Core Python Components
-
-| File | Purpose | Key Features |
-|------|---------|-------------|
-| `telegram_bot.py` | **Main Telegram Bot** | Complete bot with environment config, RabbitMQ integration, comprehensive logging, emoji system, and real-time feedback |
-| `telegram_bot_rabbitmq.py` | **RabbitMQ-Enabled Bot** | Telegram bot with message queuing for scalable AI processing and load balancing |
-| `telegram_bot_standalone.py` | **Standalone Bot** | Direct model integration without RabbitMQ dependency for simple deployments |
-| `ai_model_worker.py` | **AI Processing Worker** | RabbitMQ consumer that processes questions using LLaMA model with performance monitoring |
-| `admin_rest_api.py` | **Admin REST API** | FastAPI backend providing REST endpoints for admin panel operations and analytics |
-| `llama_model_handler.py` | **Model Inference Engine** | LLaMA 3.2 3B model loading, LoRA adapter integration, and optimized inference |
-| `database_models.py` | **Database Layer** | SQLAlchemy models, schemas, and database initialization with advanced features |
-
-### 🎯 System Management Scripts
-
-| Script | Purpose | Description |
-|--------|---------|-------------|
-| `start_system.sh` | **Production Startup** | Launches all services in production mode with proper process management and health checks |
-| `stop_system.sh` | **System Shutdown** | Gracefully terminates all services, saves state, and cleans up processes |
-| `setup_system.sh` | **Initial Setup** | Installs dependencies, configures environment, initializes database, and sets up monitoring |
-| `health_check.sh` | **Health Monitoring** | Comprehensive system health checks, service availability, and resource monitoring |
-| `dev_mode.sh` | **Development Mode** | Starts services in development mode with hot reload and debugging capabilities |
-
-### ⚙️ Configuration Files
-
-| File | Purpose | Description |
-|------|---------|-------------|
-| `env_loader.py` | **Config Manager** | Centralized environment variable management with validation and type checking |
-| `requirements.txt` | **Python Dependencies** | All required Python packages with version specifications and security updates |
-
-### 🌐 Frontend Components
-
-| File | Purpose | Description |
-|------|---------|-------------|
-| `App.tsx` | **Main React App** | Root component with routing, state management, real-time updates, and theme support |
-| `index.tsx` | **Application Entry** | React application bootstrap with performance monitoring and error boundaries |
-| `App.css` | **Global Styles** | CSS styling, themes, responsive design, and accessibility features |
-| `package.json` | **Node.js Config** | Dependencies, scripts, project metadata, and build configuration |
-| `tsconfig.json` | **TypeScript Config** | TypeScript compiler configuration for the frontend |
-| `index.html` | **HTML Template** | Main HTML template for the React application |
-
----
-
-## 🛠️ Installation & Setup
-
-### 🎯 Quick Start (Recommended)
-
-```bash
-# 1. Clone the repository
-git clone https://github.com/naholav/university-bot.git
-cd university-bot
-
-# 2. Run automated setup
-chmod +x scripts/setup_system.sh
-sudo ./scripts/setup_system.sh
-
-# 3. Configure environment
-# Create environment configuration from template
-cp config/env_loader.py.example config/env_loader.py  # if example exists
-nano .env  # Edit with your actual values
-
-# 4. Start the system
-./scripts/start_system.sh
-```
-
-### 🔧 Manual Installation
-
-#### Step 1: System Dependencies
-```bash
-# Ubuntu/Debian
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y python3 python3-pip python3-venv
-sudo apt install -y nodejs npm
-sudo apt install -y rabbitmq-server
-sudo apt install -y nginx supervisor
-sudo apt install -y git curl wget htop
-
-# Python virtual environment
-python3 -m venv .venv
-source .venv/bin/activate  # Linux/Mac
-```
-
-#### Step 2: Python Dependencies
-```bash
-# Upgrade pip and install requirements
-pip install --upgrade pip setuptools wheel
-pip install -r config/requirements.txt
-
-# Install additional development tools
-pip install pytest pytest-cov black flake8 mypy
-```
-
-#### Step 3: Frontend Setup
-```bash
-# Install Node.js dependencies
-cd admin_frontend
-npm install
-
-# Build for production
-npm run build
-cd ..
-```
-
-#### Step 4: Database Initialization
-```bash
-# Initialize SQLite database
-python3 -c "from src.database_models import init_db; init_db()"
-
-# Database initialization complete
-```
-
-#### Step 5: RabbitMQ Configuration
-```bash
-# Start and configure RabbitMQ
-sudo systemctl start rabbitmq-server
-sudo systemctl enable rabbitmq-server
-
-# Enable RabbitMQ management plugin
-sudo rabbitmq-plugins enable rabbitmq_management
-
-# RabbitMQ is now configured and running
-```
-
----
-
-## 🚀 Usage Guide
-
-### 🎯 Production Deployment
-
-```bash
-# Start all services
-./scripts/start_system.sh
-
-# Monitor system health
-./scripts/health_check.sh
-
-# View real-time logs
-tail -f logs/worker.log      # AI operations
-tail -f logs/bot.log         # Telegram interactions
-tail -f logs/admin.log       # Admin API
-tail -f logs/frontend.log    # React frontend
-tail -f logs/analytics.log   # Analytics data
-
-# Stop all services
-./scripts/stop_system.sh
-```
-
-### 🔧 Development Mode
-
-```bash
-# Start development environment
-./scripts/dev_mode.sh
-
-# Individual service startup
-python3 src/telegram_bot.py                 # Main bot
-python3 src/ai_model_worker.py              # AI worker
-uvicorn src.admin_rest_api:app --reload     # Admin API with hot reload
-cd admin_frontend && npm start              # Frontend with live reload
-```
-
-### 📊 System Monitoring
-
-```bash
-# Comprehensive system health check
-./scripts/health_check.sh
-
-# Service status monitoring
-ps aux | grep -E "(telegram_bot|ai_model_worker|admin_rest_api)"
-
-# Database queries and statistics
-sqlite3 university_bot.db "SELECT COUNT(*) FROM raw_data;"
-sqlite3 university_bot.db "SELECT language, COUNT(*) FROM raw_data GROUP BY language;"
-sqlite3 university_bot.db "SELECT AVG(like) FROM raw_data WHERE like IS NOT NULL;"
-
-# Queue monitoring
-sudo rabbitmqctl list_queues name messages
-
-# Performance monitoring
-htop  # System resources
-iostat -x 1  # Disk I/O
-netstat -tlnp  # Network connections
-```
-
----
-
-## 🌍 Environment Configuration
-
-### 📋 Essential Variables
-
-```bash
-# Bot Configuration
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-TELEGRAM_TOPIC_ID=                          # Optional: specific topic ID
-TELEGRAM_ADMIN_USERS=admin1,admin2          # Admin user IDs
-
-# AI Model Settings
-BASE_MODEL_NAME=meta-llama/Llama-3.2-3B
-LORA_MODEL_PATH=models/final-best-model-v1/method1
-MODEL_TEMPERATURE=0.7
-MODEL_MAX_NEW_TOKENS=200
-USE_CUDA=true
-MODEL_PRECISION=bfloat16
-USE_4BIT_QUANTIZATION=false
-MODEL_CACHE_DIR=./model_cache
-
-# Database Configuration
-DATABASE_URL=sqlite:///university_bot.db
-DATABASE_POOL_SIZE=20
-DATABASE_MAX_OVERFLOW=30
-DATABASE_POOL_TIMEOUT=30
-
-# Message Queue Settings
-RABBITMQ_HOST=localhost
-RABBITMQ_PORT=5672
-RABBITMQ_USERNAME=guest
-RABBITMQ_PASSWORD=guest
-RABBITMQ_URL=amqp://guest:guest@localhost:5672
-QUESTIONS_QUEUE=questions
-ANSWERS_QUEUE=answers
-FEEDBACK_QUEUE=feedback
-
-# Cache Configuration
-REDIS_HOST=localhost
-REDIS_PORT=6379
-REDIS_PASSWORD=
-REDIS_DB=0
-CACHE_TTL=3600
-
-# API Server Settings
-API_HOST=0.0.0.0
-API_PORT=8001
-CORS_ORIGINS=http://localhost:3000,https://your-domain.com
-API_RATE_LIMIT=100
-API_BURST_LIMIT=200
-
-# System Performance
-MAX_CONCURRENT_REQUESTS=3
-LOG_LEVEL=INFO
-DEBUG_MODE=false
-MONITORING_ENABLED=true
-METRICS_PORT=9090
-
-# Security Settings
-SECRET_KEY=your-secret-key-here
-JWT_SECRET=your-jwt-secret-here
-ENCRYPTION_KEY=your-encryption-key-here
-RATE_LIMIT_ENABLED=true
-SECURITY_HEADERS=true
-
-# Training Configuration
-TRAINING_BATCH_SIZE=4
-TRAINING_LEARNING_RATE=2e-4
-TRAINING_EPOCHS=3
-AUTO_RETRAIN_THRESHOLD=1000
-CLAUDE_API_KEY=your-claude-api-key-here
-```
-
-See `config/env_loader.py` for complete configuration options with detailed explanations.
-
----
-
-## 📊 Database Schema
-
-### 🗃️ Raw Data Table (Enhanced)
-```sql
-CREATE TABLE raw_data (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    telegram_id BIGINT NOT NULL,              -- User identifier
-    telegram_message_id BIGINT,               -- Message reference
-    username VARCHAR(100),                    -- User display name
-    question TEXT NOT NULL,                   -- Original question
-    answer TEXT,                              -- AI-generated response
-    language VARCHAR(10),                     -- 'TR' or 'EN'
-    like INTEGER,                             -- User feedback (-1, 1, NULL)
-    admin_approved INTEGER DEFAULT 0,         -- Admin approval (0/1)
-    is_duplicate BOOLEAN DEFAULT FALSE,       -- Duplicate detection
-    duplicate_of_id INTEGER REFERENCES raw_data(id),
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    answered_at DATETIME,                     -- Response timestamp
-    message_thread_id INTEGER,                -- Telegram topic ID
-    processing_time FLOAT,                    -- Response time (seconds)
-    similarity_score FLOAT,                   -- Duplicate similarity
-    model_version VARCHAR(50),                -- Model version used
-    context_length INTEGER,                   -- Input tokens
-    response_length INTEGER,                  -- Output tokens
-    user_session_id VARCHAR(100),             -- Session tracking
-    ip_address VARCHAR(45),                   -- User IP (if available)
-    user_agent TEXT,                          -- Client information
-    quality_score FLOAT,                      -- AI quality assessment
-    sentiment_score FLOAT,                    -- Sentiment analysis
-    complexity_score INTEGER,                 -- Question complexity (1-10)
-    topic_category VARCHAR(100),              -- Automated categorization
-    keywords TEXT,                            -- Extracted keywords
-    feedback_text TEXT,                       -- User feedback comments
-    admin_notes TEXT,                         -- Admin comments
-    last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-### 🎓 Training Data Table (Enhanced)
+**Training Data Table** - Stores approved training examples:
 ```sql
 CREATE TABLE training_data (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -635,403 +469,574 @@ CREATE TABLE training_data (
     question TEXT NOT NULL,
     answer TEXT NOT NULL,
     language VARCHAR(10),
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    quality_score INTEGER,
+    usage_count INTEGER DEFAULT 0,
+    effectiveness_score FLOAT,
+    category VARCHAR(100),
+    difficulty_level INTEGER,
+    topic_tags TEXT,
+    training_weight FLOAT,
+    augmentation_count INTEGER,
+    source_type VARCHAR(50),
+    review_status VARCHAR(20),
+    reviewer_id VARCHAR(100),
+    review_date DATETIME,
     admin_notes TEXT,
-    quality_score INTEGER,                    -- 1-10 quality rating
-    usage_count INTEGER DEFAULT 0,           -- Training usage frequency
-    last_used_at DATETIME,                   -- Last training run
-    effectiveness_score FLOAT,               -- Training effectiveness
-    category VARCHAR(100),                   -- Question category
-    difficulty_level INTEGER,                -- Complexity level
-    validation_score FLOAT,                  -- Validation performance
-    a_b_test_group VARCHAR(10),              -- A/B testing group
-    training_weight FLOAT DEFAULT 1.0,       -- Training sample weight
-    augmentation_count INTEGER DEFAULT 0,     -- Paraphrase variations
-    source_type VARCHAR(50),                 -- original/augmented/manual
-    review_status VARCHAR(20) DEFAULT 'pending', -- pending/approved/rejected
-    reviewer_id VARCHAR(100),                -- Admin who reviewed
-    review_date DATETIME,                    -- Review timestamp
-    version INTEGER DEFAULT 1,               -- Version tracking
-    is_active BOOLEAN DEFAULT TRUE           -- Active in training
-);
-```
-
-### 📈 Analytics Tables
-```sql
--- User analytics
-CREATE TABLE user_analytics (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    telegram_id BIGINT NOT NULL,
-    session_count INTEGER DEFAULT 0,
-    total_questions INTEGER DEFAULT 0,
-    avg_satisfaction FLOAT,
-    preferred_language VARCHAR(10),
-    most_active_hour INTEGER,
-    first_interaction DATETIME,
-    last_interaction DATETIME,
-    engagement_score FLOAT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
--- System metrics
-CREATE TABLE system_metrics (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    metric_name VARCHAR(100) NOT NULL,
-    metric_value FLOAT NOT NULL,
-    metric_type VARCHAR(50),
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    details TEXT
-);
-
--- Performance tracking
-CREATE TABLE performance_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    operation_type VARCHAR(50) NOT NULL,
-    duration_ms INTEGER NOT NULL,
-    success BOOLEAN NOT NULL,
-    error_message TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    metadata TEXT
+    version INTEGER,
+    is_active BOOLEAN,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_used_at DATETIME,
+    last_updated DATETIME
 );
 ```
 
 ---
 
-## 🔌 Advanced API Documentation
+## 🔧 Admin Panel Features
 
-### 📡 Core Admin REST API Endpoints
+### 🔒 Security & Authentication
+- **Password Protection**: Secure login with configurable credentials
+- **Session Management**: Automatic logout and session handling
+- **Production Ready**: Hashed passwords and secure token management
 
-#### Raw Data Management
-```http
-GET /api/raw-data
-POST /api/raw-data
-PUT /api/raw-data/{id}
-DELETE /api/raw-data/{id}
-GET /api/raw-data/search?q={query}
-GET /api/raw-data/filter?language={lang}&start_date={date}
+### 📊 Dashboard
+- **Real-time Statistics**: Total questions, approved questions, user feedback, duplicates
+- **TanStack Query**: Efficient data fetching with automatic caching
+- **Server-side Pagination**: Optimized for large datasets
+- **Auto-refresh**: Updates every 30 seconds
+
+### 📝 Data Management
+- **Raw Data Table**: View and manage all user interactions with extended fields
+  - **Telegram Information**: User ID, username, message ID display
+  - **User Identity**: Username with anonymous user indicators
+  - **Message Tracking**: Full telegram message ID for reference
+  - **Telegram User Info**: Shows telegram_id (T.ID) and telegram_message_id (M.ID)
+- **Training Data Table**: Curated Q&A pairs for model training
+- **Inline Editing**: Edit answers directly in the table
+- **Double-click Content View**: Full question/answer viewing with modal dialogs
+- **Individual Operations**: Approve and delete items one by one
+- **Enhanced Confirmation**: "Are you sure?" dialogs for training data approval
+- **Duplicate Detection**: Automatic detection with visual indicators
+
+### 🔍 Duplicate Detection System
+- **Automatic Duplicate Detection**: Real-time detection when new questions arrive
+- **Cosine Similarity Analysis**: Optimized thresholds for better quality control
+  - **Questions**: 45% similarity threshold (optimized for Turkish language)
+  - **Answers**: 85% similarity threshold (higher precision)
+- **Turkish Language Support**: TF-IDF vectorizer configured for Turkish characters
+- **Hybrid Similarity Approach**: Combines TF-IDF with Jaccard fallback
+- **Visual Duplicate Indicators**: Simple tags showing duplicate status
+- **Reference Display**: Shows which original ID the duplicate references
+- **Oldest-First Reference**: Always uses the oldest question as reference
+- **Automatic Integration**: No manual intervention needed
+
+### 📁 Documentation Viewer
+- **README Files**: View all project documentation
+- **System Logs**: Monitor system activity and errors
+- **Script Documentation**: Access to all automation scripts
+- **File Browser**: Navigate through project structure
+
+### ⚡ Performance Features
+- **Efficient Pagination**: Page-based navigation with configurable sizes
+- **Smart Caching**: Reduced API calls with intelligent cache invalidation
+- **Optimized Queries**: Database indexes for faster performance
+- **Rate Limiting**: Anti-spam protection for system stability
+- **Status Indicators**: Visual feedback for question status
+- **User Feedback**: Display like/dislike ratings
+- **Enhanced Filtering**: Filter by duplicate status and approval status
+
+### 🎓 Training Data Management
+- **View Training Data**: Browse approved training examples
+- **Delete Entries**: Remove unwanted training data
+- **Statistics**: Real-time count of training examples
+- **Duplicate Answer Detection**: Identifies duplicate answers in training data
+- **Quality Indicators**: Visual feedback for training data quality
+
+### 🔐 Enhanced Security Features
+- **Group-Only Access**: Bot configured to work ONLY in specific Telegram group (-1002630398173)
+- **Private Message Blocking**: All private messages and DMs are completely blocked
+- **Unauthorized Access Prevention**: Messages from other groups are ignored
+- **Database Protection**: Only authorized group messages are saved to database
+- **Security Logging**: All unauthorized access attempts are logged
+- **Traffic Filtering**: No unwanted traffic reaches the system
+
+### 🔌 API Endpoints
+- `GET /raw-data` - Get all raw data with telegram information
+- `PUT /raw-data/{id}` - Update answer
+- `POST /approve/{id}` - Approve question with duplicate detection
+- `GET /stats` - System statistics including duplicate counts
+- `GET /training-data` - Training data with duplicate information
+- `DELETE /training-data/{id}` - Delete training data
+- `GET /duplicates` - Get duplicate question groups
+
+---
+
+## 🔄 Model Versioning System
+
+### 🎯 Automatic Model Versioning
+Each training session creates a new versioned model:
+
+```
+models/
+├── active-model → final-best-model-v1    # Current active model
+├── final-best-model-v1/                  # First trained model
+├── final-best-model-v2/                  # Second trained model
+└── final-best-model-v3/                  # Third trained model
 ```
 
-#### Training Data Operations
-```http
-GET /api/training-data
-POST /api/training-data
-PUT /api/training-data/{id}
-DELETE /api/training-data/{id}
-POST /api/approve/{id}
-POST /api/bulk-approve
-POST /api/generate-variations/{id}
+### 🔄 Model Switching
+The system uses a symbolic link (`active-model`) to point to the current production model:
+
+```bash
+# List all model versions with info
+./scripts/switch_model.sh list
+
+# Switch to a specific version
+./scripts/switch_model.sh switch v2
+
+# Auto-switch to next available version
+./scripts/switch_model.sh auto
+
+# Check current active model
+./scripts/switch_model.sh current
 ```
 
-#### Analytics and Statistics
-```http
-GET /api/stats
-GET /api/analytics/users
-GET /api/analytics/performance
-GET /api/analytics/trends
-GET /api/duplicates
-GET /api/language-distribution
-GET /api/quality-metrics
+### 📊 Model Information
+Each model version includes:
+- **Training metrics**: Loss, steps, dataset size
+- **Configuration**: Learning rate, batch size, epochs
+- **Timestamp**: When the model was trained
+- **Version tracking**: Both training and model versions
+
+### 🚀 Production Benefits
+- **Zero-downtime switching**: Switch models without service restart
+- **Easy rollback**: Revert to previous model version instantly
+- **A/B testing**: Compare different model versions
+- **Progressive deployment**: Test new models before full rollout
+
+---
+
+## 🤖 Data Augmentation System
+
+### 🎯 AI-Powered Training Data Enhancement
+The system includes data augmentation using Anthropic's Claude API to generate training variations:
+
+#### 🧠 How It Works
+1. **Database Integration**: Loads approved training data from database
+2. **AI Generation**: Uses Claude API to create 15 variations per question
+3. **Quality Control**: Maintains semantic accuracy and natural language patterns
+4. **Security**: API key requested from user (never stored)
+5. **Checkpoint System**: Safe interruption and resumption
+
+#### ⚙️ Technical Features
+- **Multi-language Support**: Separate prompts for Turkish and English
+- **Student Profiles**: Generates variations reflecting different user types
+- **Style Diversity**: 15 different question and answer styles
+- **Link Preservation**: Maintains all URLs and technical details
+- **Progress Tracking**: Checkpoint system for large datasets
+
+#### 🔧 Usage
+```bash
+# Run data augmentation (requires Anthropic API key)
+./scripts/augment_training_data.sh
+
+# The script will:
+# 1. Check system prerequisites
+# 2. Validate database content
+# 3. Request API key from user
+# 4. Generate variations using Claude API
+# 5. Export to training format
 ```
 
-#### System Management
-```http
-GET /api/health
-GET /api/status
-GET /api/metrics
-POST /api/retrain-model
-POST /api/update-config
-GET /api/logs/{service}
+#### 🛡️ Security Features
+- **API Key Safety**: Never stored, only used in session
+- **User Confirmation**: Explicit consent required
+- **Cost Awareness**: Clear warnings about API usage costs
+- **Process Isolation**: Lock files prevent concurrent runs
+
+#### 🤖 Model Selection
+- **Default Model**: claude-3-sonnet-20240229
+- **Custom Models**: Users can choose different Claude models
+- **Model Reference**: https://docs.anthropic.com/claude/docs/models-overview
+- **Interactive Selection**: Choice presented during execution
+
+#### 📊 Benefits
+- **Data Quality**: High-quality, natural language variations
+- **Model Performance**: Improved training diversity
+- **Automated Pipeline**: Integration with training workflow
+- **Safe Operation**: Error handling and recovery
+
+---
+
+## 🔍 Duplicate Detection System
+
+### 🎯 High-Precision Semantic Deduplication
+The training system includes duplicate detection to ensure training data quality:
+
+#### 🧠 How It Works
+1. **Semantic Analysis**: Uses sentence-transformers to compute embeddings for questions and answers
+2. **Multi-Stage Filtering**: Primary check on answer similarity (94% threshold), secondary check on question similarity (98% threshold)
+3. **Language-Specific Processing**: Separate deduplication for Turkish and English content
+4. **Automatic Integration**: Runs automatically during training data preparation
+
+#### ⚙️ Technical Configuration
+- **Answer Similarity Threshold**: 94% (catches near-identical answers)
+- **Question Similarity Threshold**: 98% (prevents false positives from different questions with similar answers)
+- **Model**: paraphrase-multilingual-MiniLM-L12-v2 (supports Turkish and English)
+- **Processing**: Batch processing for efficiency
+
+#### 📊 Benefits
+- **Data Quality**: Removes redundant training examples
+- **Training Efficiency**: Reduces dataset size while maintaining quality
+- **Model Performance**: Prevents overfitting on duplicate examples
+- **Automatic**: No manual intervention required
+
+#### 🔧 Usage
+```bash
+# Duplicate detection runs automatically during training
+python3 src/train_model.py
+
+# Or during automatic training
+./scripts/train_model.sh
 ```
 
-#### Real-time Features
-```http
-WebSocket: /ws/updates
-WebSocket: /ws/analytics
-WebSocket: /ws/system-status
+**Note**: Requires `sentence-transformers` package. Install with:
+```bash
+pip install sentence-transformers>=2.2.0
 ```
 
-### 🔍 API Response Examples
+---
 
-#### Get Statistics
+## 🧠 Model Training
+
+### 🎯 Training Configuration
+- **Model**: LLaMA 3.2 3B with LoRA fine-tuning
+- **Hardware**: Optimized for RTX 5090 (24-25GB VRAM)
+- **Training Time**: ~3.5 hours
+- **Final Loss**: ~0.7665
+- **Dataset**: 18,000+ Turkish/English Q&A pairs
+
+### 🔄 Training Process
+1. **Data Preparation**: Load and validate training data
+2. **Model Setup**: Load LLaMA 3.2 3B with LoRA adapter
+3. **Training**: 3 epochs with gradient accumulation
+4. **Validation**: Separate Turkish/English validation
+5. **Model Saving**: Multiple save methods for reliability
+
+### 📊 Training Metrics
+- **Batch Size**: 4 (effective: 64 with gradient accumulation)
+- **Learning Rate**: 2e-4
+- **LoRA Rank**: 16
+- **Validation Split**: 7% of data
+- **Early Stopping**: 2 patience epochs
+
+### 📝 Training Log System
+- **Version Tracking**: Automatic v1.log, v2.log, v3.log creation
+- **Metadata Storage**: JSON files with training configuration and results
+- **Dual Logging**: Both versioned and timestamped logs
+- **Training History**: Complete log of all training sessions
+- **Progress Tracking**: Detailed training progress and metrics
+
+---
+
+## 🚀 Usage Guide
+
+### 🤖 Telegram Bot Commands
+- Send any question to get AI response
+- Use 👍/👎 buttons for feedback
+- Bot automatically detects Turkish/English
+
+### 🔧 Admin Panel Access
+1. **Start System**: `./scripts/start_system.sh`
+2. **Access Panel**: `http://localhost:3000`
+3. **Login**: Use configured admin credentials
+4. **Default Password**: `cucengedutr` (change in production)
+
+### 🔒 Production Security Setup
+```bash
+# Set secure admin password hash in .env
+export ADMIN_USERNAME=admin
+export ADMIN_PASSWORD_HASH=$(python -c "import hashlib; print(hashlib.sha256('your_secure_password'.encode()).hexdigest())")
+```
+
+### 📊 Monitoring
+- View logs in `logs/` directory
+- Check system health with `./scripts/test_environment.sh`
+- Monitor RabbitMQ queues
+
+### 📝 Training Log Management
+```bash
+# View all training versions
+ls -la logs/training/ # if training has been done
+
+# View specific training log
+tail -f logs/training/v1.log
+
+# View training metadata
+cat logs/training/v1_info.json
+
+# Compare training sessions (when v2 exists)
+diff logs/training/v1_info.json logs/training/v2_info.json
+```
+
+---
+
+## 🔄 Dynamic Learning System
+
+### 📈 Data Collection Flow
+```
+User Question → Raw Database → AI Processing → Response Generation
+       ↓
+User Feedback → Admin Review → Training Data → Model Retraining
+```
+
+### 🎯 Quality Control
+- **User Feedback**: Like/dislike system
+- **Admin Review**: Manual answer editing
+- **High-Precision Duplicate Detection**: Semantic similarity-based deduplication (94% answer + 98% question threshold)
+- **Quality Scoring**: Response quality assessment
+
+### 🔄 Continuous Improvement
+1. **Real-time Collection**: All interactions stored
+2. **Admin Curation**: Manual review and approval
+3. **Data Augmentation**: AI-powered training data enhancement using Claude API
+4. **Database Export**: Automatic conversion to training format
+5. **Duplicate Detection**: High-precision semantic deduplication during training
+6. **Model Retraining**: Periodic model updates
+7. **Quality Monitoring**: Track improvement metrics
+
+### 📊 Database to Training Export
+The system automatically converts approved database entries to training format:
+
+```bash
+# Manual export from database
+./scripts/export_training_data.sh
+
+# Export with options
+./scripts/export_training_data.sh --include-inactive --no-backup
+```
+
+**Export Process**:
+1. **Data Validation**: Checks question/answer quality and length
+2. **Language Mapping**: Converts TR→turkish, EN→english
+3. **Format Conversion**: Database → JSON format for training
+4. **Backup Creation**: Saves previous training data
+5. **Statistics**: Provides export summary and metrics
+
+**Auto-Export Features**:
+- **Triggered**: When training file is missing or older than 1 hour
+- **Automatic**: Runs before each training session
+- **Validated**: Ensures data quality and completeness
+- **Append Mode**: New database entries are added to existing training data
+- **Duplicate Prevention**: Avoids duplicate entries based on ID
+- **Logged**: Complete export process logging
+
+---
+
+## 🛡️ Security Features
+
+### 🔐 Environment Security
+- All tokens in `.env` file (gitignored)
+- No hardcoded credentials
+- Environment variable validation
+- Secure secret management
+
+### 🔒 API Security
+- Input validation and sanitization
+- Error handling and logging
+- CORS configuration
+- Request/response monitoring
+
+---
+
+## 📝 Training Log System
+
+### 🎯 Version Tracking
+The training system automatically creates versioned logs for each training session:
+
+```
+logs/
+├── training/        # Training logs (created during training)
+│   ├── v1.log       # First training session (when available)
+│   ├── v1_info.json # Training metadata for v1
+│   └── ...          # Additional training sessions
+├── admin.log        # Admin API logs
+├── bot.log          # Telegram bot logs
+├── worker.log       # AI worker logs
+└── error.log        # Error logs
+```
+
+### 📊 Log Content
+Each training log contains:
+- **Real-time Progress**: Step-by-step training progress
+- **Loss Metrics**: Training and validation loss values
+- **Performance Stats**: Memory usage, GPU utilization
+- **Error Messages**: Any issues encountered during training
+- **Completion Status**: Final training results
+
+### 🔍 Metadata Files
+Each `v{N}_info.json` file contains:
 ```json
 {
-  "total_questions": 2500,
-  "answered_questions": 2400,
-  "liked_questions": 1950,
-  "disliked_questions": 180,
-  "approved_questions": 1800,
-  "training_data_count": 1800,
-  "duplicate_count": 120,
-  "languages": {
-    "TR": {
-      "count": 1600,
-      "percentage": 64.0,
-      "avg_satisfaction": 0.85
-    },
-    "EN": {
-      "count": 900,
-      "percentage": 36.0,
-      "avg_satisfaction": 0.88
-    }
-  },
-  "avg_response_time": 1.8,
-  "success_rate": 91.5,
-  "model_version": "v1.2.3",
-  "uptime": "15 days, 8 hours",
-  "peak_usage": {
-    "hour": 14,
-    "questions_per_hour": 45
-  }
+  "version": "v2",
+  "final_loss": 0.7665,
+  "total_steps": 1250,
+  "dataset_size": 18000,
+  "model_name": "meta-llama/Llama-3.2-3B",
+  "lora_r": 16,
+  "lora_alpha": 32,
+  "learning_rate": 2e-4,
+  "num_epochs": 3,
+  "batch_size": 4,
+  "gradient_accumulation_steps": 16,
+  "validation_split": 0.07,
+  "timestamp": "2025-07-16T13:38:00",
+  "log_file": "v2.log",
+  "model_save_path": "/home/ceng/cu_ceng_bot/models/..."
 }
 ```
 
----
-
-## 🎯 Model Training & Continuous Learning
-
-### 📊 Training Pipeline
-
-#### Initial Training Process
-1. **Data Preparation**:
-   - Started with ~600 English + ~600 Turkish Q&A pairs
-   - Used Claude API for advanced paraphrasing
-   - Generated 15+ variations per original question
-   - Applied quality filtering and validation
-   - Final dataset: 18,000+ training pairs
-
-2. **Model Fine-tuning**:
-   - Base model: LLaMA 3.2 3B
-   - Method: LoRA (Low-Rank Adaptation)
-   - Training time: ~4 hours on GPU
-   - Final loss: 0.8259
-   - Validation accuracy: 89.5%
-
-#### Continuous Learning Workflow
-```
-New User Question
-       ↓
-  Store in raw_data
-       ↓
-  AI Model Processing
-       ↓
-  Response Generation
-       ↓
-  User Feedback Collection
-       ↓
-  Admin Review & Approval
-       ↓
-  Move to training_data
-       ↓
-  Threshold Check (1000+ new entries)
-       ↓
-  Automated Retraining
-       ↓
-  Model Version Update
-       ↓
-  A/B Testing
-       ↓
-  Production Deployment
-```
-
-### 🔄 Automated Retraining System
-
-#### Retraining Triggers
-- **Data Volume**: 1000+ new approved Q&A pairs
-- **Quality Threshold**: Average satisfaction < 0.8
-- **Time-based**: Monthly scheduled retraining
-- **Manual**: Admin-triggered retraining
-
-#### Retraining Process
+### 🛠️ Usage Examples
 ```bash
-# Automated retraining script
-./scripts/retrain_model.sh
+# View all training sessions
+ls -la logs/training/ # if training has been done
 
-# Manual retraining with custom parameters
-python3 src/model_training.py --dataset-size 5000 --epochs 3 --learning-rate 2e-4
+# Follow latest training session
+tail -f logs/training/v$(ls logs/training/ | grep -E '^v[0-9]+\.log$' | sort -V | tail -1 | sed 's/v\|\.log//g').log
+
+# Compare training configurations
+diff logs/training/v1_info.json logs/training/v2_info.json
+
+# View training summary
+cat logs/training/v2_info.json | jq '.final_loss, .total_steps, .dataset_size'
+
+# Find best performing model
+python3 -c "
+import json
+import os
+history_dir = 'logs/training_history'
+best_loss = float('inf')
+best_version = None
+for file in os.listdir(history_dir):
+    if file.endswith('_info.json'):
+        with open(os.path.join(history_dir, file), 'r') as f:
+            data = json.load(f)
+            if data['final_loss'] < best_loss:
+                best_loss = data['final_loss']
+                best_version = data['version']
+print(f'Best model: {best_version} with loss {best_loss}')
+"
 ```
 
-#### Model Versioning
-- **Version Format**: v{major}.{minor}.{patch}
-- **Rollback Support**: Previous model versions kept
-- **A/B Testing**: Gradual rollout to user segments
-- **Performance Monitoring**: Real-time quality metrics
+### 🚀 Automatic Integration
+The training system automatically:
+1. **Detects Next Version**: Scans existing logs to determine next version number
+2. **Creates Dual Logs**: Both versioned (v2.log) and timestamped logs
+3. **Saves Metadata**: Complete training configuration and results
+4. **Updates Summary**: Shows training history in completion summary
 
 ---
 
-## 🛡️ Security & Privacy
+## 📈 Performance
 
-### 🔒 Security Features
+### ⚡ Current Metrics
+- **Response Time**: ~2-3 seconds average
+- **Model Loading**: ~30 seconds initial
+- **Memory Usage**: ~8GB during inference
+- **GPU Utilization**: Optimized for RTX 5090
 
-#### Data Protection
-- **Encryption**: All sensitive data encrypted at rest
-- **Access Control**: Role-based admin access
-- **Audit Logs**: Complete activity tracking
-- **Privacy**: No PII stored in training data
-- **Anonymization**: User data anonymized for analytics
-
-#### API Security
-- **Rate Limiting**: 100 requests/minute per IP
-- **Input Validation**: Comprehensive sanitization
-- **CORS**: Configured for specific origins
-- **HTTPS**: TLS 1.3 encryption
-- **JWT**: Secure token-based authentication
-
-#### System Security
-- **Firewall**: Configured ports and access
-- **Updates**: Regular security patching
-- **Monitoring**: Real-time threat detection
-- **Backup**: Encrypted backup storage
-- **Recovery**: Disaster recovery procedures
-
----
-
-## 📈 Performance & Scalability
-
-### ⚡ Performance Metrics
-
-#### Current Performance
-- **Response Time**: Average 1.8 seconds
-- **Throughput**: 100 requests/minute
-- **Accuracy**: 89.5% user satisfaction
-- **Uptime**: 99.9% availability
-- **Memory Usage**: 2.5GB typical
-
-#### Optimization Features
-- **Model Caching**: Reduced loading time
+### 🎯 Optimization Features
+- **Model Caching**: Faster subsequent responses
 - **Queue Processing**: Asynchronous handling
-- **Database Indexing**: Optimized queries
-- **CDN**: Static asset delivery
-- **Compression**: Reduced bandwidth
-
-### 📊 Scalability Considerations
-
-#### Horizontal Scaling
-- **Load Balancing**: Multiple API instances
-- **Worker Scaling**: Additional AI workers
-- **Database Sharding**: Distributed data
-- **Memory Caching**: In-memory model caching
-- **Message Queues**: RabbitMQ clustering
-
-#### Vertical Scaling
-- **GPU Acceleration**: Model inference
-- **Memory Optimization**: Efficient caching
-- **CPU Optimization**: Parallel processing
-- **Storage**: SSD for database
-- **Network**: High-bandwidth connections
+- **Batch Processing**: Efficient inference
+- **Memory Management**: Optimized model loading
 
 ---
 
-## 🐛 Troubleshooting Guide
+## 🐛 Troubleshooting
 
-### 🔧 Common Issues
+### Common Issues
 
-<details>
-<summary><strong>🤖 Model Loading Issues</strong></summary>
+**Model Setup Problems**:
+```bash
+# If model files are missing, download from HuggingFace:
+# https://huggingface.co/Naholav/cengbot-lora-tr-en-cukurova
 
+# Create proper directory structure
+mkdir -p models/final-best-model-v1/method1/
+
+# Create symlink if missing
+cd models/
+ln -sf final-best-model-v1 active-model
+cd ..
+
+# Verify symlink
+ls -la models/active-model
+```
+
+**Model Loading Problems**:
 ```bash
 # Check GPU availability
 nvidia-smi
 python3 -c "import torch; print(torch.cuda.is_available())"
 
-# Verify model files
+# Verify model files exist
 ls -la models/final-best-model-v1/method1/
+ls -la models/active-model
 
-# Check memory usage
-free -h
-htop
-
-# Test model loading
-python3 -c "from src.llama_model_handler import ModelHandler; m = ModelHandler(); print('Model loaded successfully')"
+# Check if required model files are present
+# Should contain: adapter_config.json, adapter_model.safetensors, etc.
 ```
-</details>
 
-<details>
-<summary><strong>🔄 RabbitMQ Connection Problems</strong></summary>
-
+**RabbitMQ Connection Issues**:
 ```bash
 # Check RabbitMQ service
 sudo systemctl status rabbitmq-server
 sudo systemctl restart rabbitmq-server
 
-# Verify port availability
-ss -tlnp | grep 5672
-netstat -tlnp | grep 5672
-
-# View RabbitMQ logs
-sudo journalctl -u rabbitmq-server -f
-
-# Check queue status
-sudo rabbitmqctl list_queues name messages
-sudo rabbitmqctl list_connections
+# Verify queue status
+sudo rabbitmqctl list_queues
 ```
-</details>
 
-<details>
-<summary><strong>💾 Database Issues</strong></summary>
-
+**Database Issues**:
 ```bash
-# Check database permissions
+# Check database file
 ls -la university_bot.db
-chmod 666 university_bot.db
 
-# Verify database integrity
-sqlite3 university_bot.db "PRAGMA integrity_check;"
-sqlite3 university_bot.db "PRAGMA foreign_key_check;"
-
-# Reinitialize database
+# Reinitialize if needed
 python3 -c "from src.database_models import init_db; init_db()"
-
-# Backup and restore
-cp university_bot.db university_bot.db.backup
-sqlite3 university_bot.db ".backup backup.db"
 ```
-</details>
-
-<details>
-<summary><strong>🌐 Frontend Issues</strong></summary>
-
-```bash
-# Check Node.js version
-node --version
-npm --version
-
-# Clear cache and reinstall
-cd admin_frontend
-rm -rf node_modules package-lock.json
-npm cache clean --force
-npm install
-
-# Check for port conflicts
-ss -tlnp | grep 3000
-lsof -i :3000
-
-# Build issues
-npm run build
-npm run lint
-npm run type-check
-```
-</details>
 
 ---
 
-## 📞 Support & Community
+## 📞 Support
 
-### 💬 Getting Help
+### 📧 Contact Information
+- **Email**: arda.mulayim@outlook.com
+- **Bot**: [@cu_ceng_v1_bot](https://t.me/cu_ceng_v1_bot)
+- **HuggingFace**: [Naholav](https://huggingface.co/Naholav)
 
-- **📧 Email**: naholav@cu.edu.tr
-- **💬 Telegram**: [@cengbot_support](https://t.me/cengbot_support)
-- **🐛 Issues**: [GitHub Issues](https://github.com/naholav/university-bot/issues)
-- **📖 Documentation**: [GitHub Wiki](https://github.com/naholav/university-bot/wiki)
-- **💡 Discussions**: [GitHub Discussions](https://github.com/naholav/university-bot/discussions)
+### 📚 Documentation
+- **Training Scripts**: `scripts/README.md`
+- **API Documentation**: Auto-generated at `http://localhost:8001/docs`
+- **Model Information**: `models/final-best-model-v1/method1/README.md`
 
-### 📚 Additional Resources
+---
 
-- **🎯 Quick Start**: Get running in 5 minutes
-- **🔧 API Docs**: `http://localhost:8001/docs` (when running)
-- **🏗️ Architecture**: See `docs/ARCHITECTURE.md`
-- **🚀 Deployment**: See `docs/DEPLOYMENT.md`
-- **🔧 Development**: See `docs/DEVELOPMENT.md`
-- **📖 API Reference**: See `docs/API.md`
+## 📝 Changelog
+
+### August 2025 Updates
+- **Dataset Expansion**: Training dataset expanded from 18,000 to 22,000+ examples with new Q&A pairs
+- **Model Update**: Active model version set to v1.2 (latest trained model)
+- **Training Parameters Enhanced**:
+  - Training epochs increased from 3 to 4 for optimal performance with 22k dataset
+  - Warmup ratio adjusted from 0.03 to 0.05 for better convergence
+  - Early stopping patience increased from 2 to 3 epochs
+  - Training logs now stored in version-specific directories (train_logs_llama_v1.2/)
+- **Inference Improvements**:
+  - System prompt updated to allow maximum 4 sentences (previously 3) for more detailed responses
+  - Response quality enhanced while maintaining conciseness
+- **Documentation Updates**: All documentation updated to reflect latest changes
 
 ---
 
@@ -1039,44 +1044,24 @@ npm run type-check
 
 This project is licensed under the **Apache License 2.0**.
 
-```
-Copyright 2024 naholav
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
-
 ---
 
 ## 👨‍💻 Author
 
-**naholav** - Project Creator and Lead Developer
-
-- **GitHub**: [@naholav](https://github.com/naholav)
+**naholav**
+- **Email**: arda.mulayim@outlook.com
 - **University**: Çukurova University Computer Engineering Department
-- **Email**: naholav@cu.edu.tr
-- **LinkedIn**: [naholav](https://linkedin.com/in/naholav)
+- **GitHub**: [naholav](https://github.com/naholav)
+- **Date**: August 2025
 
 ---
 
 ## 🙏 Acknowledgments
 
-- **Meta AI** for the excellent LLaMA 3.2 3B base model
-- **Anthropic** for Claude API enabling advanced data augmentation
-- **Hugging Face** for the transformers and PEFT libraries
-- **Çukurova University** for providing domain expertise and support
-- **Open Source Community** for the amazing ML tools and frameworks
-- **Contributors** who helped improve the system
-- **Students** who provide feedback and help the system learn
+- **Meta AI** for the LLaMA 3.2 3B base model
+- **Hugging Face** for transformers and PEFT libraries
+- **Çukurova University** for domain expertise and support
+- **Open Source Community** for ML tools and frameworks
 
 ---
 
@@ -1084,16 +1069,14 @@ limitations under the License.
 
 ### 🎉 **CengBot - Dynamic AI Learning System**
 
-**Built with ❤️ by naholav for Çukurova University Computer Engineering Department**
+**Built with ❤️ for Çukurova University Computer Engineering Department**
 
 **🚀 Production Ready • 🔧 Easy to Deploy • 📚 Well Documented • 🌟 Continuously Learning**
 
-*"CengBot represents the future of educational AI - a system that learns, adapts, and improves with every interaction."*
-
 ---
 
-**🔥 Key Innovation**: Dynamic training system that continuously improves through user interactions  
-**🎯 Mission**: Provide intelligent, personalized assistance to computer engineering students  
+**🔥 Key Innovation**: Dynamic learning system that improves through user interactions  
+**🎯 Mission**: Provide intelligent assistance to computer engineering students  
 **🌟 Vision**: Create a self-evolving AI system that grows with its users  
 
 </div>

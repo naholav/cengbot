@@ -35,7 +35,7 @@ python3 -c "from database_models import init_db; init_db()"
 cd ..
 
 # 6. Start development environment
-./scripts/dev_mode.sh
+./scripts/start_system.sh
 ```
 
 ## 📁 Project Structure for Developers
@@ -59,7 +59,7 @@ src/
 ```python
 # Follow PEP 8 conventions
 # Use type hints
-# Add comprehensive docstrings
+# Add detailed docstrings
 
 def process_message(message: str, language: str) -> Optional[str]:
     """
@@ -440,7 +440,7 @@ clean:
 	rm -rf .mypy_cache/
 
 dev:
-	./scripts/dev_mode.sh
+	./scripts/start_system.sh
 
 prod:
 	./scripts/start_system.sh
@@ -644,4 +644,4 @@ class MessageInput(BaseModel):
         return v.strip()
 ```
 
-This development guide provides comprehensive information for developers working on CengBot, covering everything from setup to advanced development practices.
+This development guide provides information for developers working on CengBot, covering setup to development practices.

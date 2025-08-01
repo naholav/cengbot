@@ -1,22 +1,33 @@
 import logging
 import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.constants import ParseMode
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from database_models import SessionLocal, RawData, TrainingData, init_db
+from database_models import SessionLocal, RawData, TrainingData, init_db, mark_duplicate_questions, handle_user_vote, get_vote_statistics
 import asyncio
 import pika
 import json
 import threading
 from queue import Queue
 from langdetect import detect
+from collections import defaultdict
+import time
+from config.env_loader import load_config
+
+# Load configuration
+config = load_config()
 
 # Bot configuration
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-BOT_TOPIC_ID = None  # Will be set to specific topic ID if needed
+BOT_TOKEN = config.telegram_bot_token
+BOT_TOPIC_ID = config.telegram_topic_id
+
+# SECURITY: Only allow this specific group
+ALLOWED_CHAT_ID = -1002630398173  # The specific group ID from the URL
 
 # Configure logging
 logging.basicConfig(
@@ -28,26 +39,38 @@ logger = logging.getLogger(__name__)
 # Global queue for answers
 answer_queue = Queue()
 
-def check_similarity(db: Session, question: str) -> list:
-    """Check for similar questions - simplified for SQLite"""
-    try:
-        # Simple similarity check for SQLite
-        results = db.execute(
-            text("""
-            SELECT id, question FROM raw_data 
-            WHERE question LIKE :pattern
-            LIMIT 5
-            """),
-            {"pattern": f"%{question[:20]}%"}
-        ).fetchall()
-        return results
-    except Exception as e:
-        logger.error(f"Similarity check error: {e}")
-        return []
+# Rate limiting configuration
+RATE_LIMIT_MESSAGES = 5  # Messages per minute
+RATE_LIMIT_WINDOW = 60  # Time window in seconds
+user_message_history = defaultdict(list)
+
+def is_rate_limited(user_id: int) -> bool:
+    """Check if user has exceeded rate limit"""
+    current_time = time.time()
+    
+    # Clean old entries
+    user_message_history[user_id] = [
+        timestamp for timestamp in user_message_history[user_id]
+        if current_time - timestamp < RATE_LIMIT_WINDOW
+    ]
+    
+    # Check if limit exceeded
+    if len(user_message_history[user_id]) >= RATE_LIMIT_MESSAGES:
+        return True
+    
+    # Add current message timestamp
+    user_message_history[user_id].append(current_time)
+    return False
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming messages in group"""
     if not update.message or not update.message.text:
+        return
+    
+    # SECURITY: Only process messages from the allowed group
+    if update.message.chat.id != ALLOWED_CHAT_ID:
+        logger.warning(f"Unauthorized access attempt from chat ID: {update.message.chat.id}")
         return
     
     # Check if message is in correct topic (if BOT_TOPIC_ID is set)
@@ -60,6 +83,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     # Skip if message is a command
     if message_text.startswith('/'):
+        return
+    
+    # Check rate limiting
+    if is_rate_limited(user.id):
+        await update.message.reply_text(
+            "⚠️ You're sending messages too quickly. Please wait a moment before sending another message.",
+            reply_to_message_id=update.message.message_id
+        )
         return
     
     db = SessionLocal()
@@ -83,12 +114,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         db.commit()
         db.refresh(raw_data)
         
-        # Check for duplicates
-        similar_questions = check_similarity(db, message_text)
-        if similar_questions and len(similar_questions) > 1:  # Exclude self
-            raw_data.is_duplicate = True
-            raw_data.duplicate_of_id = similar_questions[1][0]  # First similar (excluding self)
-            db.commit()
+        # Automatically check for duplicates using cosine similarity
+        mark_duplicate_questions(db, raw_data.id, raw_data.question)
         
         # Send typing action
         await update.message.chat.send_action("typing")
@@ -123,11 +150,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             
             await asyncio.sleep(0.1)
         
-        # Create inline keyboard for feedback
+        # Create inline keyboard for feedback with initial vote counts
+        vote_stats = get_vote_statistics(db, raw_data.id)
         keyboard = [
             [
-                InlineKeyboardButton("👍", callback_data=f"like_{raw_data.id}"),
-                InlineKeyboardButton("👎", callback_data=f"dislike_{raw_data.id}")
+                InlineKeyboardButton(f"👍 {vote_stats['likes']}", callback_data=f"like_{raw_data.id}"),
+                InlineKeyboardButton(f"👎 {vote_stats['dislikes']}", callback_data=f"dislike_{raw_data.id}")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -142,7 +170,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode=ParseMode.HTML
         )
         
-        # Update telegram_message_id
+        # Update telegram_message_id with bot's response message ID
         raw_data.telegram_message_id = sent_message.message_id
         db.commit()
         
@@ -153,13 +181,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         db.close()
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline button callbacks"""
+    """Handle inline button callbacks with user-based voting system"""
     query = update.callback_query
-    await query.answer()
+    
+    # SECURITY: Only process callbacks from the allowed group
+    if query.message and query.message.chat.id != ALLOWED_CHAT_ID:
+        logger.warning(f"Unauthorized callback attempt from chat ID: {query.message.chat.id}")
+        await query.answer("Unauthorized access!", show_alert=True)
+        return
     
     # Parse callback data
     action, raw_data_id = query.data.split('_')
     raw_data_id = int(raw_data_id)
+    user_id = query.from_user.id
     
     db = SessionLocal()
     try:
@@ -169,32 +203,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Record not found!", show_alert=True)
             return
         
-        # Update point status (1 for like, -1 for dislike)
-        if action == "like":
-            raw_data.like = 1
-            await query.answer("You liked it! 👍")
-        else:
-            raw_data.like = -1
-            await query.answer("You disliked it! 👎")
+        # Handle user vote
+        vote_type = 1 if action == "like" else -1
+        vote_result = handle_user_vote(db, raw_data_id, user_id, vote_type)
         
-        db.commit()
+        # Answer with vote result message
+        await query.answer(vote_result["message"], show_alert=not vote_result["success"])
         
-        # Update button text to show current status
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    "👍" + (" ✓" if raw_data.like == 1 else ""), 
-                    callback_data=f"like_{raw_data_id}"
-                ),
-                InlineKeyboardButton(
-                    "👎" + (" ✓" if raw_data.like == -1 else ""), 
-                    callback_data=f"dislike_{raw_data_id}"
-                )
+        if vote_result["success"]:
+            # Get updated vote statistics
+            vote_stats = get_vote_statistics(db, raw_data_id)
+            
+            # Update button text to show vote counts
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        f"👍 {vote_stats['likes']}", 
+                        callback_data=f"like_{raw_data_id}"
+                    ),
+                    InlineKeyboardButton(
+                        f"👎 {vote_stats['dislikes']}", 
+                        callback_data=f"dislike_{raw_data_id}"
+                    )
+                ]
             ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_reply_markup(reply_markup=reply_markup)
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_reply_markup(reply_markup=reply_markup)
         
     except Exception as e:
         logger.error(f"Error handling callback: {e}")
@@ -204,6 +239,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command"""
+    # SECURITY: Only respond to start command in the allowed group
+    if update.message.chat.id != ALLOWED_CHAT_ID:
+        logger.warning(f"Unauthorized start command from chat ID: {update.message.chat.id}")
+        return
+    
     await update.message.reply_text(
         "Hello! I am the Çukurova University Computer Engineering AI assistant.\n"
         "You can write your questions to the group, and I will try to help you."
@@ -216,14 +256,15 @@ def main() -> None:
     
     # Model is now loaded in RabbitMQ worker
     logger.info("Bot starting... Model will be loaded in RabbitMQ worker.")
+    logger.info(f"SECURITY: Bot configured to ONLY work in group: {ALLOWED_CHAT_ID}")
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Add handlers
-    application.add_handler(CommandHandler("start", start_command))
+    # Add handlers - ONLY for the specific group
+    application.add_handler(CommandHandler("start", start_command, filters=filters.Chat(ALLOWED_CHAT_ID)))
     application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, 
+        filters.TEXT & ~filters.COMMAND & filters.Chat(ALLOWED_CHAT_ID) & filters.ChatType.GROUPS, 
         handle_message
     ))
     application.add_handler(CallbackQueryHandler(handle_callback))

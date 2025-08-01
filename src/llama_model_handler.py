@@ -9,13 +9,17 @@ from transformers import (
 from peft import PeftModel
 import logging
 from langdetect import detect, LangDetectException
+try:
+    from .error_handler import handle_model_error, handle_error, ErrorLevel
+except ImportError:
+    from error_handler import handle_model_error, handle_error, ErrorLevel
 
 logger = logging.getLogger(__name__)
 
 class ModelConfig:
-    # Model paths - Windows paths
+    # Model paths - Updated for active model system
     base_model = "meta-llama/Llama-3.2-3B"
-    lora_model_path = "models/final-best-model-v1/method1"
+    lora_model_path = "models/active-model"  # Uses active-model symlink (method1 added dynamically if exists)
     cache_dir = "model_cache"
     use_local_cache = True
     
@@ -26,11 +30,11 @@ class ModelConfig:
     top_p = 0.95
     top_k = 50
     
-    # System prompts - AYNEN KORUNDU
+    # System prompts 
     system_prompt_tr = """Sen Çukurova Üniversitesi Bilgisayar Mühendisliği bölümünün deneyimli dijital asistanısın. Öğrencilere samimi, yardımsever ve doğru bilgiler vererek destek oluyorsun.
 
 Önemli kurallar:
-- Her soruya MAKSİMUM 3 CÜMLE ile yanıt ver
+- Her soruya MAKSİMUM 4 CÜMLE ile yanıt ver
 - Cevapların çok kısa, net ve anlaşılır olmalı
 - Gereksiz açıklamalardan ve tekrarlardan kesinlikle kaçın
 - Selamlama mesajlarına tek cümlelik karşılık ver
@@ -41,7 +45,7 @@ class ModelConfig:
     system_prompt_en = """You are an experienced digital assistant for Çukurova University Computer Engineering Department. You help students by providing friendly, helpful and accurate information.
 
 Important rules:
-- Answer each question with MAXIMUM 3 SENTENCES
+- Answer each question with MAXIMUM 4 SENTENCES
 - Keep your answers very short, clear and understandable
 - Absolutely avoid unnecessary explanations and repetitions
 - Reply to greeting messages with a single sentence
@@ -115,25 +119,38 @@ class CengBotModel:
                 force_download=False
             )
             
-            # Load LoRA weights - ZORUNLU
-            if os.path.exists(self.config.lora_model_path):
-                logger.info(f"Loading LoRA weights from {self.config.lora_model_path}...")
-                self.model = PeftModel.from_pretrained(
-                    base_model,
-                    self.config.lora_model_path,
-                    torch_dtype=torch.bfloat16,
-                    device_map="auto"
-                )
-                logger.info("✅ LoRA adapter loaded successfully!")
+            # Load LoRA weights - check for both v1 style (method1 subdir) and v1.1 style (direct)
+            lora_path = self.config.lora_model_path
+            method1_path = os.path.join(lora_path, "method1")
+            
+            # Determine the correct path to use
+            if os.path.exists(method1_path) and os.path.exists(os.path.join(method1_path, "adapter_model.safetensors")):
+                # v1 style with method1 subdirectory
+                actual_lora_path = method1_path
+                logger.info(f"Found v1 style model structure (with method1 subdirectory)")
+            elif os.path.exists(os.path.join(lora_path, "adapter_model.safetensors")):
+                # v1.1 style with direct adapter files
+                actual_lora_path = lora_path
+                logger.info(f"Found v1.1 style model structure (direct adapter files)")
             else:
-                logger.error(f"❌ LoRA adapter not found at {self.config.lora_model_path}")
-                raise FileNotFoundError(f"LoRA adapter required but not found at {self.config.lora_model_path}")
+                logger.error(f"❌ LoRA adapter not found at {lora_path} or {method1_path}")
+                raise FileNotFoundError(f"LoRA adapter required but not found")
+            
+            logger.info(f"Loading LoRA weights from {actual_lora_path}...")
+            self.model = PeftModel.from_pretrained(
+                base_model,
+                actual_lora_path,
+                torch_dtype=torch.bfloat16,
+                device_map="auto"
+            )
+            logger.info("✅ LoRA adapter loaded successfully!")
             
             self.model.eval()
             logger.info("🎉 LLaMA 3.2 3B + LoRA model loaded successfully!")
             return True
             
         except Exception as e:
+            error_response = handle_model_error(e, "load_model")
             logger.error(f"Failed to load model: {e}")
             return False
     
@@ -240,8 +257,9 @@ class CengBotModel:
             return response
             
         except Exception as e:
+            error_response = handle_model_error(e, "generate_response")
             logger.error(f"Generation error: {e}")
-            return f"Error occurred: {str(e)}"
+            return "Sorry, I encountered an error while generating a response. Please try again."
 
 # Global model instance
 model_instance = CengBotModel()

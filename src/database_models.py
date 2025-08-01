@@ -19,7 +19,7 @@ import asyncio
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Text, Boolean, DateTime, Float, ForeignKey, text
+from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Text, Boolean, DateTime, Float, ForeignKey, text, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.sql import func
@@ -33,7 +33,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Database connection configuration
-DATABASE_URL = "sqlite:///university_bot.db"
+import os
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'university_bot.db')}"
 engine = create_engine(
     DATABASE_URL, 
     echo=False, 
@@ -162,6 +164,43 @@ class TrainingData(Base):
     # Relationships
     source = relationship("RawData", back_populates="training_data")
 
+# Database indexes for performance optimization
+Index('idx_raw_data_telegram_id', RawData.telegram_id)
+Index('idx_raw_data_created_at', RawData.created_at)
+Index('idx_raw_data_admin_approved', RawData.admin_approved)
+Index('idx_raw_data_like', RawData.like)
+Index('idx_raw_data_language', RawData.language)
+Index('idx_raw_data_is_duplicate', RawData.is_duplicate)
+Index('idx_raw_data_composite', RawData.telegram_id, RawData.created_at)
+
+Index('idx_training_data_created_at', TrainingData.created_at)
+Index('idx_training_data_source_id', TrainingData.source_id)
+Index('idx_training_data_language', TrainingData.language)
+Index('idx_training_data_review_status', TrainingData.review_status)
+Index('idx_training_data_is_active', TrainingData.is_active)
+
+class UserVotes(Base):
+    """
+    User votes model for tracking user votes on questions with change limits.
+    """
+    __tablename__ = "user_votes"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    raw_data_id = Column(Integer, ForeignKey('raw_data.id'), nullable=False)
+    telegram_user_id = Column(BigInteger, nullable=False, index=True)
+    current_vote = Column(Integer)  # 1 (like), -1 (dislike), NULL (no vote)
+    vote_changes_count = Column(Integer, default=0)  # Max 2 changes allowed
+    
+    # Timestamps
+    first_vote_at = Column(DateTime, default=datetime.utcnow)
+    last_vote_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Composite unique constraint
+    __table_args__ = (
+        Index('idx_user_votes_composite', 'raw_data_id', 'telegram_user_id'),
+    )
+
 class UserAnalytics(Base):
     """
     User analytics model for tracking user behavior and engagement.
@@ -261,39 +300,93 @@ def calculate_cosine_similarity(text1: str, text2: str) -> float:
         if clean_text1 == clean_text2:
             return 1.0
         
-        # Calculate TF-IDF vectors
-        tfidf_matrix = vectorizer.fit_transform([clean_text1, clean_text2])
+        # Simple word-based similarity using set intersection
+        words1 = set(clean_text1.split())
+        words2 = set(clean_text2.split())
         
-        # Calculate cosine similarity
-        similarity_matrix = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])
+        # Calculate Jaccard similarity as a fallback
+        if len(words1) == 0 or len(words2) == 0:
+            return 0.0
+            
+        intersection = words1.intersection(words2)
+        union = words1.union(words2)
         
-        return float(similarity_matrix[0][0])
+        if len(union) == 0:
+            return 0.0
+            
+        jaccard_score = len(intersection) / len(union)
+        
+        # Try TF-IDF as primary method
+        try:
+            # Add a dummy document to ensure min_df works
+            dummy_doc = "dummy document text"
+            texts = [clean_text1, clean_text2, dummy_doc]
+            
+            # Create vectorizer
+            local_vectorizer = TfidfVectorizer(
+                max_features=1000,
+                stop_words=None,
+                lowercase=True,
+                ngram_range=(1, 1),  # Only unigrams for simplicity
+                min_df=1,
+                token_pattern=r'[a-zA-ZçÇğĞıIİöÖşŞüÜ]+',
+                analyzer='word'
+            )
+            
+            # Calculate TF-IDF vectors
+            tfidf_matrix = local_vectorizer.fit_transform(texts)
+            
+            # Calculate cosine similarity between first two documents
+            similarity_matrix = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])
+            tfidf_score = float(similarity_matrix[0][0])
+            
+            # Use TF-IDF score if it's reasonable, otherwise use Jaccard
+            final_score = tfidf_score if tfidf_score > 0.0 else jaccard_score
+            
+        except Exception as tfidf_error:
+            logger.warning(f"TF-IDF failed, using Jaccard similarity: {tfidf_error}")
+            final_score = jaccard_score
+        
+        logger.info(f"Similarity calculated: {final_score:.3f} (Jaccard: {jaccard_score:.3f}) for texts: '{clean_text1[:50]}...' vs '{clean_text2[:50]}...'")
+        return final_score
         
     except Exception as e:
         logger.error(f"Error calculating cosine similarity: {e}")
         return 0.0
 
-def find_similar_questions(db: Session, question: str, threshold: float = 0.8) -> List[Tuple[int, str, float]]:
+def find_similar_questions(db: Session, question: str, threshold: float = 0.45, limit: int = 100) -> List[Tuple[int, str, float]]:
     """
-    Find similar questions in the raw_data table.
+    Find similar questions in the raw_data table using cosine similarity.
+    Optimized to limit database queries and improve performance.
     
     Args:
         db: Database session
         question: Question text to compare
         threshold: Similarity threshold (default: 0.8)
+        limit: Maximum number of questions to compare (default: 100)
         
     Returns:
         List of tuples (id, question, similarity_score)
     """
     try:
-        # Get all questions from database
-        existing_questions = db.query(RawData.id, RawData.question).all()
+        # Get recent questions first (more likely to be similar)
+        existing_questions = db.query(RawData.id, RawData.question)\
+            .order_by(RawData.created_at.desc())\
+            .limit(limit)\
+            .all()
         
         similar_questions = []
         
+        # Pre-process the input question for better comparison
+        question_cleaned = clean_text(question)
+        
         for existing_id, existing_question in existing_questions:
+            # Skip empty questions
+            if not existing_question or not existing_question.strip():
+                continue
+                
             # Calculate similarity
-            similarity = calculate_cosine_similarity(question, existing_question)
+            similarity = calculate_cosine_similarity(question_cleaned, clean_text(existing_question))
             
             # Check if similarity exceeds threshold
             if similarity >= threshold:
@@ -308,7 +401,7 @@ def find_similar_questions(db: Session, question: str, threshold: float = 0.8) -
         logger.error(f"Error finding similar questions: {e}")
         return []
 
-def find_similar_answers(db: Session, answer: str, threshold: float = 0.8) -> List[Tuple[int, str, float]]:
+def find_similar_answers(db: Session, answer: str, threshold: float = 0.85) -> List[Tuple[int, str, float]]:
     """
     Find similar answers in the training_data table.
     
@@ -346,6 +439,7 @@ def find_similar_answers(db: Session, answer: str, threshold: float = 0.8) -> Li
 def mark_duplicate_questions(db: Session, question_id: int, question_text: str) -> bool:
     """
     Check for duplicate questions and mark them accordingly.
+    Uses oldest question as the original reference.
     
     Args:
         db: Database session
@@ -357,7 +451,7 @@ def mark_duplicate_questions(db: Session, question_id: int, question_text: str) 
     """
     try:
         # Find similar questions
-        similar_questions = find_similar_questions(db, question_text, threshold=0.8)
+        similar_questions = find_similar_questions(db, question_text, threshold=0.45)
         
         # Remove the current question from results
         similar_questions = [sq for sq in similar_questions if sq[0] != question_id]
@@ -367,16 +461,27 @@ def mark_duplicate_questions(db: Session, question_id: int, question_text: str) 
             current_question = db.query(RawData).filter(RawData.id == question_id).first()
             
             if current_question:
-                # Mark as duplicate of the most similar question
-                original_id, _, similarity_score = similar_questions[0]
+                # Find the oldest question (smallest ID) as the original
+                oldest_id = min([sq[0] for sq in similar_questions])
+                similarity_score = next(sq[2] for sq in similar_questions if sq[0] == oldest_id)
                 
+                # Update all similar questions to reference the oldest one
+                for similar_id, _, _ in similar_questions:
+                    if similar_id != oldest_id:
+                        similar_question = db.query(RawData).filter(RawData.id == similar_id).first()
+                        if similar_question:
+                            similar_question.is_duplicate = True
+                            similar_question.duplicate_of_id = oldest_id
+                            similar_question.similarity_score = similarity_score
+                
+                # Mark current question as duplicate of the oldest
                 current_question.is_duplicate = True
-                current_question.duplicate_of_id = original_id
+                current_question.duplicate_of_id = oldest_id
                 current_question.similarity_score = similarity_score
                 
                 db.commit()
                 
-                logger.info(f"Question {question_id} marked as duplicate of {original_id} (similarity: {similarity_score:.3f})")
+                logger.info(f"Question {question_id} marked as duplicate of {oldest_id} (similarity: {similarity_score:.3f})")
                 return True
         
         return False
@@ -399,7 +504,7 @@ def mark_duplicate_answers(db: Session, training_id: int, answer_text: str) -> b
     """
     try:
         # Find similar answers
-        similar_answers = find_similar_answers(db, answer_text, threshold=0.8)
+        similar_answers = find_similar_answers(db, answer_text, threshold=0.85)
         
         # Remove the current answer from results
         similar_answers = [sa for sa in similar_answers if sa[0] != training_id]
@@ -483,9 +588,124 @@ def process_new_training_data(db: Session, training_data: dict) -> TrainingData:
         db.rollback()
         raise
 
+def handle_user_vote(db: Session, raw_data_id: int, telegram_user_id: int, vote_type: int) -> dict:
+    """
+    Handle user vote with 2 change limit system.
+    
+    Args:
+        db: Database session
+        raw_data_id: ID of the raw data question
+        telegram_user_id: Telegram user ID
+        vote_type: 1 (like), -1 (dislike)
+        
+    Returns:
+        Dict with success status and message
+    """
+    try:
+        # Check if user has already voted
+        existing_vote = db.query(UserVotes).filter(
+            UserVotes.raw_data_id == raw_data_id,
+            UserVotes.telegram_user_id == telegram_user_id
+        ).first()
+        
+        if existing_vote:
+            # Check if user has exceeded change limit
+            if existing_vote.vote_changes_count >= 2:
+                return {
+                    "success": False,
+                    "message": "No vote changes left! (2/2 used)",
+                    "changes_left": 0
+                }
+            
+            # Check if trying to vote the same thing
+            if existing_vote.current_vote == vote_type:
+                return {
+                    "success": False,
+                    "message": "You already voted this way!",
+                    "changes_left": 2 - existing_vote.vote_changes_count
+                }
+            
+            # Update existing vote
+            existing_vote.current_vote = vote_type
+            existing_vote.vote_changes_count += 1
+            existing_vote.last_vote_at = datetime.utcnow()
+            
+            changes_left = 2 - existing_vote.vote_changes_count
+            vote_text = "👍 Liked!" if vote_type == 1 else "👎 Disliked!"
+            
+            if changes_left == 0:
+                message = f"{vote_text} (Last change!)"
+            else:
+                message = f"{vote_text} ({changes_left} changes left)"
+            
+            db.commit()
+            return {
+                "success": True,
+                "message": message,
+                "changes_left": changes_left
+            }
+        else:
+            # Create new vote
+            new_vote = UserVotes(
+                raw_data_id=raw_data_id,
+                telegram_user_id=telegram_user_id,
+                current_vote=vote_type,
+                vote_changes_count=0
+            )
+            db.add(new_vote)
+            db.commit()
+            
+            vote_text = "👍 Liked!" if vote_type == 1 else "👎 Disliked!"
+            return {
+                "success": True,
+                "message": f"{vote_text} (2 changes available)",
+                "changes_left": 2
+            }
+        
+    except Exception as e:
+        logger.error(f"Error handling user vote: {e}")
+        return {
+            "success": False,
+            "message": "Error saving vote",
+            "changes_left": 0
+        }
+
+def get_vote_statistics(db: Session, raw_data_id: int) -> dict:
+    """
+    Get vote statistics for a specific question.
+    
+    Args:
+        db: Database session
+        raw_data_id: ID of the raw data question
+        
+    Returns:
+        Dict with vote statistics
+    """
+    try:
+        # Get all votes for this question
+        votes = db.query(UserVotes).filter(UserVotes.raw_data_id == raw_data_id).all()
+        
+        likes = sum(1 for vote in votes if vote.current_vote == 1)
+        dislikes = sum(1 for vote in votes if vote.current_vote == -1)
+        
+        return {
+            "likes": likes,
+            "dislikes": dislikes,
+            "total_votes": len(votes),
+            "score": likes - dislikes
+        }
+    except Exception as e:
+        logger.error(f"Error getting vote statistics: {e}")
+        return {
+            "likes": 0,
+            "dislikes": 0,
+            "total_votes": 0,
+            "score": 0
+        }
+
 def get_database_statistics(db: Session) -> dict:
     """
-    Get comprehensive database statistics.
+    Get database statistics.
     
     Args:
         db: Database session
@@ -554,6 +774,11 @@ def init_db():
             # User analytics indexes
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_user_analytics_telegram_id ON user_analytics(telegram_id);"))
             
+            # User votes indexes
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_user_votes_raw_data_id ON user_votes(raw_data_id);"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_user_votes_telegram_user_id ON user_votes(telegram_user_id);"))
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_user_votes_unique ON user_votes(raw_data_id, telegram_user_id);"))
+            
             # System metrics indexes
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_system_metrics_name ON system_metrics(metric_name);"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_system_metrics_timestamp ON system_metrics(timestamp);"))
@@ -584,6 +809,7 @@ def get_db() -> Session:
 __all__ = [
     'RawData',
     'TrainingData', 
+    'UserVotes',
     'UserAnalytics',
     'SystemMetrics',
     'init_db',
@@ -595,5 +821,7 @@ __all__ = [
     'find_similar_questions',
     'find_similar_answers',
     'calculate_cosine_similarity',
+    'handle_user_vote',
+    'get_vote_statistics',
     'get_database_statistics'
 ]

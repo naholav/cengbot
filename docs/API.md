@@ -10,16 +10,17 @@ The CengBot API provides RESTful endpoints for managing bot data, user interacti
 
 ## 🔐 Authentication
 
-Currently, the API uses IP-based access control. In production, implement proper authentication:
+The API uses HTTP Basic Authentication. Credentials are configured via environment variables:
 
+```bash
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD_HASH=<sha256_hash_of_password>
+```
+
+To generate password hash:
 ```python
-# Example JWT authentication (future implementation)
-@app.middleware("http")
-async def verify_token(request: Request, call_next):
-    token = request.headers.get("Authorization")
-    if not token or not verify_jwt_token(token):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    return await call_next(request)
+import hashlib
+password_hash = hashlib.sha256('your_password'.encode()).hexdigest()
 ```
 
 ## 📊 Data Models
@@ -41,6 +42,11 @@ interface RawData {
   created_at: string;            // ISO timestamp
   answered_at?: string;          // Response timestamp
   message_thread_id?: number;    // Telegram topic ID
+  // Vote statistics
+  likes?: number;                // Total likes count
+  dislikes?: number;             // Total dislikes count
+  total_votes?: number;          // Total votes count
+  vote_score?: number;           // Vote score calculation
 }
 ```
 
@@ -54,6 +60,19 @@ interface TrainingData {
   language?: string;             // Language code
   created_at: string;            // Approval timestamp
   point?: number;                // User rating from source
+}
+```
+
+### PaginatedResponse Model
+```typescript
+interface PaginatedResponse<T> {
+  items: T[];                    // Array of items
+  total: number;                 // Total count of items
+  page: number;                  // Current page number
+  page_size: number;             // Items per page
+  total_pages: number;           // Total number of pages
+  has_next: boolean;             // Whether next page exists
+  has_prev: boolean;             // Whether previous page exists
 }
 ```
 
@@ -78,188 +97,206 @@ interface Statistics {
 
 ## 🔌 API Endpoints
 
+### General Endpoints
+
+#### Root Endpoint
+```http
+GET /
+```
+Returns API welcome message and version info.
+
+#### Health Check
+```http
+GET /health
+```
+Returns system health status including database connectivity and model status.
+
+**Response:**
+```json
+{
+  "status": "healthy",
+  "database": "connected",
+  "model": "loaded",
+  "timestamp": "2025-08-01T10:30:00Z"
+}
+```
+
+### Authentication
+
+#### Login
+```http
+POST /auth/login
+```
+
+**Request Body:**
+```json
+{
+  "username": "admin",
+  "password": "your_password"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Login successful"
+}
+```
+
 ### Raw Data Management
 
-#### Get All Raw Data
+#### Get All Raw Data (Paginated)
 ```http
 GET /raw-data
 ```
 
 **Query Parameters:**
-- `skip` (int, optional): Number of records to skip (default: 0)
-- `limit` (int, optional): Maximum records to return (default: 100)
+- `page` (int, optional): Page number (default: 1)
+- `page_size` (int, optional): Items per page (default: 50, max: 100)
 - `language` (string, optional): Filter by language ('TR' or 'EN')
 - `admin_approved` (int, optional): Filter by approval status (0 or 1)
 - `has_answer` (bool, optional): Filter by answer presence
 
 **Response:**
 ```json
-[
-  {
-    "id": 1,
-    "telegram_id": 123456789,
-    "username": "john_doe",
-    "question": "What is computer science?",
-    "answer": "Computer science is the study of algorithms...",
-    "language": "EN",
-    "like": 1,
-    "admin_approved": 1,
-    "is_duplicate": false,
-    "created_at": "2024-01-15T10:30:00Z",
-    "answered_at": "2024-01-15T10:30:15Z"
-  }
-]
-```
-
-**Example:**
-```bash
-curl -X GET "http://localhost:8001/raw-data?limit=50&language=TR"
-```
-
-#### Get Single Raw Data Entry
-```http
-GET /raw-data/{id}
-```
-
-**Path Parameters:**
-- `id` (int): Raw data entry ID
-
-**Response:**
-```json
 {
-  "id": 1,
-  "telegram_id": 123456789,
-  "username": "john_doe",
-  "question": "What is computer science?",
-  "answer": "Computer science is...",
-  "language": "EN",
-  "like": 1,
-  "admin_approved": 1,
-  "is_duplicate": false,
-  "created_at": "2024-01-15T10:30:00Z",
-  "answered_at": "2024-01-15T10:30:15Z"
+  "items": [
+    {
+      "id": 1,
+      "telegram_id": 123456789,
+      "username": "john_doe",
+      "question": "What is computer science?",
+      "answer": "Computer science is the study of algorithms...",
+      "language": "EN",
+      "like": 1,
+      "admin_approved": 1,
+      "is_duplicate": false,
+      "created_at": "2024-01-15T10:30:00Z",
+      "answered_at": "2024-01-15T10:30:15Z",
+      "likes": 5,
+      "dislikes": 1,
+      "total_votes": 6,
+      "vote_score": 0.83
+    }
+  ],
+  "total": 150,
+  "page": 1,
+  "page_size": 50,
+  "total_pages": 3,
+  "has_next": true,
+  "has_prev": false
 }
 ```
 
 #### Update Raw Data Answer
 ```http
-PUT /raw-data/{id}
+PUT /raw-data/{item_id}
 ```
 
 **Path Parameters:**
-- `id` (int): Raw data entry ID
+- `item_id` (int): Raw data entry ID
 
 **Request Body:**
 ```json
 {
-  "answer": "Updated answer text"
+  "answer": "Updated answer text here"
 }
 ```
 
 **Response:**
 ```json
 {
-  "success": true,
-  "message": "Answer updated successfully"
+  "id": 1,
+  "answer": "Updated answer text here",
+  "admin_approved": 0
 }
-```
-
-**Example:**
-```bash
-curl -X PUT "http://localhost:8001/raw-data/1" \
-  -H "Content-Type: application/json" \
-  -d '{"answer": "Updated answer"}'
 ```
 
 #### Delete Raw Data Entry
 ```http
-DELETE /raw-data/{id}
+DELETE /raw-data/{item_id}
 ```
 
 **Path Parameters:**
-- `id` (int): Raw data entry ID
+- `item_id` (int): Raw data entry ID
 
 **Response:**
 ```json
 {
-  "success": true,
-  "message": "Entry deleted successfully"
+  "message": "Raw data entry deleted successfully"
+}
+```
+
+#### Approve for Training Data
+```http
+POST /approve/{item_id}
+```
+
+**Path Parameters:**
+- `item_id` (int): Raw data entry ID to approve
+
+**Response:**
+```json
+{
+  "message": "Approved and added to training data",
+  "training_data_id": 123
 }
 ```
 
 ### Training Data Management
 
-#### Get Training Data
+#### Get Training Data (Paginated)
 ```http
 GET /training-data
 ```
 
 **Query Parameters:**
-- `skip` (int, optional): Number of records to skip
-- `limit` (int, optional): Maximum records to return
+- `page` (int, optional): Page number (default: 1)
+- `page_size` (int, optional): Items per page (default: 50, max: 100)
 - `language` (string, optional): Filter by language
 
 **Response:**
 ```json
-[
-  {
-    "id": 1,
-    "source_id": 5,
-    "question": "What is computer science?",
-    "answer": "Computer science is the study of algorithms...",
-    "language": "EN",
-    "created_at": "2024-01-15T10:30:00Z",
-    "point": 1
-  }
-]
+{
+  "items": [
+    {
+      "id": 1,
+      "source_id": 10,
+      "question": "What is OOP?",
+      "answer": "Object-Oriented Programming is...",
+      "language": "EN",
+      "created_at": "2024-01-16T14:20:00Z",
+      "point": 1
+    }
+  ],
+  "total": 500,
+  "page": 1,
+  "page_size": 50,
+  "total_pages": 10,
+  "has_next": true,
+  "has_prev": false
+}
 ```
 
-#### Approve Question for Training
+#### Remove from Training Data
 ```http
-POST /approve/{id}
+DELETE /training-data/{item_id}
 ```
 
 **Path Parameters:**
-- `id` (int): Raw data entry ID to approve
+- `item_id` (int): Training data entry ID
 
 **Response:**
 ```json
 {
-  "success": true,
-  "training_data_id": 15,
-  "message": "Question approved for training"
+  "message": "Training data entry removed successfully"
 }
 ```
 
-**Example:**
-```bash
-curl -X POST "http://localhost:8001/approve/1"
-```
+### Analytics & Statistics
 
-#### Bulk Approve Questions
-```http
-POST /bulk-approve
-```
-
-**Request Body:**
-```json
-{
-  "ids": [1, 2, 3, 4, 5]
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "approved_count": 5,
-  "training_data_ids": [15, 16, 17, 18, 19]
-}
-```
-
-### Statistics and Analytics
-
-#### Get System Statistics
+#### Get Statistics
 ```http
 GET /stats
 ```
@@ -268,22 +305,22 @@ GET /stats
 ```json
 {
   "total_questions": 1250,
-  "answered_questions": 1180,
-  "liked_questions": 950,
-  "disliked_questions": 120,
-  "approved_questions": 800,
-  "training_data_count": 800,
-  "duplicate_count": 45,
+  "answered_questions": 1200,
+  "liked_questions": 850,
+  "disliked_questions": 150,
+  "approved_questions": 500,
+  "training_data_count": 500,
+  "duplicate_count": 75,
   "languages": {
-    "TR": 800,
-    "EN": 450
+    "TR": 700,
+    "EN": 550
   },
   "avg_response_time": 2.5,
-  "success_rate": 88.8
+  "success_rate": 85.0
 }
 ```
 
-#### Get Duplicate Questions
+#### Get Duplicate Groups
 ```http
 GET /duplicates
 ```
@@ -292,359 +329,197 @@ GET /duplicates
 ```json
 [
   {
-    "original_id": 1,
-    "original_question": "What is computer science?",
-    "duplicates": [
+    "group_id": 1,
+    "count": 3,
+    "questions": [
       {
-        "id": 15,
-        "question": "What is computer science?",
-        "similarity": 1.0
+        "id": 10,
+        "question": "What is Python?",
+        "telegram_id": 12345,
+        "created_at": "2024-01-15T10:00:00Z"
       },
       {
-        "id": 23,
-        "question": "What's computer science?",
-        "similarity": 0.95
+        "id": 25,
+        "question": "What is Python programming?",
+        "telegram_id": 67890,
+        "created_at": "2024-01-16T11:00:00Z"
       }
     ]
   }
 ]
 ```
 
-#### Get Language Distribution
+#### Detect Duplicates
 ```http
-GET /language-stats
+POST /detect-duplicates
 ```
+
+Runs duplicate detection algorithm on existing data.
 
 **Response:**
 ```json
 {
-  "total_questions": 1250,
-  "languages": {
-    "TR": {
-      "count": 800,
-      "percentage": 64.0,
-      "avg_likes": 0.7
-    },
-    "EN": {
-      "count": 450,
-      "percentage": 36.0,
-      "avg_likes": 0.8
-    }
-  }
+  "message": "Duplicate detection completed",
+  "duplicates_found": 25,
+  "groups_created": 10
 }
 ```
 
-### Health and Monitoring
+### Documentation
 
-#### Health Check
+#### List Available Documents
 ```http
-GET /health
+GET /docs/list
 ```
 
 **Response:**
 ```json
 {
-  "status": "healthy",
-  "timestamp": "2024-01-15T10:30:00Z",
-  "database": "connected",
-  "model": "loaded",
-  "rabbitmq": "connected"
-}
-```
-
-#### System Status
-```http
-GET /status
-```
-
-**Response:**
-```json
-{
-  "system": {
-    "uptime": "2 days, 14 hours",
-    "memory_usage": "2.5 GB",
-    "cpu_usage": "15%",
-    "disk_usage": "45%"
-  },
-  "services": {
-    "telegram_bot": "running",
-    "ai_worker": "running",
-    "database": "connected",
-    "rabbitmq": "connected"
-  },
-  "model": {
-    "status": "loaded",
-    "model_name": "LLaMA-3.2-3B",
-    "adapter": "method1",
-    "memory_usage": "1.8 GB"
-  }
-}
-```
-
-## 🔧 Advanced Features
-
-### Filtering and Searching
-
-#### Search Questions
-```http
-GET /search
-```
-
-**Query Parameters:**
-- `q` (string): Search query
-- `language` (string, optional): Filter by language
-- `limit` (int, optional): Maximum results
-
-**Response:**
-```json
-{
-  "query": "computer science",
-  "results": [
+  "documents": [
     {
-      "id": 1,
-      "question": "What is computer science?",
-      "answer": "Computer science is...",
-      "relevance": 0.95,
-      "language": "EN"
+      "name": "README.md",
+      "path": "README.md",
+      "type": "markdown",
+      "size": 45678
+    },
+    {
+      "name": "training_20240731_144939_3511.log",
+      "path": "logs/train_logs_llama_v1.2/training_20240731_144939_3511.log",
+      "type": "log",
+      "size": 12345
     }
-  ],
-  "total": 1
+  ]
 }
 ```
 
-#### Advanced Filtering
+#### Read Document
 ```http
-GET /raw-data/filter
+GET /docs/read
 ```
 
 **Query Parameters:**
-- `start_date` (string): Start date (ISO format)
-- `end_date` (string): End date (ISO format)
-- `min_likes` (int): Minimum like count
-- `max_likes` (int): Maximum like count
-- `username` (string): Filter by username
-
-**Example:**
-```bash
-curl -X GET "http://localhost:8001/raw-data/filter?start_date=2024-01-01&min_likes=0"
-```
-
-### Export and Import
-
-#### Export Data
-```http
-GET /export
-```
-
-**Query Parameters:**
-- `format` (string): Export format ('json', 'csv', 'xlsx')
-- `table` (string): Table to export ('raw_data', 'training_data', 'all')
-- `language` (string, optional): Filter by language
-
-**Response:**
-- JSON: Returns data as JSON
-- CSV: Returns CSV file
-- XLSX: Returns Excel file
-
-**Example:**
-```bash
-curl -X GET "http://localhost:8001/export?format=csv&table=training_data" \
-  -o training_data.csv
-```
-
-#### Import Training Data
-```http
-POST /import
-```
-
-**Request Body (multipart/form-data):**
-- `file`: CSV/JSON file with training data
-- `format`: File format ('csv' or 'json')
+- `path` (string): Path to the document file
 
 **Response:**
 ```json
 {
-  "success": true,
-  "imported_count": 100,
-  "skipped_count": 5,
-  "errors": []
+  "content": "# Document Content\n\nFile content here...",
+  "filename": "README.md",
+  "type": "markdown"
 }
 ```
 
-## 🚫 Error Handling
+## 🚨 Error Responses
 
-### Error Response Format
+All endpoints return consistent error responses:
+
 ```json
 {
-  "error": {
-    "code": "VALIDATION_ERROR",
-    "message": "Invalid input data",
-    "details": {
-      "field": "question",
-      "issue": "Question cannot be empty"
-    }
-  },
-  "timestamp": "2024-01-15T10:30:00Z",
-  "path": "/raw-data/1"
+  "detail": "Error message here"
 }
 ```
 
-### Common Error Codes
+Common HTTP status codes:
+- `400`: Bad Request - Invalid parameters
+- `401`: Unauthorized - Authentication required
+- `404`: Not Found - Resource doesn't exist
+- `422`: Unprocessable Entity - Validation error
+- `500`: Internal Server Error - Server error
 
-| Code | HTTP Status | Description |
-|------|-------------|-------------|
-| `NOT_FOUND` | 404 | Resource not found |
-| `VALIDATION_ERROR` | 400 | Invalid input data |
-| `DUPLICATE_ENTRY` | 409 | Duplicate resource |
-| `INTERNAL_ERROR` | 500 | Server error |
-| `DATABASE_ERROR` | 500 | Database connection issue |
-| `MODEL_ERROR` | 503 | AI model unavailable |
+## 📝 Example Usage
 
-## 📡 WebSocket Endpoints
-
-### Real-time Updates
-```javascript
-// Connect to WebSocket
-const ws = new WebSocket('ws://localhost:8001/ws');
-
-// Listen for real-time updates
-ws.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  console.log('New data:', data);
-};
-
-// Send message
-ws.send(JSON.stringify({
-  type: 'subscribe',
-  channel: 'raw_data'
-}));
-```
-
-### Available Channels
-- `raw_data`: New questions and answers
-- `training_data`: New training data approvals
-- `stats`: Real-time statistics updates
-- `system`: System status changes
-
-## 🔐 Rate Limiting
-
-### Default Limits
-- **General API**: 100 requests per minute per IP
-- **Search API**: 20 requests per minute per IP
-- **Export API**: 5 requests per minute per IP
-
-### Rate Limit Headers
-```http
-X-RateLimit-Limit: 100
-X-RateLimit-Remaining: 95
-X-RateLimit-Reset: 1642248600
-```
-
-## 📊 API Usage Examples
-
-### Python Client Example
+### Python Example
 ```python
 import requests
+from requests.auth import HTTPBasicAuth
 
-class CengBotAPI:
-    def __init__(self, base_url="http://localhost:8001"):
-        self.base_url = base_url
-    
-    def get_raw_data(self, limit=100, language=None):
-        params = {"limit": limit}
-        if language:
-            params["language"] = language
-        
-        response = requests.get(f"{self.base_url}/raw-data", params=params)
-        return response.json()
-    
-    def update_answer(self, id, answer):
-        data = {"answer": answer}
-        response = requests.put(f"{self.base_url}/raw-data/{id}", json=data)
-        return response.json()
-    
-    def approve_question(self, id):
-        response = requests.post(f"{self.base_url}/approve/{id}")
-        return response.json()
-    
-    def get_stats(self):
-        response = requests.get(f"{self.base_url}/stats")
-        return response.json()
+# Configuration
+BASE_URL = "http://localhost:8001"
+auth = HTTPBasicAuth("admin", "your_password")
 
-# Usage
-api = CengBotAPI()
-data = api.get_raw_data(limit=50, language="TR")
-stats = api.get_stats()
+# Get statistics
+response = requests.get(f"{BASE_URL}/stats", auth=auth)
+stats = response.json()
+print(f"Total questions: {stats['total_questions']}")
+
+# Get raw data with pagination
+response = requests.get(
+    f"{BASE_URL}/raw-data",
+    params={"page": 1, "page_size": 50, "language": "TR"},
+    auth=auth
+)
+data = response.json()
+for item in data["items"]:
+    print(f"Q: {item['question']}")
+    print(f"A: {item['answer']}")
+
+# Update an answer
+response = requests.put(
+    f"{BASE_URL}/raw-data/123",
+    json={"answer": "Updated answer"},
+    auth=auth
+)
 ```
 
-### JavaScript Client Example
-```javascript
-class CengBotAPI {
-  constructor(baseUrl = 'http://localhost:8001') {
-    this.baseUrl = baseUrl;
-  }
-  
-  async getRawData(limit = 100, language = null) {
-    const params = new URLSearchParams({ limit });
-    if (language) params.append('language', language);
-    
-    const response = await fetch(`${this.baseUrl}/raw-data?${params}`);
-    return response.json();
-  }
-  
-  async updateAnswer(id, answer) {
-    const response = await fetch(`${this.baseUrl}/raw-data/${id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answer })
-    });
-    return response.json();
-  }
-  
-  async approveQuestion(id) {
-    const response = await fetch(`${this.baseUrl}/approve/${id}`, {
-      method: 'POST'
-    });
-    return response.json();
-  }
-  
-  async getStats() {
-    const response = await fetch(`${this.baseUrl}/stats`);
-    return response.json();
-  }
-}
+### JavaScript/TypeScript Example
+```typescript
+const BASE_URL = 'http://localhost:8001';
+const auth = btoa('admin:your_password');
 
-// Usage
-const api = new CengBotAPI();
-const data = await api.getRawData(50, 'TR');
-const stats = await api.getStats();
+// Get statistics
+fetch(`${BASE_URL}/stats`, {
+  headers: {
+    'Authorization': `Basic ${auth}`
+  }
+})
+.then(res => res.json())
+.then(stats => {
+  console.log(`Total questions: ${stats.total_questions}`);
+});
+
+// Update answer
+fetch(`${BASE_URL}/raw-data/123`, {
+  method: 'PUT',
+  headers: {
+    'Authorization': `Basic ${auth}`,
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({
+    answer: 'Updated answer'
+  })
+})
+.then(res => res.json())
+.then(data => console.log(data));
 ```
 
-## 📈 Performance Tips
+## 🔄 Pagination
 
-### Pagination
-Always use pagination for large datasets:
-```bash
-# Get first page
-curl "http://localhost:8001/raw-data?limit=50&skip=0"
+Paginated endpoints use consistent query parameters:
+- `page`: Page number (starts from 1)
+- `page_size`: Number of items per page
 
-# Get second page
-curl "http://localhost:8001/raw-data?limit=50&skip=50"
+Response includes metadata:
+- `total`: Total number of items
+- `total_pages`: Total number of pages
+- `has_next`: Boolean indicating if next page exists
+- `has_prev`: Boolean indicating if previous page exists
+
+## 📊 Rate Limiting
+
+Currently no rate limiting is implemented. In production, consider adding rate limiting:
+- 100 requests per minute for authenticated users
+- 10 requests per minute for unauthenticated users
+
+## 🔗 CORS Configuration
+
+CORS is enabled for all origins in development. For production, configure specific allowed origins:
+
+```python
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://yourdomain.com"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 ```
-
-### Caching
-The API supports ETags for caching:
-```bash
-# Initial request
-curl -H "If-None-Match: \"etag-value\"" "http://localhost:8001/stats"
-
-# Returns 304 Not Modified if unchanged
-```
-
-### Compression
-Enable gzip compression:
-```bash
-curl -H "Accept-Encoding: gzip" "http://localhost:8001/raw-data"
-```
-
-This API documentation provides comprehensive information for integrating with the CengBot system and managing its data effectively.

@@ -5,7 +5,7 @@ Environment Configuration Loader for CengBot
 This module handles loading environment variables from .env files
 and provides a centralized configuration management system.
 
-Author: Çukurova University Computer Engineering Department
+Author: naholav
 """
 
 import os
@@ -162,7 +162,7 @@ class EnvironmentConfig:
     @property
     def lora_model_path(self) -> Path:
         """LoRA adapter model path."""
-        return self.get_path("LORA_MODEL_PATH", "models/final-best-model-v1/method1")
+        return self.get_path("LORA_MODEL_PATH", "models/active-model/method1")
     
     @property
     def model_cache_dir(self) -> Path:

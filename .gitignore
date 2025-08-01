@@ -5,11 +5,13 @@
 .env.production
 config/env/
 
-# Sensitive data directories (keep .gitkeep files)
+# Sensitive data directories (keep .gitkeep files and training logs)
 data/*
 !data/.gitkeep
 logs/*
 !logs/.gitkeep
+!logs/train_logs_*/
+!logs/training/
 model_cache/*
 !model_cache/.gitkeep
 models/*

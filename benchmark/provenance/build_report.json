@@ -1,0 +1,393 @@
+{
+  "candidates": 151,
+  "passed": 146,
+  "kept": 100,
+  "not_selected": 46,
+  "dropped": [
+    {
+      "cand_id": "c060",
+      "question": "Bilgisayar Mühendisliği lisans programı kaç yıl sürüyor ve toplam kaç AKTS?",
+      "reasons": [
+        "too similar to an existing question (0.815): 'Bilgisayar Mühendisliği yüksek lisans programı kaç yıl sürüyor?'"
+      ]
+    },
+    {
+      "cand_id": "c129",
+      "question": "Bölümde kaç laboratuvar var ve isimleri neler?",
+      "reasons": [
+        "manual review: two official pages disagree (about page: 5 labs incl. Image Processing; labs page lists 4)"
+      ]
+    },
+    {
+      "cand_id": "c132",
+      "question": "What kind of work is done in the iCAD Lab?",
+      "reasons": [
+        "too similar to an existing question (0.85): 'What type of work is done in iCAD Lab?'"
+      ]
+    },
+    {
+      "cand_id": "c141",
+      "question": "Bölüm MÜDEK'i nasıl tanımlıyor; MÜDEK hangi yıl kuruldu ve ne zaman dernekleşti?",
+      "reasons": [
+        "manual review: MÜDEK founding history is off-topic trivia for a department bot"
+      ]
+    },
+    {
+      "cand_id": "c150",
+      "question": "What are the main focus areas of the Computer Engineering master's programme?",
+      "reasons": [
+        "too similar to an existing question (0.952): \"What are the focus areas of the Computer Engineering master's program?\""
+      ]
+    }
+  ],
+  "reserve": [
+    {
+      "cand_id": "c003",
+      "question": "Staj raporumu bölümün ilan ettiği son tarihten sonra teslim edersem stajım kabul edilir mi?"
+    },
+    {
+      "cand_id": "c009",
+      "question": "Yazılım geliştiren bir firmada staj yapıyorum; staj konum ne olmak zorunda?"
+    },
+    {
+      "cand_id": "c010",
+      "question": "Does the department find an internship company for me, or do I have to find one myself?"
+    },
+    {
+      "cand_id": "c011",
+      "question": "Firma staj değerlendirme formunu kaşesiz gönderirse form geçerli olur mu?"
+    },
+    {
+      "cand_id": "c012",
+      "question": "After my internship has started, am I allowed to move to a different company?"
+    },
+    {
+      "cand_id": "c027",
+      "question": "Aynı yarıyıla ait derslerden bir günde en fazla kaç dersin sınavı yapılabilir?"
+    },
+    {
+      "cand_id": "c029",
+      "question": "Sınavda kopya çekerken yakalanan öğrenciye ne uygulanır?"
+    },
+    {
+      "cand_id": "c030",
+      "question": "How long after the end of the final exams are course grades announced?"
+    },
+    {
+      "cand_id": "c033",
+      "question": "Her derste en az kaç ara sınav olur? Bitirme tezi gibi derslerde ara sınav notu hesaba katılır mı?"
+    },
+    {
+      "cand_id": "c035",
+      "question": "Ara sınav ve final sonuçları en geç ne zaman ilan edilmek zorunda?"
+    },
+    {
+      "cand_id": "c036",
+      "question": "How long before the exams must final exam schedules be announced?"
+    },
+    {
+      "cand_id": "c038",
+      "question": "If my excuse for missing a midterm is accepted, do I still have to meet the attendance requirement?"
+    },
+    {
+      "cand_id": "c039",
+      "question": "What is the grade point (coefficient) of each passing letter grade from AA to CC?"
+    },
+    {
+      "cand_id": "c042",
+      "question": "Mezun olunca diplomanın yanında başka hangi belgeler veriliyor?"
+    },
+    {
+      "cand_id": "c048",
+      "question": "Mühendislik Fakültesi bitirme ödevi ilkelerine göre konu tercih formunu ne zaman ve en az kaç konu yazarak veriyoruz?"
+    },
+    {
+      "cand_id": "c057",
+      "question": "In the 2026-2027 plan, in which semester is Operating Systems (CEN222) and how many ECTS is it?"
+    },
+    {
+      "cand_id": "c058",
+      "question": "2026-2027 planında Graduation Thesis dersi hangi yarıyılda zorunlu ve kaç AKTS?"
+    },
+    {
+      "cand_id": "c059",
+      "question": "How many ECTS of elective courses must be taken in the 7th semester of the 2026-2027 plan?"
+    },
+    {
+      "cand_id": "c063",
+      "question": "2026-2027 planında 1. yarıyıldaki Introduction to Computer Engineering dersinin kodu ve AKTS'si nedir?"
+    },
+    {
+      "cand_id": "c064",
+      "question": "In the 2026-2027 plan, is Linear Algebra a first-semester course, and how many ECTS is it?"
+    },
+    {
+      "cand_id": "c065",
+      "question": "2026-2027 planına göre Software Engineering (CEN352) kaçıncı yarıyılda ve kaç AKTS?"
+    },
+    {
+      "cand_id": "c066",
+      "question": "Which elective courses are listed for the 5th semester in the 2026-2027 plan?"
+    },
+    {
+      "cand_id": "c077",
+      "question": "When are the spring 2027 midterm exams?"
+    },
+    {
+      "cand_id": "c078",
+      "question": "2026-2027 güz dönemi final notlarının sisteme girilmesi için son gün hangisi?"
+    },
+    {
+      "cand_id": "c083",
+      "question": "Kaydolmadığım bir dersin sınavına girersem notum geçerli sayılır mı?"
+    },
+    {
+      "cand_id": "c085",
+      "question": "Muaf olduğum dersler sayesinde bir üst yarıyıldan ders alabilir miyim?"
+    },
+    {
+      "cand_id": "c095",
+      "question": "Kendi bölümümde açılan yandal programına başvurabilir miyim?"
+    },
+    {
+      "cand_id": "c096",
+      "question": "According to the department's 2019-2020 minor course list, how many ECTS of compulsory courses does the Computer Engineering minor contain?"
+    },
+    {
+      "cand_id": "c097",
+      "question": "Çift anadaldan ayrılırsam başarısız olduğum çift anadal derslerini tekrar almak zorunda mıyım?"
+    },
+    {
+      "cand_id": "c098",
+      "question": "Which department commission determines course equivalencies for transfer, double major and minor students?"
+    },
+    {
+      "cand_id": "c099",
+      "question": "Çift anadal programına başvuru nasıl yapılıyor ve değerlendirmeyi kim yapıyor?"
+    },
+    {
+      "cand_id": "c102",
+      "question": "Başka bir üniversitenin yaz okulunda bitirme projesi ya da staj dersi alabilir miyim?"
+    },
+    {
+      "cand_id": "c107",
+      "question": "Who reviews summer school applications, and how is the Summer School Commission formed?"
+    },
+    {
+      "cand_id": "c114",
+      "question": "How long is the Erasmus achievement score valid in the Computer Engineering department, and what should second-year applicants do?"
+    },
+    {
+      "cand_id": "c117",
+      "question": "Daha önce Erasmus'tan yararlandıysam tekrar başvurduğumda puanımdan kesinti yapılır mı?"
+    },
+    {
+      "cand_id": "c118",
+      "question": "Which groups receive bonus points in the Erasmus selection, and how many?"
+    },
+    {
+      "cand_id": "c119",
+      "question": "Erasmus dil sınavlarına birden fazla dil için girebilir miyim, Almanca eğitim veren okul için hangi sınav gerekir?"
+    },
+    {
+      "cand_id": "c122",
+      "question": "What is Prof. Dr. Ramazan Çoban's email address?"
+    },
+    {
+      "cand_id": "c126",
+      "question": "How can I contact the Computer Engineering department about Erasmus (phone and emails)?"
+    },
+    {
+      "cand_id": "c127",
+      "question": "Bölümde Bilgisayar Mühendisliğinin Kuramsal Temelleri anabilim dalının başkanı kim?"
+    },
+    {
+      "cand_id": "c128",
+      "question": "Which faculty member heads the Computer Software division (Bilgisayar Yazılımı ABD)?"
+    },
+    {
+      "cand_id": "c134",
+      "question": "Which laboratory is used for the lab hours of Algorithms and Programming, Data Structures and Object Oriented Programming?"
+    },
+    {
+      "cand_id": "c139",
+      "question": "MÜDEK ne zamandan beri Washington Accord imzacısı ve ENAEE üyesi?"
+    },
+    {
+      "cand_id": "c142",
+      "question": "How does the department describe its mission?"
+    },
+    {
+      "cand_id": "c149",
+      "question": "Bilgisayar Mühendisliği doktora programı en az kaç yıl sürüyor ve hangi alanlara odaklanıyor?"
+    },
+    {
+      "cand_id": "c151",
+      "question": "Which online systems are listed on the department's e-services page for students?"
+    }
+  ],
+  "id_map": {
+    "tr-001": "c068",
+    "tr-002": "c050",
+    "tr-003": "c136",
+    "tr-004": "c087",
+    "tr-005": "c108",
+    "tr-006": "c019",
+    "tr-007": "c143",
+    "tr-008": "c031",
+    "tr-009": "c001",
+    "tr-010": "c131",
+    "tr-011": "c079",
+    "tr-012": "c121",
+    "tr-013": "c100",
+    "tr-014": "c070",
+    "tr-015": "c052",
+    "tr-016": "c137",
+    "tr-017": "c089",
+    "tr-018": "c110",
+    "tr-019": "c021",
+    "tr-020": "c145",
+    "tr-021": "c040",
+    "tr-022": "c005",
+    "tr-023": "c133",
+    "tr-024": "c081",
+    "tr-025": "c123",
+    "tr-026": "c104",
+    "tr-027": "c072",
+    "tr-028": "c054",
+    "tr-029": "c091",
+    "tr-030": "c113",
+    "tr-031": "c023",
+    "tr-032": "c147",
+    "tr-033": "c044",
+    "tr-034": "c007",
+    "tr-035": "c086",
+    "tr-036": "c106",
+    "tr-037": "c074",
+    "tr-038": "c056",
+    "tr-039": "c093",
+    "tr-040": "c115",
+    "tr-041": "c025",
+    "tr-042": "c046",
+    "tr-043": "c014",
+    "tr-044": "c124",
+    "tr-045": "c076",
+    "tr-046": "c067",
+    "tr-047": "c037",
+    "tr-048": "c049",
+    "tr-049": "c015",
+    "tr-050": "c018",
+    "en-001": "c069",
+    "en-002": "c051",
+    "en-003": "c135",
+    "en-004": "c088",
+    "en-005": "c109",
+    "en-006": "c020",
+    "en-007": "c144",
+    "en-008": "c041",
+    "en-009": "c002",
+    "en-010": "c130",
+    "en-011": "c080",
+    "en-012": "c116",
+    "en-013": "c032",
+    "en-014": "c071",
+    "en-015": "c053",
+    "en-016": "c138",
+    "en-017": "c090",
+    "en-018": "c111",
+    "en-019": "c022",
+    "en-020": "c146",
+    "en-021": "c043",
+    "en-022": "c004",
+    "en-023": "c082",
+    "en-024": "c120",
+    "en-025": "c101",
+    "en-026": "c073",
+    "en-027": "c055",
+    "en-028": "c140",
+    "en-029": "c092",
+    "en-030": "c112",
+    "en-031": "c024",
+    "en-032": "c148",
+    "en-033": "c045",
+    "en-034": "c006",
+    "en-035": "c084",
+    "en-036": "c125",
+    "en-037": "c103",
+    "en-038": "c075",
+    "en-039": "c061",
+    "en-040": "c094",
+    "en-041": "c026",
+    "en-042": "c047",
+    "en-043": "c008",
+    "en-044": "c105",
+    "en-045": "c062",
+    "en-046": "c028",
+    "en-047": "c013",
+    "en-048": "c034",
+    "en-049": "c016",
+    "en-050": "c017"
+  },
+  "kept_by_lang": {
+    "tr": 50,
+    "en": 50
+  },
+  "kept_by_category": {
+    "academic_calendar": 9,
+    "courses_credits": 10,
+    "department_general": 5,
+    "double_major_minor": 8,
+    "erasmus_exchange": 7,
+    "exams": 11,
+    "graduate_programs": 6,
+    "graduation": 9,
+    "internship": 13,
+    "labs_research": 3,
+    "registration": 6,
+    "staff_contacts": 5,
+    "student_affairs": 8
+  },
+  "kept_by_difficulty": {
+    "easy": 22,
+    "medium": 58,
+    "hard": 20
+  },
+  "link_status": {
+    "https://bmb.cu.edu.tr/storage/belgeler/formlar/Staj_Yonergesi.pdf": 200,
+    "https://bmb.cu.edu.tr/cu/education/lisans/staj": 200,
+    "https://ebs.cu.edu.tr/En/Program/CourseCatalog/555/2026": 200,
+    "https://genelsekreterlik.cu.edu.tr/storage/MEVZUAT/%C3%96%C4%9ERENC%C4%B0/Onlisans_Lisans_Sinav_Yonetmelik.pdf": 200,
+    "https://ebs.cu.edu.tr/Program/GenelBilgi/555/2026": 200,
+    "https://bmb.cu.edu.tr/cu/student/bitirme-tezi": 200,
+    "https://bmb.cu.edu.tr/cu/education/lisans/bitirme-projesi": 200,
+    "https://bmb.cu.edu.tr/storage/B%C3%B6l%C3%BCmlerden%20g%C3%B6r%C3%BC%C5%9Flere%20g%C3%B6re%20d%C3%BCzenlenen%20Bitirme_Odevi_Ilkeleri-12.01.2022.pdf": 200,
+    "https://bmb.cu.edu.tr/storage/engineering%20design/CEN317_Engineering_desing_rubicle__turkish_final.pdf": 200,
+    "https://ebs.cu.edu.tr/Program/DersPlan/555/2026": 200,
+    "https://www.cu.edu.tr/media/212daahw/2026genel.pdf": 200,
+    "http://genelsekreterlik.cu.edu.tr/storage/MEVZUAT/%C3%96%C4%9ERENC%C4%B0/KayitYenilemeYeniSenato.pdf": 200,
+    "http://genelsekreterlik.cu.edu.tr/storage/MEVZUAT/%C3%96%C4%9ERENC%C4%B0/%C3%87ift%20Anadal%20Yandal%20Y%C3%B6nerge%2016.04.2024%20son%20%C5%9Fekli.pdf": 200,
+    "https://bmb.cu.edu.tr/storage/belgeler/mufredat/19-20Yandal.pdf": 200,
+    "https://bmb.cu.edu.tr/cu/bolumumuz/committees": 200,
+    "https://bmb.cu.edu.tr/storage/belgeler/%C3%87.%C3%9C%20Yaz%20%C3%96%C4%9Fretimi%20Y%C3%B6nergesi.pdf": 200,
+    "https://bmb.cu.edu.tr/storage/belgeler/yaz_okulu/yazokulu_sunumG%C3%BCncel1.pdf": 200,
+    "https://erasmus.cu.edu.tr/cu/erasmus-study/terms-of-application": 200,
+    "https://bmb.cu.edu.tr/cu/student/erasmus": 200,
+    "https://bmb.cu.edu.tr/storage/belgeler/erasmus/Erasmus_Bilgiler.pdf": 200,
+    "https://erasmus.cu.edu.tr/cu/erasmus-study/contact": 200,
+    "https://bmb.cu.edu.tr/cu/personel/akademik-personel": 200,
+    "https://bmb.cu.edu.tr/cu/bolumumuz/administrative-structure": 200,
+    "https://oidb.cu.edu.tr/%C4%B1letisim/": 200,
+    "https://bmb.cu.edu.tr/cu/education/lisans": 200,
+    "https://bmb.cu.edu.tr/cu/bolumumuz/about": 200,
+    "https://bmb.cu.edu.tr/cu/research/laboratuvarlar": 200,
+    "https://bmb.cu.edu.tr/cu/research/calisma-gruplari": 200,
+    "https://bmb.cu.edu.tr/cu/kalite/mudek-ve-eur-ace-akreditasyonlarimiz-hakkinda": 200,
+    "https://bmb.cu.edu.tr/cu/kalite/mudek-hakkinda": 200,
+    "https://ebs.cu.edu.tr/En/Program/Information/555/2026": 200,
+    "https://bmb.cu.edu.tr/cu/bolumumuz/ozgorev-ve-ozgorus": 200,
+    "https://bmb.cu.edu.tr/cu/education/yuksek-lisans": 200,
+    "https://bmb.cu.edu.tr/cu/education/doktora": 200,
+    "https://bmb.cu.edu.tr/cu/education/doktora/doktora-yeterlik": 200,
+    "https://bmb.cu.edu.tr/cu/student/e-services": 200
+  }
+}

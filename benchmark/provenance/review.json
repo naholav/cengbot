@@ -1,0 +1,652 @@
+{
+ "c001": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c002": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c003": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c004": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c005": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c006": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c007": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c008": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c009": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c010": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c011": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c012": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c013": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c014": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c015": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c016": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c017": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c018": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c019": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c020": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c021": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c022": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c023": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c024": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c025": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c026": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c027": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c028": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c029": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c030": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c031": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c032": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c033": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c034": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c035": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c036": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c037": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c038": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c039": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c040": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c041": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c042": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c043": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c044": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c045": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c046": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c047": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c048": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c049": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c050": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c051": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c052": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c053": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c054": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c055": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c056": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c057": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c058": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c059": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c060": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c061": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c062": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c063": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c064": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c065": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c066": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c067": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c068": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c069": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c070": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c071": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c072": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c073": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c074": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c075": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c076": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c077": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c078": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c079": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c080": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c081": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c082": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c083": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c084": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c085": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c086": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c087": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c088": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c089": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c090": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c091": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c092": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c093": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c094": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c095": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c096": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c097": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c098": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c099": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c100": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c101": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c102": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c103": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c104": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c105": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c106": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c107": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c108": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c109": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c110": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c111": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c112": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c113": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c114": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c115": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c116": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c117": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c118": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c119": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c120": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c121": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c122": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c123": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c124": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c125": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c126": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c127": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c128": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c129": {
+  "ok": false,
+  "reason": "two official pages disagree (about page: 5 labs incl. Image Processing; labs page lists 4)"
+ },
+ "c130": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c131": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c132": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c133": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c134": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c135": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c136": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c137": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c138": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c139": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c140": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c141": {
+  "ok": false,
+  "reason": "MÜDEK founding history is off-topic trivia for a department bot"
+ },
+ "c142": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c143": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c144": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c145": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c146": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c147": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c148": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c149": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ },
+ "c150": {
+  "ok": true,
+  "reason": "checked against the page text"
+ },
+ "c151": {
+  "ok": true,
+  "select": false,
+  "reason": "reserve: correct, but topic already covered / lower priority"
+ }
+}

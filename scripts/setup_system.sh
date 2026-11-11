@@ -64,8 +64,12 @@ fi
 print_status "📦 Installing Python dependencies..."
 "$PYTHON" -m pip install -r config/requirements.txt
 
-print_status "📦 Installing Node.js dependencies..."
-( cd admin_frontend && npm install )
+if node_ok && command -v npm >/dev/null 2>&1; then
+    print_status "📦 Installing Node.js dependencies..."
+    ( cd admin_frontend && npm install )
+else
+    print_warning "Skipping the admin panel dependencies (Node.js 22.13+/24+ with npm is required). $NODE_INSTALL_HINT"
+fi
 
 print_status "💾 Initializing database (creates missing tables only)..."
 "$PYTHON" -c 'import sys; sys.path.insert(0, "src"); from database_models import init_db; init_db()'

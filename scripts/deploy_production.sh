@@ -147,7 +147,7 @@ deploy_application() {
     as_service_user ".venv/bin/python -c 'import sys; sys.path.insert(0, \"src\"); from database_models import init_db; init_db()'"
     # The panel is served by nginx on the same origin; nginx proxies /api/ to the
     # admin API (127.0.0.1:8001). REACT_APP_API_URL is baked in at build time.
-    as_service_user "cd admin_frontend && npm install && REACT_APP_API_URL='${PANEL_API_URL:-/api}' npm run build"
+    as_service_user "cd admin_frontend && npm install && REACT_APP_API_URL=$(printf '%q' "${PANEL_API_URL:-/api}") npm run build"
     run install -d -m 0755 "$WEB_ROOT"
     # Remove files of the previous build (e.g. old static/ chunks) before copying.
     if [[ -n "$WEB_ROOT" && "$WEB_ROOT" == /var/www/* && -d "$WEB_ROOT" ]]; then

@@ -360,7 +360,7 @@ class EnvironmentConfig:
     @property
     def api_host(self) -> str:
         """API server host."""
-        return self.get_str("API_HOST", "0.0.0.0")
+        return self.get_str("API_HOST", "127.0.0.1")  # loopback by default; expose via a reverse proxy
 
     @property
     def api_port(self) -> int:

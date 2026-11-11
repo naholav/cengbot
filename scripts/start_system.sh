@@ -127,7 +127,7 @@ start_and_record() {
     print_success "$(service_label "$1") started - PID: $LAST_PID (log: $(service_log "$1"))"
 }
 
-print_status "1️⃣  AI Worker (LLaMA 3.2 3B + LoRA from models/active-model)..."
+print_status "1️⃣  AI Worker (fine-tuned model from models/active-model)..."
 start_and_record worker
 sleep 5
 print_status "2️⃣  Admin API..."

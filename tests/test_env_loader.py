@@ -338,3 +338,11 @@ def test_rabbitmq_credentials(clean_env, monkeypatch):
     monkeypatch.setenv("RABBITMQ_USER", "cengbot")
     monkeypatch.setenv("RABBITMQ_PASSWORD", "p w")
     assert (clean_env.rabbitmq_user, clean_env.rabbitmq_password) == ("cengbot", "p w")
+
+
+def test_api_host_defaults_to_loopback(clean_env, monkeypatch):
+    """The admin API must not listen on every interface unless explicitly configured."""
+    monkeypatch.delenv("API_HOST", raising=False)
+    assert clean_env.api_host == "127.0.0.1"
+    monkeypatch.setenv("API_HOST", "0.0.0.0")
+    assert clean_env.api_host == "0.0.0.0"

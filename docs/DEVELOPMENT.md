@@ -1,647 +1,190 @@
 # 🔧 CengBot Development Guide
 
-## 🚀 Quick Start for Developers
+## 🚀 Setup
 
-### Prerequisites
-- Python 3.8+ installed
-- Node.js 16+ and npm
-- RabbitMQ server
-- Git
-- Code editor (VS Code recommended)
+Requirements: Python 3.11, Node.js 18+ and npm, RabbitMQ, and a CUDA GPU if
+you want to run the real model (the tests do not need one).
 
-### Development Setup
 ```bash
-# 1. Clone repository
-git clone https://github.com/your-username/university-bot.git
-cd university-bot
+git clone https://github.com/naholav/cu_ceng_bot.git
+cd cu_ceng_bot
 
-# 2. Setup Python environment
-python3 -m venv .venv
-source .venv/bin/activate  # Linux/Mac
-# or
-.venv\Scripts\activate     # Windows
+python3.11 -m venv .venv                                   # the scripts always use .venv/bin/python
+.venv/bin/python -m pip install -r config/requirements.txt
+.venv/bin/python -m pip install -r config/requirements-dev.txt   # pytest, pytest-asyncio, httpx
 
-# 3. Install dependencies
-pip install -r config/requirements.txt
+(cd admin_frontend && npm install)
 
-# 4. Setup frontend
-cd admin_frontend
-npm install
-cd ..
-
-# 5. Initialize database
-cd src
-python3 -c "from database_models import init_db; init_db()"
-cd ..
-
-# 6. Start development environment
-./scripts/dev_mode.sh
+cp .env.example .env && chmod 600 .env                     # fill in a test bot token, admin password, ...
+.venv/bin/python -c "import sys; sys.path.insert(0, 'src'); from database_models import init_db; init_db()"
 ```
 
-## 📁 Project Structure for Developers
+`config/requirements-dev.txt` does not include `config/requirements.txt`, so
+installing it never upgrades torch or transformers in an existing environment.
 
-```
-src/
-├── telegram_bot.py                 # 🤖 Main Telegram bot
-├── telegram_bot_rabbitmq.py        # 🔄 RabbitMQ-enabled bot
-├── telegram_bot_standalone.py      # 🏃 Standalone bot
-├── ai_model_worker.py              # ⚡ AI processing worker
-├── admin_rest_api.py               # 🌐 FastAPI backend
-├── llama_model_handler.py          # 🧠 LLaMA model handler
-└── database_models.py              # 💾 Database models
-```
+## ▶️ Running the components
 
-## 🔧 Development Workflow
+All at once: `./scripts/start_system.sh` (`--no-frontend` without the React
+dev server), stop with `./scripts/stop_system.sh`. Or one by one, from the
+project root:
 
-### 1. Code Organization
-
-#### Python Code Style
-```python
-# Follow PEP 8 conventions
-# Use type hints
-# Add comprehensive docstrings
-
-def process_message(message: str, language: str) -> Optional[str]:
-    """
-    Process incoming message and generate response.
-    
-    Args:
-        message: User message text
-        language: Detected language (TR/EN)
-        
-    Returns:
-        Generated response or None if error
-    """
-    try:
-        # Implementation here
-        return response
-    except Exception as e:
-        logger.error(f"Error processing message: {e}")
-        return None
+```bash
+.venv/bin/python src/ai_model_worker.py          # needs RabbitMQ + the model (GPU)
+.venv/bin/python src/telegram_bot_rabbitmq.py    # needs RabbitMQ + TELEGRAM_BOT_TOKEN
+.venv/bin/python src/admin_rest_api.py           # http://localhost:8001 (API_RELOAD=true for auto-reload)
+(cd admin_frontend && npm start)                 # http://localhost:3000
 ```
 
-#### Database Models
-```python
-# SQLAlchemy models with proper relationships
-class RawData(Base):
-    __tablename__ = "raw_data"
-    
-    id = Column(Integer, primary_key=True)
-    telegram_id = Column(BigInteger, nullable=False)
-    question = Column(Text, nullable=False)
-    answer = Column(Text)
-    language = Column(String(10))
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
-    # Relationships
-    training_data = relationship("TrainingData", back_populates="source")
+Use a **separate test bot token** and test group for development: two pollers
+on the same token make Telegram answer `409 Conflict`. The same applies to
+`src/telegram_bot_standalone.py` (a development bot that loads the model
+in-process, without RabbitMQ) and the legacy `src/telegram_bot.py`: never run
+them next to the production bot.
+
+For more detail, raise the log level (the entrypoints have no debug flag):
+
+```bash
+LOG_LEVEL=DEBUG .venv/bin/python src/ai_model_worker.py
+LOG_LEVEL=DEBUG .venv/bin/python src/telegram_bot_rabbitmq.py
 ```
 
-### 2. API Development
+(The Admin API always logs at INFO.)
 
-#### FastAPI Endpoints
-```python
-@app.get("/raw-data", response_model=List[RawDataResponse])
-async def get_raw_data(
-    skip: int = 0,
-    limit: int = 100,
-    language: Optional[str] = None,
-    db: Session = Depends(get_db)
-):
-    """Get raw data with pagination and filtering."""
-    query = db.query(RawData)
-    
-    if language:
-        query = query.filter(RawData.language == language)
-    
-    return query.offset(skip).limit(limit).all()
+## 📁 Code layout and conventions
+
+```
+src/                 application code; modules import each other WITHOUT a "src." prefix
+                     (from database_models import ...); every entrypoint puts src/ and the
+                     project root on sys.path itself
+config/env_loader.py .env loading and typed settings
+scripts/             bash tools; all source scripts/_common.sh
+tests/               pytest suite
+admin_frontend/src/  React + TypeScript (Ant Design, TanStack Query, axios)
 ```
 
-#### Error Handling
-```python
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    """Handle HTTP exceptions with proper logging."""
-    logger.error(f"HTTP error {exc.status_code}: {exc.detail}")
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"error": exc.detail}
-    )
-```
+- **Configuration** goes through `config/env_loader.py`. It loads `.env` once
+  (or the file named by `CENGBOT_ENV_FILE`); variables already in the process
+  environment win, empty values fall back to the default, relative paths
+  resolve against the project root, and unedited `.env.example` placeholders
+  count as unset. Document every new variable in `.env.example`.
 
-### 3. Frontend Development
+  ```python
+  from config.env_loader import get_config
 
-#### React Components
-```typescript
-// Use TypeScript for better type safety
-interface RawDataProps {
-  data: RawData[];
-  onUpdate: (id: number, answer: string) => void;
-}
+  config = get_config()
+  config.questions_queue                       # QUESTIONS_QUEUE, default "questions"
+  config.model_path                            # MODEL_PATH, default <root>/models/active-model
+  config.get_int("BOT_ANSWER_TIMEOUT", 30)     # get_str / get_int / get_float / get_bool / get_list / get_path
+  ```
 
-const RawDataTable: React.FC<RawDataProps> = ({ data, onUpdate }) => {
-  const [loading, setLoading] = useState(false);
-  
-  const handleUpdate = async (id: number, answer: string) => {
-    setLoading(true);
-    try {
-      await onUpdate(id, answer);
-      message.success('Answer updated successfully');
-    } catch (error) {
-      message.error('Failed to update answer');
-    } finally {
-      setLoading(false);
-    }
-  };
-  
-  return (
-    <Table
-      dataSource={data}
-      loading={loading}
-      columns={columns}
-      rowKey="id"
-    />
-  );
-};
-```
+- **Database** access uses short-lived sessions from
+  `database_models.SessionLocal` (always closed, rolled back on errors). Times
+  are stored as naive UTC. `init_db()` only creates missing tables and indexes;
+  there are no migrations, so a new column on an existing table needs a manual
+  `ALTER TABLE` on existing databases.
+- **Logging**: one concise line per event. Code that retries (worker, bot
+  consumer) logs the first failure as an error and repeats more briefly, so a
+  long outage cannot fill the disk. Unexpected errors with tracebacks go
+  through `src/error_handler.py` into the rotating `logs/error.log`.
+- **Scripts** source `scripts/_common.sh` for `PROJECT_ROOT`, `PYTHON`,
+  `print_*`, `confirm`, `as_root` (interactive sudo, never a stored password),
+  `service_pids` (only processes of this project) and log rotation. New
+  scripts should accept `--help`, and `--dry-run` / `--yes` if they change the
+  system.
 
-#### State Management
-```typescript
-// Use React hooks for state management
-const useRawData = () => {
-  const [data, setData] = useState<RawData[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  
-  const fetchData = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const response = await fetch('/api/raw-data');
-      const result = await response.json();
-      setData(result);
-    } catch (err) {
-      setError('Failed to fetch data');
-    } finally {
-      setLoading(false);
-    }
-  };
-  
-  return { data, loading, error, fetchData };
-};
-```
+## 🧩 Common changes
+
+**Admin API endpoint.** Register data endpoints on the `protected` router in
+`src/admin_rest_api.py`; it applies `verify_credentials` to every route. Only
+add routes to `app` directly when they must be public. Add tests to
+`tests/test_admin_api.py` (they use FastAPI's `TestClient` and the test
+credentials `admin` / `test-admin-password` from `tests/conftest.py`). Update
+[API.md](API.md) and `admin_frontend/src/services/api.ts` + `types/api.ts`.
+
+**Prompts.** The system prompts and turn markers
+(`TRAINING_SYSTEM_PROMPT_TR/EN`, `TRAINING_TURN_MARKERS`) are defined once in
+`src/llama_model_handler.py`; `src/train_model.py` imports them, and
+`tests/test_training_pipeline.py` checks that the training prompt is
+byte-identical to the inference prompt. The deployed adapter was trained with
+these exact prompts, so changing them means retraining.
+
+**Prompt guard rules.** `src/prompt_guard.py`, tests in
+`tests/test_prompt_guard.py`. False positives are worse than misses here
+(students ask real questions); add a test for both the attack and a similar
+harmless question.
+
+**Model directory format.** `src/llama_model_handler.py`
+(`resolve_model_spec`), the validator in `scripts/switch_model.sh` and
+`save_final_model` in `src/train_model.py` must agree on the contract in
+[MODEL_SWAP.md](MODEL_SWAP.md).
+
+**Frontend.** `npm start` reads `REACT_APP_API_URL` (default
+`http://localhost:8001`) and `REACT_APP_ADMIN_USERNAME` at build time, from
+the shell or `admin_frontend/.env.local`. The dev server origin
+`http://localhost:3000` is in the default `CORS_ORIGINS`. Credentials are kept
+in memory and `sessionStorage` only (`src/services/api.ts`); keep it that way.
 
 ## 🧪 Testing
 
-### Unit Tests
-```python
-# tests/test_model_handler.py
-import pytest
-from src.llama_model_handler import ModelHandler
-
-class TestModelHandler:
-    @pytest.fixture
-    def model_handler(self):
-        return ModelHandler()
-    
-    def test_model_initialization(self, model_handler):
-        """Test model loads correctly."""
-        assert model_handler.model is not None
-        assert model_handler.tokenizer is not None
-    
-    def test_generate_response(self, model_handler):
-        """Test response generation."""
-        question = "Test question"
-        response = model_handler.generate_response(question)
-        assert response is not None
-        assert len(response) > 0
-```
-
-### Integration Tests
-```python
-# tests/test_api.py
-from fastapi.testclient import TestClient
-from src.admin_rest_api import app
-
-client = TestClient(app)
-
-def test_get_raw_data():
-    """Test raw data endpoint."""
-    response = client.get("/raw-data")
-    assert response.status_code == 200
-    assert isinstance(response.json(), list)
-
-def test_update_answer():
-    """Test answer update endpoint."""
-    response = client.put("/raw-data/1", json={"answer": "Test answer"})
-    assert response.status_code == 200
-```
-
-### Running Tests
 ```bash
-# Install test dependencies
-pip install pytest pytest-asyncio httpx
+.venv/bin/python -m pytest                                  # whole suite (~940 tests)
+.venv/bin/python -m pytest tests/test_prompt_guard.py -q    # one file
+.venv/bin/python -m pytest -k switch                        # by name
+RUN_GPU_TESTS=1 .venv/bin/python -m pytest -m gpu           # opt-in: loads the real model on the GPU
+SHELLCHECK=/usr/bin/shellcheck .venv/bin/python -m pytest tests/test_shell_scripts.py
 
-# Run unit tests
-pytest tests/unit/
-
-# Run integration tests
-pytest tests/integration/
-
-# Run all tests with coverage
-pytest --cov=src tests/
+cd admin_frontend && CI=true npx react-scripts test --watchAll=false   # frontend (Jest + Testing Library)
 ```
+
+The Python tests run offline. `tests/conftest.py` (do not bypass it) runs
+before any project module is imported and:
+
+- puts `src/` and the project root on `sys.path`;
+- sets dummy tokens and keys, `HF_HUB_OFFLINE=1`, `ADMIN_USERNAME=admin` and
+  `ADMIN_PASSWORD=test-admin-password`, so the real `.env` secrets are never used;
+- points `LOG_DIR` and `ERROR_LOG_FILE` to a temporary directory, so the real
+  `logs/` files are never written;
+- points the ORM at a temporary SQLite database (fixture `db_session` gives a
+  fresh schema) and fails the run if the real `university_bot.db` changes.
+
+Mock pika, Telegram, torch/transformers and the Anthropic client; never load
+the real model outside tests marked `gpu`. The `gpu` test is skipped unless
+`RUN_GPU_TESTS=1`; the shellcheck test is skipped unless `shellcheck` is on
+`PATH` or `SHELLCHECK` points to it. Markers are defined in `pytest.ini`
+(`gpu`, `slow`).
+
+| Test file | Covers |
+|---|---|
+| `test_admin_api.py` | endpoints, auth, pagination, `/docs/read` allowlist, CORS |
+| `test_ai_model_worker.py` | backoff, poison messages, answer publishing |
+| `test_telegram_bot_rabbitmq.py` | answer router, rate limit, message splitting, votes |
+| `test_telegram_bot_legacy.py` | the legacy and standalone bots |
+| `test_llama_model_handler.py` | model resolution, offline-first loading, post-processing (+ the opt-in GPU test) |
+| `test_prompt_guard.py` | blocked attacks and allowed questions (TR + EN) |
+| `test_training_pipeline.py` | prompt alignment, label masking, group split, export, augmentation |
+| `test_database_models.py` | schema, duplicates, votes and `like` sync |
+| `test_shell_scripts.py` | the bash scripts in a temporary project (+ shellcheck) |
+| `test_env_loader.py`, `test_error_handler.py`, `test_export_to_excel.py`, `test_system_monitor.py`, `test_smoke_infra.py` | the remaining modules |
 
 ## 🔍 Debugging
 
-### Logging Configuration
-```python
-# Enhanced logging for development
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/debug.log'),
-        logging.StreamHandler()
-    ]
-)
-
-# Create logger for specific module
-logger = logging.getLogger(__name__)
-```
-
-### Debug Mode
 ```bash
-# Enable debug mode
-export DEBUG=true
-export LOG_LEVEL=DEBUG
+# What would the worker load? (filesystem only, no weights)
+.venv/bin/python -c "import sys; sys.path.insert(0, 'src'); from llama_model_handler import resolve_model_spec; print(resolve_model_spec())"
 
-# Run with debug output
-python3 src/telegram_bot.py --debug
+# Database reachable?
+.venv/bin/python -c "import sys; sys.path.insert(0, 'src'); from database_models import SessionLocal; from sqlalchemy import text; s = SessionLocal(); print(s.execute(text('SELECT COUNT(*) FROM raw_data')).scalar()); s.close()"
+
+# RabbitMQ reachable? Queue lengths?
+.venv/bin/python -c "import pika; pika.BlockingConnection(pika.ConnectionParameters('localhost')).close(); print('RabbitMQ OK')"
+sudo rabbitmqctl list_queues
+
+# Training data and tokenization without a GPU run
+./scripts/train_model.sh --dry-run
+
+# Log sizes / free disk
+.venv/bin/python src/system_monitor.py --check-logs
 ```
 
-### Common Debug Commands
-```bash
-# Check model loading
-python3 -c "from src.llama_model_handler import ModelHandler; m = ModelHandler(); print('Model loaded successfully')"
-
-# Test database connection
-python3 -c "from src.database_models import SessionLocal; db = SessionLocal(); print('Database connected')"
-
-# Check RabbitMQ connection
-python3 -c "import pika; conn = pika.BlockingConnection(pika.ConnectionParameters('localhost')); print('RabbitMQ connected')"
-```
-
-## 📊 Performance Monitoring
-
-### Profiling
-```python
-# Profile model inference
-import cProfile
-import pstats
-
-def profile_model_inference():
-    pr = cProfile.Profile()
-    pr.enable()
-    
-    # Your model inference code here
-    model_handler.generate_response("Test question")
-    
-    pr.disable()
-    stats = pstats.Stats(pr)
-    stats.sort_stats('tottime')
-    stats.print_stats()
-```
-
-### Memory Monitoring
-```python
-# Monitor memory usage
-import psutil
-import os
-
-def get_memory_usage():
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss / 1024 / 1024  # MB
-
-# Log memory usage
-logger.info(f"Memory usage: {get_memory_usage():.2f} MB")
-```
-
-## 🔄 CI/CD Pipeline
-
-### GitHub Actions Workflow
-```yaml
-# .github/workflows/test.yml
-name: Test and Deploy
-
-on:
-  push:
-    branches: [ main, develop ]
-  pull_request:
-    branches: [ main ]
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    
-    services:
-      rabbitmq:
-        image: rabbitmq:3.11
-        ports:
-          - 5672:5672
-    
-    steps:
-    - uses: actions/checkout@v3
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.9'
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r config/requirements.txt
-        pip install pytest pytest-cov
-    
-    - name: Run tests
-      run: |
-        pytest --cov=src tests/
-    
-    - name: Upload coverage
-      uses: codecov/codecov-action@v3
-```
-
-### Pre-commit Hooks
-```yaml
-# .pre-commit-config.yaml
-repos:
-  - repo: https://github.com/psf/black
-    rev: 22.3.0
-    hooks:
-      - id: black
-        language_version: python3.9
-
-  - repo: https://github.com/pycqa/flake8
-    rev: 4.0.1
-    hooks:
-      - id: flake8
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v0.950
-    hooks:
-      - id: mypy
-```
-
-## 🛠️ Development Tools
-
-### VS Code Configuration
-```json
-// .vscode/settings.json
-{
-    "python.defaultInterpreterPath": ".venv/bin/python",
-    "python.formatting.provider": "black",
-    "python.linting.enabled": true,
-    "python.linting.flake8Enabled": true,
-    "python.linting.mypyEnabled": true,
-    "files.exclude": {
-        "**/__pycache__": true,
-        "**/.pytest_cache": true,
-        "**/node_modules": true
-    }
-}
-```
-
-### Makefile for Common Tasks
-```makefile
-# Makefile
-.PHONY: install test format lint clean
-
-install:
-	pip install -r config/requirements.txt
-	cd admin_frontend && npm install
-
-test:
-	pytest tests/ -v
-
-format:
-	black src/
-	cd admin_frontend && npm run format
-
-lint:
-	flake8 src/
-	mypy src/
-	cd admin_frontend && npm run lint
-
-clean:
-	find . -type d -name "__pycache__" -exec rm -rf {} +
-	find . -type f -name "*.pyc" -delete
-	rm -rf .pytest_cache/
-	rm -rf .mypy_cache/
-
-dev:
-	./scripts/dev_mode.sh
-
-prod:
-	./scripts/start_system.sh
-```
-
-## 🔧 Configuration Management
-
-### Environment Variables
-```python
-# config/env_loader.py
-import os
-from typing import Optional
-from dataclasses import dataclass
-
-@dataclass
-class Config:
-    telegram_bot_token: str
-    database_url: str
-    rabbitmq_url: str
-    model_path: str
-    debug: bool = False
-    
-    @classmethod
-    def from_env(cls) -> 'Config':
-        return cls(
-            telegram_bot_token=os.getenv('TELEGRAM_BOT_TOKEN'),
-            database_url=os.getenv('DATABASE_URL', 'sqlite:///university_bot.db'),
-            rabbitmq_url=os.getenv('RABBITMQ_URL', 'amqp://localhost:5672'),
-            model_path=os.getenv('LORA_MODEL_PATH', 'models/final-best-model-v1/method1'),
-            debug=os.getenv('DEBUG', 'false').lower() == 'true'
-        )
-```
-
-### Configuration Validation
-```python
-def validate_config(config: Config) -> None:
-    """Validate configuration settings."""
-    if not config.telegram_bot_token:
-        raise ValueError("TELEGRAM_BOT_TOKEN is required")
-    
-    if not os.path.exists(config.model_path):
-        raise ValueError(f"Model path does not exist: {config.model_path}")
-    
-    # Test database connection
-    try:
-        engine = create_engine(config.database_url)
-        engine.connect()
-    except Exception as e:
-        raise ValueError(f"Database connection failed: {e}")
-```
-
-## 📈 Performance Optimization
-
-### Database Optimization
-```python
-# Use connection pooling
-from sqlalchemy.pool import QueuePool
-
-engine = create_engine(
-    DATABASE_URL,
-    poolclass=QueuePool,
-    pool_size=20,
-    max_overflow=30,
-    pool_pre_ping=True
-)
-```
-
-### Async Processing
-```python
-# Use asyncio for concurrent processing
-import asyncio
-from typing import List
-
-async def process_messages_batch(messages: List[str]) -> List[str]:
-    """Process multiple messages concurrently."""
-    tasks = [process_single_message(msg) for msg in messages]
-    return await asyncio.gather(*tasks)
-
-async def process_single_message(message: str) -> str:
-    """Process a single message asynchronously."""
-    # Implementation here
-    return response
-```
-
-## 📝 Documentation
-
-### Code Documentation
-```python
-def generate_response(self, question: str, language: str = "TR") -> Optional[str]:
-    """
-    Generate AI response for a given question.
-    
-    This method processes the input question through the LLaMA model with
-    LoRA adapter to generate contextually appropriate responses.
-    
-    Args:
-        question (str): The user's question
-        language (str): Language code ('TR' or 'EN')
-        
-    Returns:
-        Optional[str]: Generated response or None if processing fails
-        
-    Raises:
-        ModelError: If model inference fails
-        ValidationError: If input validation fails
-        
-    Example:
-        >>> handler = ModelHandler()
-        >>> response = handler.generate_response("What is computer science?")
-        >>> print(response)
-        "Computer science is the study of algorithms..."
-    """
-```
-
-### API Documentation
-```python
-# Use OpenAPI/Swagger for API documentation
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-
-app = FastAPI(
-    title="CengBot Admin API",
-    description="API for managing CengBot data and operations",
-    version="1.0.0"
-)
-
-class RawDataCreate(BaseModel):
-    """Schema for creating raw data entries."""
-    question: str
-    answer: Optional[str] = None
-    language: str = "TR"
-    
-    class Config:
-        schema_extra = {
-            "example": {
-                "question": "What is computer science?",
-                "answer": "Computer science is...",
-                "language": "EN"
-            }
-        }
-```
-
-## 🎯 Best Practices
-
-### 1. Error Handling
-```python
-# Use specific exception types
-class ModelError(Exception):
-    """Raised when model inference fails."""
-    pass
-
-class ValidationError(Exception):
-    """Raised when input validation fails."""
-    pass
-
-# Handle errors gracefully
-try:
-    response = model_handler.generate_response(question)
-except ModelError as e:
-    logger.error(f"Model inference failed: {e}")
-    return "I'm sorry, I'm having trouble processing your question."
-except ValidationError as e:
-    logger.error(f"Input validation failed: {e}")
-    return "Please check your input and try again."
-```
-
-### 2. Resource Management
-```python
-# Use context managers for resource cleanup
-from contextlib import contextmanager
-
-@contextmanager
-def get_db_session():
-    """Context manager for database sessions."""
-    session = SessionLocal()
-    try:
-        yield session
-    finally:
-        session.close()
-
-# Usage
-with get_db_session() as db:
-    # Database operations
-    user = db.query(User).first()
-```
-
-### 3. Security
-```python
-# Input validation and sanitization
-from pydantic import validator
-
-class MessageInput(BaseModel):
-    content: str
-    
-    @validator('content')
-    def validate_content(cls, v):
-        if len(v) > 1000:
-            raise ValueError('Message too long')
-        if not v.strip():
-            raise ValueError('Message cannot be empty')
-        return v.strip()
-```
-
-This development guide provides comprehensive information for developers working on CengBot, covering everything from setup to advanced development practices.
+Loading the real model (`model_instance.load_model()`) needs the GPU memory
+the running worker uses; stop the worker first.

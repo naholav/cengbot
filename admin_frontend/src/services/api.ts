@@ -15,7 +15,7 @@ import {
 const DEFAULT_API_URL = 'http://localhost:8001';
 
 /** Base URL of the admin API: `REACT_APP_API_URL` (build time) or localhost:8001. */
-export const resolveApiBaseUrl = (raw: string | undefined = process.env.REACT_APP_API_URL): string => {
+export const resolveApiBaseUrl = (raw: string | undefined = import.meta.env.REACT_APP_API_URL): string => {
   const value = (raw ?? '').trim();
   return (value || DEFAULT_API_URL).replace(/\/+$/, '');
 };
@@ -23,7 +23,7 @@ export const resolveApiBaseUrl = (raw: string | undefined = process.env.REACT_AP
 export const API_BASE_URL = resolveApiBaseUrl();
 
 /** Username pre-filled on the login form (the backend's ADMIN_USERNAME defaults to "admin"). */
-export const DEFAULT_ADMIN_USERNAME = (process.env.REACT_APP_ADMIN_USERNAME ?? '').trim() || 'admin';
+export const DEFAULT_ADMIN_USERNAME = (import.meta.env.REACT_APP_ADMIN_USERNAME ?? '').trim() || 'admin';
 
 export const AUTH_STORAGE_KEY = 'adminAuth';
 export const LOGIN_PATH = '/auth/login';

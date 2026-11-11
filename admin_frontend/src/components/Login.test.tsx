@@ -23,7 +23,7 @@ beforeEach(() => {
 afterEach(() => {
   restoreApi();
   clearAuth();
-  jest.restoreAllMocks();
+  vi.restoreAllMocks();
 });
 
 describe('Login', () => {
@@ -34,7 +34,7 @@ describe('Login', () => {
   });
 
   it('requires a password before calling the API', async () => {
-    const loginSpy = jest.spyOn(apiService, 'login');
+    const loginSpy = vi.spyOn(apiService, 'login');
     renderLogin();
     await user.click(loginButton());
     expect(await screen.findByText('Please enter the password!')).toBeInTheDocument();
@@ -70,7 +70,7 @@ describe('Login', () => {
   });
 
   it('shows a connection error when the API is down', async () => {
-    jest.spyOn(apiService, 'login').mockRejectedValueOnce(
+    vi.spyOn(apiService, 'login').mockRejectedValueOnce(
       Object.assign(new Error('Network Error'), { isAxiosError: true, code: 'ERR_NETWORK' })
     );
     renderLogin();

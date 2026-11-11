@@ -62,7 +62,7 @@ describe('AuthProvider', () => {
   });
 
   it('reports an unreachable server distinctly from bad credentials', async () => {
-    jest.spyOn(apiService, 'login').mockRejectedValueOnce(
+    vi.spyOn(apiService, 'login').mockRejectedValueOnce(
       Object.assign(new Error('Network Error'), { isAxiosError: true, code: 'ERR_NETWORK' })
     );
     const { result } = renderHook(() => useAuth(), { wrapper });
@@ -77,7 +77,7 @@ describe('AuthProvider', () => {
   });
 
   it('does not log credentials to the console on failure', async () => {
-    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     mockApi(() => ({ status: 401 }));
     const { result } = renderHook(() => useAuth(), { wrapper });
     await act(async () => {
@@ -133,7 +133,7 @@ describe('AuthProvider', () => {
   });
 
   it('useAuth outside the provider throws a helpful error', () => {
-    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     expect(() => renderHook(() => useAuth())).toThrow('useAuth must be used within AuthProvider');
     errorSpy.mockRestore();
   });

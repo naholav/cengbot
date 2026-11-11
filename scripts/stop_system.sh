@@ -69,7 +69,7 @@ echo ""
 if (( remaining == 0 )); then
     print_success "All CengBot services stopped"
 else
-    print_warning "Some processes may still be running (ps -ef | grep -E 'ai_model_worker|admin_rest_api|telegram_bot|react-scripts')"
+    print_warning "Some processes may still be running (ps -ef | grep -E 'ai_model_worker|admin_rest_api|telegram_bot|bin/vite( |$)')"
 fi
 echo "📊 Restart: ./scripts/start_system.sh      📝 Logs are preserved in logs/"
 exit "$remaining"

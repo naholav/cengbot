@@ -121,7 +121,7 @@ describe('request interceptor', () => {
 describe('401 handling', () => {
   it('clears credentials and notifies the app when an authenticated request is rejected', async () => {
     setAuthHeader(HEADER);
-    const onUnauthorized = jest.fn();
+    const onUnauthorized = vi.fn();
     setUnauthorizedHandler(onUnauthorized);
     mockApi(() => ({ status: 401, data: { detail: 'Incorrect username or password' } }));
 
@@ -133,7 +133,7 @@ describe('401 handling', () => {
 
   it('does not treat a failed login attempt as a session expiry', async () => {
     setAuthHeader(HEADER);
-    const onUnauthorized = jest.fn();
+    const onUnauthorized = vi.fn();
     setUnauthorizedHandler(onUnauthorized);
     mockApi(() => ({ status: 401, data: {} }));
 
@@ -145,7 +145,7 @@ describe('401 handling', () => {
   it('ignores a 401 for credentials that are no longer current', async () => {
     const stale = encodeBasicAuth('admin', 'old');
     setAuthHeader(HEADER);
-    const onUnauthorized = jest.fn();
+    const onUnauthorized = vi.fn();
     setUnauthorizedHandler(onUnauthorized);
     mockApi(() => ({ status: 401, data: {} }));
 
@@ -156,7 +156,7 @@ describe('401 handling', () => {
 
   it('does not log out on server errors', async () => {
     setAuthHeader(HEADER);
-    const onUnauthorized = jest.fn();
+    const onUnauthorized = vi.fn();
     setUnauthorizedHandler(onUnauthorized);
     mockApi(() => ({ status: 500, data: { detail: 'boom' } }));
 
@@ -166,8 +166,8 @@ describe('401 handling', () => {
   });
 
   it('the unregister function only removes its own handler', () => {
-    const first = jest.fn();
-    const second = jest.fn();
+    const first = vi.fn();
+    const second = vi.fn();
     const unregisterFirst = setUnauthorizedHandler(first);
     setUnauthorizedHandler(second);
     unregisterFirst();

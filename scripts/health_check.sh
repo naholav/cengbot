@@ -21,7 +21,14 @@ if [[ -x "$PYTHON" ]]; then
 else
     bad "Project Python not found: $PYTHON"
 fi
-if command -v node >/dev/null 2>&1; then ok "Node.js: $(node --version 2>&1)"; else bad "Node.js not found"; fi
+# the admin panel toolchain (Vite, Vitest) needs Node.js ^22.13 or >=24 (admin_frontend/package.json engines)
+if ! command -v node >/dev/null 2>&1; then
+    bad "Node.js not found"
+elif node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a >= 24 || (a === 22 && b >= 13) ? 0 : 1)' 2>/dev/null; then
+    ok "Node.js: $(node --version 2>&1)"
+else
+    warn "Node.js: $(node --version 2>&1) - too old for the admin panel (needs 22.13+ or 24+)"
+fi
 if systemctl cat rabbitmq-server.service >/dev/null 2>&1 || command -v rabbitmq-server >/dev/null 2>&1; then
     if systemctl is-active --quiet rabbitmq-server; then ok "RabbitMQ: running"; else warn "RabbitMQ: installed but not running"; fi
 else

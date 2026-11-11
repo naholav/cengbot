@@ -5,7 +5,7 @@
 #
 # Options:
 #   --install-deps   (re)install Python requirements and frontend npm packages
-#   --no-frontend    do not start the React dev server
+#   --no-frontend    do not start the admin panel dev server (Vite)
 #   -h, --help
 #
 # Logs are APPENDED to logs/*.log; any log bigger than CENGBOT_LOG_MAX_BYTES
@@ -76,7 +76,8 @@ if (( INSTALL_DEPS == 1 || VENV_CREATED == 1 )); then
     print_status "Installing Python dependencies..."
     "$PYTHON" -m pip install -r config/requirements.txt || die "pip install failed"
 fi
-if (( START_FRONTEND == 1 )) && { (( INSTALL_DEPS == 1 )) || [[ ! -d admin_frontend/node_modules ]]; }; then
+# no .bin/vite: node_modules is missing or still holds the old Create React App install
+if (( START_FRONTEND == 1 )) && { (( INSTALL_DEPS == 1 )) || [[ ! -x admin_frontend/node_modules/.bin/vite ]]; }; then
     print_status "Installing frontend dependencies..."
     ( cd admin_frontend && npm install ) || die "npm install failed"
 fi

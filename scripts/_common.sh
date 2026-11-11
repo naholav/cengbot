@@ -233,9 +233,9 @@ service_regex() {
         bot)      echo '(^|[ /])telegram_bot_rabbitmq\.py( |$)' ;;
         # old polling bots - must not run next to the production bot (same token)
         legacy_bot) echo '(^|[ /])telegram_bot(_standalone)?\.py( |$)' ;;
-        # the dev server only (npm start -> react-scripts start -> scripts/start.js),
-        # never "react-scripts test/build" runs
-        frontend) echo '(^|[ /])react-scripts(\.js)? start( |$)|react-scripts/scripts/start\.js|(^|[ /])npm( run)? start( |$)' ;;
+        # the Vite dev server only (npm start -> sh -c vite -> node .../.bin/vite),
+        # never "vite build", "vite preview" or vitest runs
+        frontend) echo '(^|[ /])vite(\.js)?( (dev|serve))?( -|$)|(^|[ /])npm( run)? start( |$)' ;;
         *)        return 1 ;;
     esac
 }
@@ -257,7 +257,7 @@ pid_matches_service() {
     argv0="${cmd%% *}"
     argv0="${argv0##*/}"
     if [[ "$svc" == "frontend" ]]; then
-        # npm / node / the "sh -c react-scripts start" child - never a user's shell
+        # npm / node / the "sh -c vite" child - never a user's shell
         [[ "$argv0" =~ ^(npm|node|nodejs|sh|dash)$ ]] || return 1
     else
         [[ "$argv0" == python* ]] || return 1

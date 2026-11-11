@@ -71,7 +71,7 @@ const loggedIn = () => window.sessionStorage.setItem(AUTH_STORAGE_KEY, HEADER);
 const rawDataCalls = (calls: InternalAxiosRequestConfig[]) => calls.filter((c) => c.url === '/raw-data');
 
 // antd tables are heavy in jsdom; give the integration tests some headroom.
-jest.setTimeout(30000);
+vi.setConfig({ testTimeout: 30000 });
 // Skipping the per-click pointer-events check avoids thousands of slow jsdom
 // getComputedStyle() calls over antd's CSS-in-JS styles.
 const user = userEvent.setup({ pointerEventsCheck: PointerEventsCheckLevel.Never });

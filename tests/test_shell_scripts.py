@@ -517,6 +517,134 @@ def test_stop_system_stops_only_this_project(fake_project, tmp_path, cleanup_pid
 
 
 # --------------------------------------------------------------------------
+# admin panel (Vite): package.json contract and dev-server process matching
+# --------------------------------------------------------------------------
+FRONTEND = ROOT / "admin_frontend"
+FE_BIN = "/srv/cengbot/admin_frontend/node_modules/.bin"
+
+
+def frontend_regex_matches(cmdlines, root):
+    """service_regex frontend from _common.sh applied to each command line."""
+    script = 'source "$1"; shift; re=$(service_regex frontend); for c in "$@"; do [[ "$c" =~ $re ]] && echo 1 || echo 0; done'
+    proc = subprocess.run(["bash", "-c", script, "_", str(SCRIPTS / "_common.sh"), *cmdlines],
+                          env=script_env(root), capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    return [flag == "1" for flag in proc.stdout.split()]
+
+
+def test_admin_frontend_package_uses_vite_not_react_scripts():
+    pkg = json.loads((FRONTEND / "package.json").read_text(encoding="utf-8"))
+    deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+    assert "react-scripts" not in deps
+    assert "react-scripts" not in json.dumps(pkg)
+    scripts = pkg["scripts"]
+    for name in ("start", "build", "test"):
+        assert scripts.get(name), f"admin_frontend: npm run {name} is missing"
+    assert scripts["start"] == "vite"  # _common.sh start_service frontend runs `npm start`
+    assert "vite build" in scripts["build"]
+    assert "vitest run" in scripts["test"]  # non-watch: `npm test` must terminate
+    config = (FRONTEND / "vite.config.ts").read_text(encoding="utf-8")
+    assert re.search(r"outDir:\s*['\"]build['\"]", config), "deploy_production.sh copies admin_frontend/build/"
+    assert re.search(r"port:\s*3000\b", config), "the panel origin localhost:3000 is in the default CORS_ORIGINS"
+    assert "admin_frontend/build/." in (SCRIPTS / "deploy_production.sh").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("cmdline", [
+    "npm start",
+    "npm run start",
+    "sh -c vite",
+    f"node {FE_BIN}/vite",
+    f"node {FE_BIN}/vite --host 127.0.0.1",
+    f"node {FE_BIN}/vite dev",
+    f"node {FE_BIN}/vite serve --port 3000",
+    "node /srv/cengbot/admin_frontend/node_modules/vite/bin/vite.js",
+])
+def test_frontend_regex_matches_vite_dev_server(cmdline, tmp_path):
+    assert frontend_regex_matches([cmdline], tmp_path) == [True]
+
+
+@pytest.mark.parametrize("cmdline", [
+    "npm test",
+    "npm run test:watch",
+    "npm run build",
+    "npm run preview",
+    "sh -c vitest run",
+    "sh -c vitest",
+    f"node {FE_BIN}/vitest run",
+    f"node {FE_BIN}/vitest",
+    "node --conditions node /srv/cengbot/admin_frontend/node_modules/vitest/dist/workers/forks.js",
+    "sh -c tsc --noEmit && vite build",
+    f"node {FE_BIN}/vite build",
+    f"node {FE_BIN}/vite preview",
+    "sh -c vite preview",
+    "vim /srv/cengbot/admin_frontend/vite.config.ts",
+])
+def test_frontend_regex_ignores_vitest_build_and_preview(cmdline, tmp_path):
+    assert frontend_regex_matches([cmdline], tmp_path) == [False]
+
+
+def test_frontend_regex_follows_package_scripts(tmp_path):
+    """What npm actually spawns for each script (`sh -c <script>`)."""
+    scripts = json.loads((FRONTEND / "package.json").read_text(encoding="utf-8"))["scripts"]
+    names = ["start", "build", "test", "preview"]
+    got = frontend_regex_matches([f"sh -c {scripts[n]}" for n in names if n in scripts], tmp_path)
+    assert got == [n == "start" for n in names if n in scripts]
+
+
+FAKE_NODE_BIN = """#!/bin/sh
+trap 'exit 0' TERM
+while :; do sleep 0.2; done
+"""
+
+
+def test_stop_system_stops_vite_dev_server_but_not_vitest(fake_project):
+    """npm start -> `sh -c vite` -> .bin/vite is stopped; a vitest run or a
+    `vite build` in the same project is left alone."""
+    fe = fake_project / "admin_frontend"
+    bin_dir = fe / "node_modules" / ".bin"
+    bin_dir.mkdir(parents=True)
+    for name in ("vite", "vitest"):
+        (bin_dir / name).write_text(FAKE_NODE_BIN)
+        (bin_dir / name).chmod(0o755)
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    def spawn(command):
+        return subprocess.Popen(["sh", "-c", command], cwd=str(fe), env=env, start_new_session=True,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def tree(proc):
+        """The `sh -c` process plus the fake script it runs (or became), once started."""
+        for _ in range(50):
+            try:
+                own = Path(f"/proc/{proc.pid}/cmdline").read_bytes()
+                children = Path(f"/proc/{proc.pid}/task/{proc.pid}/children").read_text().split()
+            except OSError:
+                own, children = b"", []
+            if children or b"/.bin/" in own:
+                return [proc.pid, *map(int, children)]
+            time.sleep(0.1)
+        raise AssertionError(f"fake process did not start: {proc.args}")
+
+    procs = [spawn("vite"), spawn("vitest run"), spawn("vite build")]
+    try:
+        dev, vitest, build = (tree(p) for p in procs)
+        proc = run(SCRIPTS / "stop_system.sh", root=fake_project, timeout=60)
+        assert proc.returncode == 0, out(proc)
+        assert "Stopping React Frontend" in proc.stdout
+        procs[0].wait(timeout=10)
+        assert all(wait_dead(pid) for pid in dev), "the Vite dev server must be stopped"
+        assert all(alive(pid) for pid in vitest), "a vitest run must not be touched"
+        assert all(alive(pid) for pid in build), "a vite build must not be touched"
+    finally:
+        for p in procs:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            p.wait(timeout=10)
+
+
+# --------------------------------------------------------------------------
 # log rotation
 # --------------------------------------------------------------------------
 def rotate(path, root, **env):

@@ -2,6 +2,7 @@ import React from 'react';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { message } from 'antd';
+import type { MockInstance } from 'vitest';
 import {
   POLL_INTERVAL_MS,
   queryKeys,
@@ -20,22 +21,22 @@ const wrapperFor = (client: QueryClient) => ({ children }: { children: React.Rea
   <QueryClientProvider client={client}>{children}</QueryClientProvider>
 );
 
-let successSpy: jest.SpyInstance;
-let errorSpy: jest.SpyInstance;
+let successSpy: MockInstance;
+let errorSpy: MockInstance;
 
 beforeEach(() => {
   failOnRealRequests();
-  successSpy = jest.spyOn(message, 'success').mockImplementation(() => (() => {}) as never);
-  errorSpy = jest.spyOn(message, 'error').mockImplementation(() => (() => {}) as never);
+  successSpy = vi.spyOn(message, 'success').mockImplementation(() => (() => {}) as never);
+  errorSpy = vi.spyOn(message, 'error').mockImplementation(() => (() => {}) as never);
 });
 
 afterEach(() => {
   restoreApi();
-  jest.restoreAllMocks();
-  jest.useRealTimers();
+  vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
-const invalidatedKeys = (spy: jest.SpyInstance) =>
+const invalidatedKeys = (spy: MockInstance) =>
   spy.mock.calls.map(([filters]) => (filters as { queryKey: unknown[] }).queryKey[0]).sort();
 
 describe('queryKeys', () => {
@@ -59,7 +60,7 @@ describe('useRawData', () => {
   });
 
   it('polls every 30 s only when polling is enabled', async () => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
     const calls = mockApi(() => ({ status: 200, data: paginated([]) }));
     const client = makeClient();
     const { result, rerender } = renderHook(({ poll }) => useRawData(1, 20, false, { poll }), {
@@ -70,13 +71,13 @@ describe('useRawData', () => {
     expect(calls).toHaveLength(1);
 
     await act(async () => {
-      jest.advanceTimersByTime(POLL_INTERVAL_MS * 3);
+      vi.advanceTimersByTime(POLL_INTERVAL_MS * 3);
     });
     expect(calls).toHaveLength(1);
 
     rerender({ poll: true });
     await act(async () => {
-      jest.advanceTimersByTime(POLL_INTERVAL_MS + 10);
+      vi.advanceTimersByTime(POLL_INTERVAL_MS + 10);
     });
     await waitFor(() => expect(calls.length).toBeGreaterThanOrEqual(2));
     expect(calls.length).toBeLessThanOrEqual(3);
@@ -87,7 +88,7 @@ describe('mutations', () => {
   it('approve invalidates raw data, training data and stats', async () => {
     const calls = mockApi(() => ({ status: 200, data: { success: true, message: 'ok', training_data_id: 3 } }));
     const client = makeClient();
-    const invalidate = jest.spyOn(client, 'invalidateQueries');
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
     const { result } = renderHook(() => useApproveToTraining(), { wrapper: wrapperFor(client) });
 
     await act(async () => {
@@ -102,7 +103,7 @@ describe('mutations', () => {
   it('deleting raw data also refreshes training data (its copy is deleted too)', async () => {
     mockApi(() => ({ status: 200, data: { success: true, message: 'ok' } }));
     const client = makeClient();
-    const invalidate = jest.spyOn(client, 'invalidateQueries');
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
     const { result } = renderHook(() => useDeleteRawData(), { wrapper: wrapperFor(client) });
 
     await act(async () => {
@@ -115,7 +116,7 @@ describe('mutations', () => {
   it('removing training data refreshes all three views', async () => {
     mockApi(() => ({ status: 200, data: { success: true, message: 'ok' } }));
     const client = makeClient();
-    const invalidate = jest.spyOn(client, 'invalidateQueries');
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
     const { result } = renderHook(() => useDeleteTrainingData(), { wrapper: wrapperFor(client) });
 
     await act(async () => {
@@ -128,7 +129,7 @@ describe('mutations', () => {
   it('update answer sends the new text and refreshes raw data', async () => {
     const calls = mockApi(() => ({ status: 200, data: { success: true, message: 'ok' } }));
     const client = makeClient();
-    const invalidate = jest.spyOn(client, 'invalidateQueries');
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
     const { result } = renderHook(() => useUpdateAnswer(), { wrapper: wrapperFor(client) });
 
     await act(async () => {
@@ -143,7 +144,7 @@ describe('mutations', () => {
   it('update answer also refreshes training data when the backend synced the training copy', async () => {
     mockApi(() => ({ status: 200, data: { success: true, message: 'ok', training_data_updated: true } }));
     const client = makeClient();
-    const invalidate = jest.spyOn(client, 'invalidateQueries');
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
     const { result } = renderHook(() => useUpdateAnswer(), { wrapper: wrapperFor(client) });
 
     await act(async () => {
@@ -156,7 +157,7 @@ describe('mutations', () => {
   it('shows the backend error detail instead of a generic message', async () => {
     mockApi(() => ({ status: 400, data: { detail: 'Already in training data' } }));
     const client = makeClient();
-    const invalidate = jest.spyOn(client, 'invalidateQueries');
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
     const { result } = renderHook(() => useApproveToTraining(), { wrapper: wrapperFor(client) });
 
     await act(async () => {

@@ -1,0 +1,10 @@
+# CengBot - test / development tools
+# (does NOT pull in config/requirements.txt, so installing it never upgrades
+#  torch/transformers in an existing environment)
+#
+# .venv/bin/python -m pip install -r config/requirements-dev.txt
+# .venv/bin/python -m pytest
+
+pytest>=8.0,<10
+pytest-asyncio>=0.23,<2          # pytest.ini uses asyncio_mode = auto
+httpx>=0.25.2,<0.26              # FastAPI TestClient; must match python-telegram-bot 20.7 (httpx~=0.25.2)

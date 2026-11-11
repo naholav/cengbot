@@ -1,25 +1,33 @@
 # CengBot - Çukurova Üniversitesi AI Chatbot Requirements
+#
+# Python 3.11 (several pinned minimums require Python >= 3.10/3.11).
+# Lower bounds = first releases without known vulnerabilities relevant to this
+# project (pip-audit, Nov 2026). Upper bounds keep untested major versions out.
+# Test/dev tools live in config/requirements-dev.txt.
 
 # Core AI Dependencies
-torch>=2.0.0
-transformers>=4.35.0
-accelerate>=0.24.0
-peft>=0.6.0
-bitsandbytes>=0.41.0
+torch>=2.7.1,<3                  # validated on GPU. Security: >=2.10 fixes a weights_only unpickler bypass (malicious .pth) - upgrade + GPU-test before the next retrain
+transformers>=4.53.2,<5          # validated on GPU. Security: >=4.57.6 recommended (advisories need attacker-controlled model files; we load local models offline). 5.x = API change
+accelerate>=1.8.1                # validated on GPU. Security: >=1.15 fixes path traversal in sharded checkpoint loading (upgrade with torch/transformers)
+peft>=0.16.0
+bitsandbytes>=0.46.0             # BitsAndBytesConfig (4-bit loading / training)
+datasets>=5.0.1,<6               # train_model.py; <5.0.1: path traversal in folder builders
 
 # Telegram Bot
-python-telegram-bot==20.7
+python-telegram-bot==20.7        # pins httpx~=0.25.2 (do not upgrade httpx separately)
 
-# Web Framework & API
-fastapi==0.104.1
-uvicorn==0.24.0
-python-multipart==0.0.6
+# Web Framework & API (admin panel, port 8001)
+fastapi>=0.135.0                 # first releases that allow starlette 1.x
+starlette>=1.3.1                 # <1.3.1: Host-header / form-limit / multipart DoS issues
+python-multipart>=0.0.31         # <0.0.31: multiple multipart DoS / ReDoS issues
+uvicorn>=0.24.0
+anyio>=4.14.2                    # fastapi/starlette need anyio 4; <4.14.2: TLS / worker issues
 
 # Database (SQLite - No PostgreSQL needed)
-sqlalchemy>=2.0.41
+sqlalchemy>=2.0.41,<2.1
 
 # Message Queue
-pika==1.3.2
+pika>=1.3.2,<2
 
 # Language Detection
 langdetect>=1.0.9
@@ -27,21 +35,43 @@ langdetect>=1.0.9
 # Machine Learning & Similarity
 scikit-learn>=1.3.0
 numpy>=1.24.0
+sentence-transformers>=5.6.0     # optional in train_model.py; <5.6.0: code-execution bypass
+
+# Data Augmentation (Claude API)
+anthropic>=0.35.0,<1             # 1.x/2.x not tested with src/data_augmentation.py
+
+# Excel export (src/export_to_excel.py)
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# System monitoring (admin API /health details, src/system_monitor.py)
+psutil>=5.9.0
 
 # Utilities
-aiohttp==3.9.1
-requests>=2.31.0
-python-dotenv>=1.0.0
+python-dotenv>=1.2.2             # <1.2.2: set_key() follows symlinks
+
+# Security floors for transitive dependencies (not imported directly)
+aiohttp>=3.14.4                  # via datasets -> fsspec[http]
+fsspec>=2026.6.0
+requests>=2.33.0
+urllib3>=2.8.0
+certifi>=2026.10.18
+filelock>=4.2.1
+pillow>=13.0.0
+h11>=0.16.0
 
 # System Requirements:
-# - Python 3.8+
-# - Node.js 16+ (for React frontend: cd admin_frontend && npm install)
+# - Python 3.11
+# - Node.js 18+ (for React frontend: cd admin_frontend && npm install)
 # - RabbitMQ Server (sudo apt install rabbitmq-server)
 # - CUDA compatible GPU (recommended for LLaMA 3.2 3B model)
 # - Minimum 8GB RAM (16GB+ recommended for model inference)
 #
-# Installation:
-# pip install -r requirements.txt
+# Installation (from the project root):
+# .venv/bin/python -m pip install -r config/requirements.txt
+#
+# Vulnerability audit:
+# pip install pip-audit && pip-audit -r config/requirements.txt
 #
 # Frontend:
 # cd admin_frontend && npm install

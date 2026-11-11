@@ -53,9 +53,9 @@ if ! command -v rabbitmq-server >/dev/null 2>&1 && ! systemctl cat rabbitmq-serv
     print_warning "RabbitMQ is not installed"
     install_pkg rabbitmq-server || die "RabbitMQ installation failed"
 fi
-if (( START_FRONTEND == 1 )) && ! command -v npm >/dev/null 2>&1; then
-    print_warning "Node.js / npm not found"
-    install_pkg nodejs npm || die "Node.js installation failed"
+if (( START_FRONTEND == 1 )) && ! { node_ok && command -v npm >/dev/null 2>&1; }; then
+    print_warning "Node.js/npm missing or too old - the admin panel will NOT be started. $NODE_INSTALL_HINT"
+    START_FRONTEND=0
 fi
 
 VENV_CREATED=0

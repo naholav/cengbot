@@ -149,6 +149,10 @@ deploy_application() {
     # admin API (127.0.0.1:8001). REACT_APP_API_URL is baked in at build time.
     as_service_user "cd admin_frontend && npm install && REACT_APP_API_URL='${PANEL_API_URL:-/api}' npm run build"
     run install -d -m 0755 "$WEB_ROOT"
+    # Remove files of the previous build (e.g. old static/ chunks) before copying.
+    if [[ -n "$WEB_ROOT" && "$WEB_ROOT" == /var/www/* && -d "$WEB_ROOT" ]]; then
+        run find "$WEB_ROOT" -mindepth 1 -delete
+    fi
     run cp -a "$PROJECT_DIR/admin_frontend/build/." "$WEB_ROOT/"
     run chmod -R a+rX "$WEB_ROOT"
     # Secrets must not be readable by other users (the old version did chmod -R 755).

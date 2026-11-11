@@ -176,6 +176,16 @@ rotate_logs_dir() {
     done
 }
 
+# node_ok -> true if Node.js satisfies admin_frontend/package.json "engines"
+# (^22.13 or >=24, required by Vite/Vitest). Distribution packages (apt) are
+# usually far older, so the hint points to nvm / NodeSource instead.
+node_ok() {
+    command -v node >/dev/null 2>&1 || return 1
+    node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a >= 24 || (a === 22 && b >= 13) ? 0 : 1)' 2>/dev/null
+}
+# shellcheck disable=SC2034  # used by the scripts that source this file
+NODE_INSTALL_HINT="Install Node.js 22 LTS (>= 22.13) or 24+, e.g. with nvm: https://github.com/nvm-sh/nvm (nvm install 22), or from https://nodejs.org"
+
 # resolve_db_file -> prints the SQLite file the services use (honours DATABASE_URL
 # via src/database_models.resolve_database_url); falls back to <root>/university_bot.db.
 resolve_db_file() {

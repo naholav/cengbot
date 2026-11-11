@@ -39,8 +39,14 @@ as_root apt-get update
 if (( UPGRADE == 1 )); then
     as_root apt-get upgrade -y
 fi
-as_root apt-get install -y python3 python3-pip python3-venv python3-dev nodejs npm \
+as_root apt-get install -y python3 python3-pip python3-venv python3-dev \
     rabbitmq-server logrotate curl wget git htop dos2unix build-essential
+# Node.js is not taken from apt: distribution packages are too old for Vite.
+if node_ok; then
+    print_success "Node.js $(node --version) OK for the admin panel"
+else
+    print_warning "Node.js is missing or too old for the admin panel. $NODE_INSTALL_HINT"
+fi
 
 print_status "🔄 Configuring RabbitMQ..."
 as_root systemctl enable --now rabbitmq-server

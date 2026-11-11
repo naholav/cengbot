@@ -54,7 +54,7 @@ logs/
 
 # Model cache and checkpoints
 model_cache/
-models/*/
+models/
 checkpoints/
 
 # IDE
@@ -81,3 +81,29 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
+
+# Project data, exports and runtime state
+data/
+excel/
+.pids
+.production_pids
+
+# Admin frontend (also matched by node_modules/ and build/ above)
+admin_frontend/node_modules/
+admin_frontend/build/
+
+# Local environment configs (the canonical template is the root .env.example)
+config/env/
+
+# Local tool settings
+
+# Local admin credentials note (never commit)
+ADMIN_CREDENTIALS.txt
+
+# Backups written by scripts/backup_data.sh (contain the database = user data)
+backups/
+
+# Run locks
+.training.lock
+.augmentation_lock
+models/.switch.lock

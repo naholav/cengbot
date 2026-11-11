@@ -1,103 +1,75 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# =============================================================================
+# CengBot - stop the services started by scripts/start_system.sh
+#
+# Only processes that belong to THIS project are stopped: PIDs from .pids are
+# verified against their command line (protects against PID reuse), and the
+# fallback search only matches CengBot scripts running inside the project
+# directory. Logs are kept.
+# =============================================================================
+set -uo pipefail
+
+# shellcheck source=scripts/_common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
+
+case "${1:-}" in
+    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    "") ;;
+    *) die "Unknown option: $1" ;;
+esac
 
 echo "🛑 CengBot System Stopping..."
 echo "============================="
 
-# Color codes
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+read -r -a SAVED <<< "$(pidfile_read)"
+for i in "${!CENGBOT_SERVICES[@]}"; do
+    svc="${CENGBOT_SERVICES[$i]}"
+    pids=()
+    unit=""
+    case "$svc" in worker) unit=cengbot-worker ;; api) unit=cengbot-admin ;; bot) unit=cengbot-bot ;; esac
+    if [[ -n "$unit" ]] && systemd_unit_active_here "$unit"; then
+        # killing it would only make systemd restart it (Restart=always)
+        print_warning "$(service_label "$svc") is managed by systemd - stop it with: sudo systemctl stop $unit"
+        continue
+    fi
+    saved="${SAVED[$i]:--}"
+    if [[ "$saved" != "-" ]] && pid_matches_service "$saved" "$svc"; then
+        pids+=("$saved")
+    elif [[ "$saved" != "-" ]] && pid_alive "$saved"; then
+        print_warning "PID $saved from .pids is no longer $(service_label "$svc") - not touching it"
+    fi
+    while IFS= read -r pid; do
+        [[ -n "$pid" && " ${pids[*]} " != *" $pid "* ]] && pids+=("$pid")
+    done < <(service_pids "$svc")
+    if (( ${#pids[@]} > 0 )); then
+        timeout=15
+        [[ "$svc" == "worker" ]] && timeout=60   # give the worker time to free the GPU
+        stop_pids "$(service_label "$svc")" "$timeout" "${pids[@]}"
+    else
+        print_status "$(service_label "$svc"): not running"
+    fi
+done
 
-# Set working directory
-cd "$(dirname "$0")/.."
-
-# Check for PID file
-if [[ -f ".pids" ]]; then
-    echo -e "${BLUE}📋 Reading saved PIDs...${NC}"
-    read -r WORKER_PID API_PID BOT_PID FRONTEND_PID < .pids
-    
-    # Stop services by PID
-    echo -e "${BLUE}🛑 Stopping services by PID...${NC}"
-    
-    if [[ -n "$WORKER_PID" ]] && ps -p $WORKER_PID > /dev/null 2>&1; then
-        echo -e "${YELLOW}  Stopping AI Worker (PID: $WORKER_PID)...${NC}"
-        kill $WORKER_PID
-    fi
-    
-    if [[ -n "$API_PID" ]] && ps -p $API_PID > /dev/null 2>&1; then
-        echo -e "${YELLOW}  Stopping Admin API (PID: $API_PID)...${NC}"
-        kill $API_PID
-    fi
-    
-    if [[ -n "$BOT_PID" ]] && ps -p $BOT_PID > /dev/null 2>&1; then
-        echo -e "${YELLOW}  Stopping Telegram Bot (PID: $BOT_PID)...${NC}"
-        kill $BOT_PID
-    fi
-    
-    if [[ -n "$FRONTEND_PID" ]] && ps -p $FRONTEND_PID > /dev/null 2>&1; then
-        echo -e "${YELLOW}  Stopping Frontend (PID: $FRONTEND_PID)...${NC}"
-        kill $FRONTEND_PID
-    fi
-    
-    sleep 3
-    
-    # Force kill if still running
-    if [[ -n "$WORKER_PID" ]] && ps -p $WORKER_PID > /dev/null 2>&1; then
-        echo -e "${RED}  Force killing AI Worker...${NC}"
-        kill -9 $WORKER_PID
-    fi
-    
-    if [[ -n "$API_PID" ]] && ps -p $API_PID > /dev/null 2>&1; then
-        echo -e "${RED}  Force killing Admin API...${NC}"
-        kill -9 $API_PID
-    fi
-    
-    if [[ -n "$BOT_PID" ]] && ps -p $BOT_PID > /dev/null 2>&1; then
-        echo -e "${RED}  Force killing Telegram Bot...${NC}"
-        kill -9 $BOT_PID
-    fi
-    
-    if [[ -n "$FRONTEND_PID" ]] && ps -p $FRONTEND_PID > /dev/null 2>&1; then
-        echo -e "${RED}  Force killing Frontend...${NC}"
-        kill -9 $FRONTEND_PID
-    fi
-    
-    rm .pids
-    echo -e "${GREEN}✅ PID file cleaned${NC}"
-else
-    echo -e "${YELLOW}⚠️ No PID file found, using process names...${NC}"
+mapfile -t legacy < <(service_pids legacy_bot)
+if (( ${#legacy[@]} > 0 )); then
+    stop_pids "$(service_label legacy_bot)" 15 "${legacy[@]}"
 fi
 
-# Kill by process name patterns
-echo -e "${BLUE}🔍 Killing remaining processes...${NC}"
-pkill -f "python3.*ai_model_worker" 2>/dev/null || true
-pkill -f "python3.*admin_rest_api" 2>/dev/null || true
-pkill -f "python3.*telegram_bot" 2>/dev/null || true
-pkill -f "node.*react-scripts" 2>/dev/null || true
+rm -f -- "$PID_FILE"
 
-# Kill any remaining CengBot processes
-pkill -f "python3.*src/" 2>/dev/null || true
+remaining=0
+for svc in "${CENGBOT_SERVICES[@]}" legacy_bot; do
+    if [[ -n "$(service_pids "$svc")" ]]; then
+        remaining=1
+        print_warning "$(service_label "$svc") still running: $(service_pids "$svc" | tr '\n' ' ')"
+    fi
+done
 
-sleep 2
-
-# Check if processes are still running
-REMAINING=$(ps aux | grep -E "(python3.*(ai_model_worker|admin_rest_api|telegram_bot)|node.*react-scripts)" | grep -v grep | wc -l)
-
-if [[ $REMAINING -eq 0 ]]; then
-    echo -e "${GREEN}✅ All CengBot services stopped successfully${NC}"
+echo ""
+if (( remaining == 0 )); then
+    print_success "All CengBot services stopped"
 else
-    echo -e "${YELLOW}⚠️ Some processes may still be running${NC}"
-    echo -e "${YELLOW}   Check with: ps aux | grep -E 'python3.*src|node.*react-scripts'${NC}"
+    print_warning "Some processes may still be running (ps -ef | grep -E 'ai_model_worker|admin_rest_api|telegram_bot|react-scripts')"
 fi
-
-echo ""
-echo -e "${GREEN}🎉 CengBot System Stopped!${NC}"
-echo "========================="
-echo ""
-echo -e "${BLUE}📊 To restart the system:${NC}"
-echo -e "${YELLOW}  ./scripts/start_system.sh${NC}"
-echo ""
-echo -e "${BLUE}📝 Log files are preserved in logs/ directory${NC}"
-echo ""
+echo "📊 Restart: ./scripts/start_system.sh      📝 Logs are preserved in logs/"
+exit "$remaining"

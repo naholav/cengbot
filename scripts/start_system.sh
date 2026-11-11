@@ -1,204 +1,167 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# =============================================================================
+# CengBot - start the complete system (manual / non-systemd mode)
+#   AI worker -> Admin API -> Telegram bot -> React admin panel
+#
+# Options:
+#   --install-deps   (re)install Python requirements and frontend npm packages
+#   --no-frontend    do not start the React dev server
+#   -h, --help
+#
+# Logs are APPENDED to logs/*.log; any log bigger than CENGBOT_LOG_MAX_BYTES
+# (default 50 MiB) is rotated first (last 10 MiB kept in <log>.1.gz, 5 generations).
+# =============================================================================
+set -uo pipefail
 
+# shellcheck source=scripts/_common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
+
+INSTALL_DEPS=0
+START_FRONTEND=1
+while (( $# > 0 )); do
+    case "$1" in
+        --install-deps) INSTALL_DEPS=1 ;;
+        --no-frontend)  START_FRONTEND=0 ;;
+        -h|--help)      sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)              die "Unknown option: $1 (see --help)" ;;
+    esac
+    shift
+done
+
+cd "$PROJECT_ROOT" || die "Cannot cd to $PROJECT_ROOT"
 echo "🚀 CengBot Complete System Starting..."
 echo "====================================="
 
-# Color codes for better output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-# Set working directory
-cd "$(dirname "$0")/.."
-
-# Check if we're in the right directory
 if [[ ! -f "README.md" || ! -d "src" ]]; then
-    echo -e "${RED}❌ Error: Must be run from university-bot directory${NC}"
-    exit 1
+    die "$PROJECT_ROOT does not look like the CengBot project (README.md / src missing)"
 fi
 
-# Check dependencies
-echo -e "${BLUE}📋 Checking requirements...${NC}"
+# Refuse to run a second copy next to the systemd-managed services.
+for unit in cengbot-worker cengbot-bot cengbot-admin; do
+    if systemd_unit_active_here "$unit"; then
+        die "$unit.service is active (systemd mode). Use 'sudo systemctl restart $unit' instead of this script."
+    fi
+done
 
-if ! command -v rabbitmq-server &> /dev/null; then
-    echo -e "${RED}❌ RabbitMQ not installed!${NC}"
-    echo -e "${YELLOW}Installing RabbitMQ...${NC}"
-    echo "REDACTED" | sudo -S apt update
-    echo "REDACTED" | sudo -S apt install -y rabbitmq-server
+# ---- requirements -------------------------------------------------------------
+print_status "Checking requirements..."
+install_pkg() {   # install_pkg <apt packages...>
+    print_warning "Installing: $* (sudo will ask for YOUR password)"
+    as_root apt-get update && as_root apt-get install -y "$@"
+}
+if ! command -v rabbitmq-server >/dev/null 2>&1 && ! systemctl cat rabbitmq-server.service >/dev/null 2>&1; then
+    print_warning "RabbitMQ is not installed"
+    install_pkg rabbitmq-server || die "RabbitMQ installation failed"
+fi
+if (( START_FRONTEND == 1 )) && ! command -v npm >/dev/null 2>&1; then
+    print_warning "Node.js / npm not found"
+    install_pkg nodejs npm || die "Node.js installation failed"
 fi
 
-if ! command -v node &> /dev/null; then
-    echo -e "${RED}❌ Node.js not installed!${NC}"
-    echo -e "${YELLOW}Installing Node.js...${NC}"
-    echo "REDACTED" | sudo -S apt update
-    echo "REDACTED" | sudo -S apt install -y nodejs npm
+VENV_CREATED=0
+if [[ ! -x "$PYTHON" ]]; then
+    if [[ -n "${CENGBOT_PYTHON:-}" ]]; then
+        die "CENGBOT_PYTHON=$CENGBOT_PYTHON is not executable"
+    fi
+    BASE_PY="${CENGBOT_BASE_PYTHON:-python3}"
+    command -v "$BASE_PY" >/dev/null 2>&1 || die "$BASE_PY not found - install Python 3.11 first"
+    print_status "Creating Python virtual environment .venv with $BASE_PY ..."
+    "$BASE_PY" -m venv .venv || die "venv creation failed"
+    VENV_CREATED=1
+fi
+require_python
+print_success "Python: $("$PYTHON" --version 2>&1) ($PYTHON)"
+
+if (( INSTALL_DEPS == 1 || VENV_CREATED == 1 )); then
+    print_status "Installing Python dependencies..."
+    "$PYTHON" -m pip install -r config/requirements.txt || die "pip install failed"
+fi
+if (( START_FRONTEND == 1 )) && { (( INSTALL_DEPS == 1 )) || [[ ! -d admin_frontend/node_modules ]]; }; then
+    print_status "Installing frontend dependencies..."
+    ( cd admin_frontend && npm install ) || die "npm install failed"
 fi
 
-if ! command -v python3 &> /dev/null; then
-    echo -e "${RED}❌ Python3 not installed!${NC}"
-    echo -e "${YELLOW}Installing Python3...${NC}"
-    echo "REDACTED" | sudo -S apt update
-    echo "REDACTED" | sudo -S apt install -y python3 python3-pip python3-venv
-fi
+print_status "Initializing database (creates missing tables only)..."
+( cd "$PROJECT_ROOT" && "$PYTHON" -c 'import sys; sys.path.insert(0, "src"); from database_models import init_db; init_db()' ) \
+    || die "Database initialization failed"
 
-echo -e "${GREEN}✅ All requirements available${NC}"
-
-# Create and activate virtual environment if not exists
-if [[ ! -d ".venv" ]]; then
-    echo -e "${BLUE}🔧 Creating Python virtual environment...${NC}"
-    python3 -m venv .venv
-fi
-
-# Activate virtual environment
-source .venv/bin/activate
-
-# Install Python dependencies
-echo -e "${BLUE}📦 Installing Python dependencies...${NC}"
-pip install -r config/requirements.txt
-
-# Initialize database
-echo -e "${BLUE}💾 Initializing database...${NC}"
-python3 -c "from src.database_models import init_db; init_db()"
-
-# Install frontend dependencies
-echo -e "${BLUE}📦 Installing frontend dependencies...${NC}"
-cd admin_frontend
-npm install
-cd ..
-
-# Start RabbitMQ
-echo -e "${BLUE}🔄 Starting RabbitMQ...${NC}"
-echo "REDACTED" | sudo -S systemctl start rabbitmq-server
-echo "REDACTED" | sudo -S systemctl enable rabbitmq-server
-sleep 3
-
-# Check RabbitMQ status
+# ---- RabbitMQ -------------------------------------------------------------------
 if ! systemctl is-active --quiet rabbitmq-server; then
-    echo -e "${RED}❌ RabbitMQ failed to start${NC}"
-    exit 1
+    print_status "Starting RabbitMQ (sudo may ask for YOUR password)..."
+    as_root systemctl start rabbitmq-server || die "Could not start rabbitmq-server"
 fi
+if ! systemctl is-enabled --quiet rabbitmq-server 2>/dev/null; then
+    as_root systemctl enable rabbitmq-server || print_warning "Could not enable rabbitmq-server at boot"
+fi
+for _ in $(seq 1 30); do
+    systemctl is-active --quiet rabbitmq-server && break
+    sleep 1
+done
+systemctl is-active --quiet rabbitmq-server || die "RabbitMQ failed to start (journalctl -u rabbitmq-server)"
+print_success "RabbitMQ is running"
 
-echo -e "${GREEN}✅ RabbitMQ is running${NC}"
+# ---- stop old instances of THIS project (never other processes) --------------
+mkdir -p "$LOG_DIR"
+print_status "Stopping existing CengBot services of this project..."
+for svc in "${CENGBOT_SERVICES[@]}" legacy_bot; do
+    mapfile -t pids < <(service_pids "$svc")
+    if (( ${#pids[@]} > 0 )); then
+        stop_pids "$(service_label "$svc")" 30 "${pids[@]}"
+    fi
+done
 
-# Create directories
-mkdir -p logs
-echo -e "${BLUE}📁 Log directory prepared${NC}"
+print_status "Rotating oversized logs..."
+rotate_logs_dir "$LOG_DIR"
 
-# Kill existing processes
-echo -e "${BLUE}🛑 Stopping existing services...${NC}"
-pkill -f "python3.*ai_model_worker" 2>/dev/null || true
-pkill -f "python3.*admin_rest_api" 2>/dev/null || true
-pkill -f "python3.*telegram_bot" 2>/dev/null || true
-pkill -f "node.*react-scripts" 2>/dev/null || true
-sleep 3
-
-# Start services
+# ---- start ----------------------------------------------------------------------
 echo ""
-echo -e "${BLUE}🔧 Starting services...${NC}"
+print_status "Starting services..."
 echo "=============================="
 
-echo -e "${BLUE}1️⃣ Starting AI Worker (LLaMA 3.2 3B + LoRA)...${NC}"
-python3 src/ai_model_worker.py > logs/worker.log 2>&1 &
-WORKER_PID=$!
-echo -e "${GREEN}   ✅ AI Worker started - PID: $WORKER_PID${NC}"
+declare -A PIDS=([worker]="-" [api]="-" [bot]="-" [frontend]="-")
+start_and_record() {
+    start_service "$1"
+    PIDS[$1]="$LAST_PID"
+    pidfile_write "${PIDS[worker]}" "${PIDS[api]}" "${PIDS[bot]}" "${PIDS[frontend]}"
+    print_success "$(service_label "$1") started - PID: $LAST_PID (log: $(service_log "$1"))"
+}
 
+print_status "1️⃣  AI Worker (LLaMA 3.2 3B + LoRA from models/active-model)..."
+start_and_record worker
 sleep 5
-
-echo -e "${BLUE}2️⃣ Starting Admin API...${NC}"
-python3 src/admin_rest_api.py > logs/admin.log 2>&1 &
-API_PID=$!
-echo -e "${GREEN}   ✅ Admin API started - PID: $API_PID${NC}"
-
+print_status "2️⃣  Admin API..."
+start_and_record api
 sleep 3
+print_status "3️⃣  Telegram Bot..."
+start_and_record bot
+if (( START_FRONTEND == 1 )); then
+    sleep 3
+    print_status "4️⃣  React Frontend..."
+    start_and_record frontend
+fi
 
-echo -e "${BLUE}3️⃣ Starting Telegram Bot...${NC}"
-python3 src/telegram_bot_rabbitmq.py > logs/bot.log 2>&1 &
-BOT_PID=$!
-echo -e "${GREEN}   ✅ Telegram Bot started - PID: $BOT_PID${NC}"
-
-sleep 3
-
-echo -e "${BLUE}4️⃣ Starting React Frontend...${NC}"
-cd admin_frontend
-npm start > ../logs/frontend.log 2>&1 &
-FRONTEND_PID=$!
-cd ..
-echo -e "${GREEN}   ✅ Frontend started - PID: $FRONTEND_PID${NC}"
-
-# Save PIDs for stop script
-echo "$WORKER_PID $API_PID $BOT_PID $FRONTEND_PID" > .pids
-
-# Wait for services to fully start
 echo ""
-echo -e "${YELLOW}⏳ Waiting for services to fully initialize...${NC}"
+print_status "⏳ Waiting for services to initialize..."
 sleep 10
 
-# Check if services are running
 echo ""
-echo -e "${BLUE}🔍 Checking service status...${NC}"
-
-if ps -p $WORKER_PID > /dev/null 2>&1; then
-    echo -e "${GREEN}   ✅ AI Worker is running${NC}"
-else
-    echo -e "${RED}   ❌ AI Worker failed to start${NC}"
-    echo -e "${YELLOW}   Check logs/worker.log for details${NC}"
-fi
-
-if ps -p $API_PID > /dev/null 2>&1; then
-    echo -e "${GREEN}   ✅ Admin API is running${NC}"
-else
-    echo -e "${RED}   ❌ Admin API failed to start${NC}"
-    echo -e "${YELLOW}   Check logs/admin.log for details${NC}"
-fi
-
-if ps -p $BOT_PID > /dev/null 2>&1; then
-    echo -e "${GREEN}   ✅ Telegram Bot is running${NC}"
-else
-    echo -e "${RED}   ❌ Telegram Bot failed to start${NC}"
-    echo -e "${YELLOW}   Check logs/bot.log for details${NC}"
-fi
-
-if ps -p $FRONTEND_PID > /dev/null 2>&1; then
-    echo -e "${GREEN}   ✅ Frontend is running${NC}"
-else
-    echo -e "${RED}   ❌ Frontend failed to start${NC}"
-    echo -e "${YELLOW}   Check logs/frontend.log for details${NC}"
-fi
+print_status "🔍 Service status:"
+FAILED=0
+for svc in "${CENGBOT_SERVICES[@]}"; do
+    pid="${PIDS[$svc]}"
+    [[ "$pid" == "-" ]] && continue
+    if pid_alive "$pid"; then
+        print_success "$(service_label "$svc") is running (PID $pid)"
+    else
+        print_error "$(service_label "$svc") failed to start - check $(service_log "$svc")"
+        FAILED=1
+    fi
+done
 
 echo ""
-echo -e "${GREEN}🎉 CengBot System is Ready!${NC}"
-echo "================================="
-echo ""
-echo -e "${BLUE}📊 Running Services:${NC}"
-echo -e "${GREEN}  🤖 AI Worker (LLaMA 3.2 3B + LoRA): PID $WORKER_PID${NC}"
-echo -e "${GREEN}  🌐 Admin API: PID $API_PID${NC}"
-echo -e "${GREEN}  📱 Telegram Bot: PID $BOT_PID${NC}"
-echo -e "${GREEN}  💻 React Frontend: PID $FRONTEND_PID${NC}"
-echo ""
-echo -e "${BLUE}🌐 Web Interfaces:${NC}"
-echo -e "${GREEN}  📊 Admin Panel: http://localhost:3000${NC}"
-echo -e "${GREEN}  🔗 API Docs: http://localhost:8001/docs${NC}"
-echo ""
-echo -e "${BLUE}📝 Log Files:${NC}"
-echo -e "${GREEN}  🤖 AI Worker: logs/worker.log${NC}"
-echo -e "${GREEN}  🌐 Admin API: logs/admin.log${NC}"
-echo -e "${GREEN}  📱 Telegram Bot: logs/bot.log${NC}"
-echo -e "${GREEN}  💻 Frontend: logs/frontend.log${NC}"
-echo ""
-echo -e "${BLUE}🔍 System Monitoring:${NC}"
-echo -e "${YELLOW}  tail -f logs/worker.log    # AI model status${NC}"
-echo -e "${YELLOW}  tail -f logs/bot.log       # Telegram messages${NC}"
-echo -e "${YELLOW}  tail -f logs/admin.log     # Admin API requests${NC}"
-echo ""
-echo -e "${BLUE}🛑 To Stop System:${NC}"
-echo -e "${YELLOW}  ./scripts/stop_system.sh${NC}"
-echo ""
-echo -e "${GREEN}✨ CengBot is Production Ready! You can test it on Telegram.${NC}"
-echo ""
-echo -e "${YELLOW}💡 Important Notes:${NC}"
-echo -e "${YELLOW}  • First model loading may take 5-10 minutes${NC}"
-echo -e "${YELLOW}  • Admin panel will be available at http://localhost:3000${NC}"
-echo -e "${YELLOW}  • Make sure to configure TELEGRAM_BOT_TOKEN in .env${NC}"
-echo ""
+echo "🌐 Admin Panel: http://localhost:3000    API docs: http://localhost:8001/docs"
+echo "📝 Logs: tail -f logs/worker.log | logs/bot.log | logs/admin.log | logs/frontend.log"
+echo "🧠 Active model: $(readlink models/active-model 2>/dev/null || echo 'NOT SET') (scripts/switch_model.sh current)"
+echo "🛑 Stop: ./scripts/stop_system.sh"
+echo "💡 First model loading may take several minutes."
+exit "$FAILED"

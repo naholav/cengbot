@@ -1,165 +1,89 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# =============================================================================
+# CengBot system setup (Ubuntu 22.04+)
+#
+# Usage: scripts/setup_system.sh [--upgrade] [--yes]
+#   --upgrade   also run "apt upgrade" (off by default: a full upgrade can replace
+#               the NVIDIA driver / CUDA stack the model needs)
+#   --yes       do not ask for confirmation
+#
+# Installs system packages (sudo asks for YOUR password), creates .venv only if
+# it does not exist yet (an existing venv is never re-created), installs the
+# Python and frontend dependencies, initialises the database (missing tables
+# only) and creates .env from .env.example if .env is missing.
+# =============================================================================
+set -euo pipefail
 
-echo "🔧 CengBot System Setup"
+# shellcheck source=scripts/_common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
+
+UPGRADE=0
+while (( $# > 0 )); do
+    case "$1" in
+        --upgrade) UPGRADE=1 ;;
+        -y|--yes)  ASSUME_YES=1 ;;
+        -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)         die "Unknown option: $1 (see --help)" ;;
+    esac
+    shift
+done
+export ASSUME_YES="${ASSUME_YES:-0}"
+
+cd "$PROJECT_ROOT" || die "Cannot cd to $PROJECT_ROOT"
+echo "🔧 CengBot System Setup ($PROJECT_ROOT)"
 echo "======================"
+confirm "Install system packages (sudo) and project dependencies?" || die "Cancelled."
 
-# Color codes
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+print_status "📦 Installing system packages..."
+as_root apt-get update
+if (( UPGRADE == 1 )); then
+    as_root apt-get upgrade -y
+fi
+as_root apt-get install -y python3 python3-pip python3-venv python3-dev nodejs npm \
+    rabbitmq-server logrotate curl wget git htop dos2unix build-essential
 
-# Set working directory
-cd "$(dirname "$0")/.."
+print_status "🔄 Configuring RabbitMQ..."
+as_root systemctl enable --now rabbitmq-server
+as_root rabbitmq-plugins enable rabbitmq_management || print_warning "Could not enable the RabbitMQ management plugin"
 
-echo -e "${BLUE}🚀 Setting up CengBot system for Ubuntu 22.04...${NC}"
-echo ""
+if [[ -x "$PYTHON" ]]; then
+    print_success "Using existing Python environment: $PYTHON ($("$PYTHON" --version 2>&1))"
+else
+    BASE_PY="${CENGBOT_BASE_PYTHON:-python3}"
+    print_status "🐍 Creating .venv with $BASE_PY (set CENGBOT_BASE_PYTHON to use e.g. a conda python with CUDA torch)"
+    "$BASE_PY" -m venv .venv
+    "$PYTHON" -m pip install --upgrade pip setuptools wheel
+fi
 
-# Update system
-echo -e "${BLUE}📦 Updating system packages...${NC}"
-sudo apt update && sudo apt upgrade -y
+print_status "📦 Installing Python dependencies..."
+"$PYTHON" -m pip install -r config/requirements.txt
 
-# Install system dependencies
-echo -e "${BLUE}📦 Installing system dependencies...${NC}"
-sudo apt install -y \
-    python3 \
-    python3-pip \
-    python3-venv \
-    python3-dev \
-    nodejs \
-    npm \
-    rabbitmq-server \
-    curl \
-    wget \
-    git \
-    htop \
-    dos2unix \
-    build-essential
+print_status "📦 Installing Node.js dependencies..."
+( cd admin_frontend && npm install )
 
-# Start and enable RabbitMQ
-echo -e "${BLUE}🔄 Configuring RabbitMQ...${NC}"
-sudo systemctl start rabbitmq-server
-sudo systemctl enable rabbitmq-server
+print_status "💾 Initializing database (creates missing tables only)..."
+"$PYTHON" -c 'import sys; sys.path.insert(0, "src"); from database_models import init_db; init_db()'
 
-# Enable RabbitMQ management plugin
-echo -e "${BLUE}🔧 Enabling RabbitMQ management plugin...${NC}"
-sudo rabbitmq-plugins enable rabbitmq_management
+mkdir -p logs config/env
+find scripts/ -maxdepth 1 -name "*.sh" -exec chmod +x {} +
 
-# Create Python virtual environment
-echo -e "${BLUE}🐍 Creating Python virtual environment...${NC}"
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Upgrade pip
-echo -e "${BLUE}📦 Upgrading pip...${NC}"
-pip install --upgrade pip setuptools wheel
-
-# Install Python dependencies
-echo -e "${BLUE}📦 Installing Python dependencies...${NC}"
-pip install -r config/requirements.txt
-
-# Install Node.js dependencies
-echo -e "${BLUE}📦 Installing Node.js dependencies...${NC}"
-cd admin_frontend
-npm install
-cd ..
-
-# Initialize database
-echo -e "${BLUE}💾 Initializing database...${NC}"
-python3 -c "from src.database_models import init_db; init_db()"
-
-# Create necessary directories
-echo -e "${BLUE}📁 Creating directories...${NC}"
-mkdir -p logs
-mkdir -p config/env
-
-# Fix script permissions
-echo -e "${BLUE}🔧 Fixing script permissions...${NC}"
-find scripts/ -name "*.sh" -exec chmod +x {} \;
-
-# Create environment file template
-echo -e "${BLUE}📝 Creating environment template...${NC}"
-cat > .env.example << 'EOF'
-# Telegram Bot Configuration
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
-
-# Database Configuration
-DATABASE_URL=sqlite:///university_bot.db
-
-# RabbitMQ Configuration
-RABBITMQ_HOST=localhost
-RABBITMQ_PORT=5672
-RABBITMQ_USER=guest
-RABBITMQ_PASSWORD=guest
-RABBITMQ_QUEUE_NAME=cengbot_queue
-
-# Model Configuration
-BASE_MODEL_NAME=meta-llama/Llama-3.2-3B
-LORA_MODEL_PATH=models/final-best-model-v1/method1
-MODEL_TEMPERATURE=0.7
-MODEL_MAX_NEW_TOKENS=200
-USE_CUDA=true
-MODEL_PRECISION=bfloat16
-
-# API Configuration
-API_HOST=0.0.0.0
-API_PORT=8001
-ADMIN_API_KEY=your_admin_api_key_here
-
-# Frontend Configuration
-FRONTEND_PORT=3000
-FRONTEND_HOST=localhost
-
-# Logging Configuration
-LOG_LEVEL=INFO
-LOG_FILE=logs/cengbot.log
-
-# Training Configuration
-AUTO_RETRAIN_THRESHOLD=1000
-CLAUDE_API_KEY=your_claude_api_key_here
-EOF
-
-# Check if .env exists, if not copy from template
-if [[ ! -f ".env" ]]; then
-    echo -e "${BLUE}📝 Creating .env file from template...${NC}"
-    cp .env.example .env
-    echo -e "${YELLOW}⚠️ Please edit .env file with your actual configuration values${NC}"
+if [[ ! -f .env ]]; then
+    if [[ -f .env.example ]]; then
+        cp .env.example .env
+        chmod 600 .env
+        print_warning "Created .env from .env.example - edit it with your real values (nano .env)"
+    else
+        print_warning ".env.example not found - create .env manually"
+    fi
+else
+    chmod 600 .env 2>/dev/null || true
 fi
 
 echo ""
-echo -e "${GREEN}🎉 CengBot Setup Complete!${NC}"
-echo "========================="
-echo ""
-echo -e "${BLUE}📋 What was installed:${NC}"
-echo -e "${GREEN}✅ Python 3 + pip + venv${NC}"
-echo -e "${GREEN}✅ Node.js + npm${NC}"
-echo -e "${GREEN}✅ RabbitMQ Server${NC}"
-echo -e "${GREEN}✅ All Python dependencies${NC}"
-echo -e "${GREEN}✅ All Node.js dependencies${NC}"
-echo -e "${GREEN}✅ Database initialized${NC}"
-echo -e "${GREEN}✅ Environment configuration${NC}"
-echo ""
-echo -e "${BLUE}🔧 Next steps:${NC}"
-echo -e "${YELLOW}1. Edit .env file with your configuration:${NC}"
-echo -e "${GREEN}   nano .env${NC}"
-echo ""
-echo -e "${YELLOW}2. Add your Telegram bot token:${NC}"
-echo -e "${GREEN}   TELEGRAM_BOT_TOKEN=your_token_here${NC}"
-echo ""
-echo -e "${YELLOW}3. Start the system:${NC}"
-echo -e "${GREEN}   ./scripts/start_system.sh${NC}"
-echo ""
-echo -e "${BLUE}🌐 Service URLs:${NC}"
-echo -e "${GREEN}   Admin Panel: http://localhost:3000${NC}"
-echo -e "${GREEN}   API Docs: http://localhost:8001/docs${NC}"
-echo -e "${GREEN}   RabbitMQ Management: http://localhost:15672${NC}"
-echo -e "${GREEN}   (Default login: guest/guest)${NC}"
-echo ""
-echo -e "${BLUE}📊 Useful commands:${NC}"
-echo -e "${YELLOW}   ./scripts/health_check.sh    # Check system status${NC}"
-echo -e "${YELLOW}   ./scripts/dev_mode.sh        # Development mode${NC}"
-echo -e "${YELLOW}   ./scripts/stop_system.sh     # Stop all services${NC}"
-echo ""
-echo -e "${GREEN}✨ System is ready for production! 🚀${NC}"
-echo ""
+print_success "🎉 CengBot setup complete"
+echo "Next steps:"
+echo "  1. Edit .env (TELEGRAM_BOT_TOKEN, ADMIN_PASSWORD_HASH, ...)"
+echo "  2. Start:         ./scripts/start_system.sh   (or systemd: sudo ./scripts/optimize_linux.sh --only services,logrotate)"
+echo "  3. Log rotation:  ./scripts/rotate_logs.sh --install-cron   (no root)"
+echo "  4. Check:         ./scripts/health_check.sh"
+echo "Service URLs: Admin Panel http://localhost:3000 | API docs http://localhost:8001/docs | RabbitMQ http://localhost:15672"

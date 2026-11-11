@@ -30,6 +30,7 @@ MODEL_ENV_VARS = [
     "MODEL_MAX_NEW_TOKENS", "MODEL_TOP_P", "MODEL_TOP_K", "MODEL_REPETITION_PENALTY", "MODEL_PRECISION",
     "USE_CUDA", "MODEL_MAX_INPUT_TOKENS", "MODEL_MAX_SENTENCES", "MODEL_PROMPT_STYLE", "MODEL_MERGE_LORA",
     "MODEL_ALLOW_DOWNLOAD", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HUGGING_FACE_TOKEN", "HF_TOKEN",
+    "MODEL_TRUST_REMOTE_CODE", "MODEL_LOAD_IN_4BIT",
 ]
 
 
@@ -123,7 +124,10 @@ def loaders(monkeypatch):
     tokenizer.eos_token = "<|end_of_text|>"
     tokenizer.eos_token_id = 128001
     tokenizer.unk_token_id = None
-    tokenizer.convert_tokens_to_ids.return_value = 128009
+    llama3_specials = {"<|begin_of_text|>": 128000, "<|end_of_text|>": 128001, "<|eot_id|>": 128009}
+    tokenizer.get_added_vocab.return_value = dict(llama3_specials)
+    tokenizer.all_special_tokens = ["<|begin_of_text|>", "<|end_of_text|>"]
+    tokenizer.convert_tokens_to_ids.side_effect = llama3_specials.get
     base_model = mock.MagicMock(name="base_model")
     peft_model = mock.MagicMock(name="peft_model")
     merged = mock.MagicMock(name="merged_model")
@@ -829,6 +833,197 @@ def test_language_detection_is_deterministic(text, lang):
 def test_split_sentences_keeps_urls_and_ordinals():
     parts = h.split_sentences("Bkz. https://a.b/c.d sayfası. 3. sınıf! Doç. Dr. Ali? Son")
     assert parts == ["Bkz. https://a.b/c.d sayfası. ", "3. sınıf! ", "Doç. Dr. Ali? ", "Son"]
+
+
+# --------------------------------------------------------------------------
+# Model families: stop tokens, pad token, remote code, reasoning, prompt suffix
+# --------------------------------------------------------------------------
+
+class VocabTokenizer:
+    """Tokenizer stand-in with a vocabulary, added (special) tokens and an unk token."""
+
+    def __init__(self, vocab, added=(), specials=(), eos=None, unk=None, pad=None):
+        self.vocab = dict(vocab)
+        self._added = {t: self.vocab[t] for t in added}
+        self.all_special_tokens = list(specials)
+        self.eos_token = eos
+        self.eos_token_id = self.vocab.get(eos) if eos else None
+        self.unk_token = unk
+        self.unk_token_id = self.vocab.get(unk) if unk else None
+        self.pad_token = pad
+
+    def get_added_vocab(self):
+        return dict(self._added)
+
+    def convert_tokens_to_ids(self, token):
+        return self.vocab.get(token, self.unk_token_id)
+
+
+@pytest.mark.parametrize("family,vocab,added,eos,unk,generation_eos,expected", [
+    ("llama3", {"<|end_of_text|>": 128001, "<|eot_id|>": 128009, "</s>": 524}, ["<|end_of_text|>", "<|eot_id|>"],
+     "<|end_of_text|>", None, 128001, [128001, 128009]),  # "</s>" is a plain vocabulary piece: not a stop token
+    ("qwen2.5-instruct", {"<|endoftext|>": 151643, "<|im_end|>": 151645}, ["<|endoftext|>", "<|im_end|>"],
+     "<|im_end|>", None, [151645, 151643], [151645, 151643]),
+    ("mistral", {"<unk>": 0, "<s>": 1, "</s>": 2}, ["<unk>", "<s>", "</s>"], "</s>", "<unk>", 2, [2]),
+    ("gemma2", {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3, "<end_of_turn>": 107},
+     ["<pad>", "<eos>", "<bos>", "<unk>", "<end_of_turn>"], "<eos>", "<unk>", [1, 107], [1, 107]),
+    ("phi3", {"<|endoftext|>": 32000, "<|assistant|>": 32001, "<|end|>": 32007, "<|user|>": 32010, "</s>": 2},
+     ["<|endoftext|>", "<|assistant|>", "<|end|>", "<|user|>", "</s>"], "<|endoftext|>", None,
+     [32000, 32001, 32007], [32000, 32001, 32007, 2, 32010]),
+    ("glm4", {"<|endoftext|>": 151329, "<|user|>": 151336, "<|observation|>": 151338},
+     ["<|endoftext|>", "<|user|>", "<|observation|>"], "<|endoftext|>", None, [151329, 151336, 151338],
+     [151329, 151336, 151338]),
+    ("deepseek-r1-distill", {"<｜end▁of▁sentence｜>": 151643, "<think>": 151648},
+     ["<｜end▁of▁sentence｜>", "<think>"], "<｜end▁of▁sentence｜>", None, 151643, [151643]),
+])
+def test_collect_stop_token_ids_per_family(family, vocab, added, eos, unk, generation_eos, expected):
+    tok = VocabTokenizer(vocab, added=added, eos=eos, unk=unk)
+    model = mock.Mock(generation_config=mock.Mock(eos_token_id=generation_eos))
+    assert h.collect_stop_token_ids(tok, model) == expected
+    assert h.CengBotModel._collect_eos_ids(tok, model) == expected
+
+
+def test_collect_stop_token_ids_edge_cases():
+    # unknown candidates map to unk -> ignored; bools / negatives / junk in generation_config ignored
+    tok = VocabTokenizer({"<unk>": 0, "</s>": 2}, added=["<unk>"], specials=["</s>"], eos="</s>", unk="<unk>")
+    gen = mock.Mock(generation_config=mock.Mock(eos_token_id=[True, -1, "x", None, [2, 5]]))
+    assert h.collect_stop_token_ids(tok, gen) == [2, 5]
+    assert h.collect_stop_token_ids(tok, mock.Mock(generation_config=None)) == [2]
+
+    class Minimal:  # no get_added_vocab / all_special_tokens: any real id that is not unk counts
+        eos_token_id = 7
+        unk_token_id = 0
+
+        def convert_tokens_to_ids(self, token):
+            return {"<|im_end|>": 9, "<eos>": 0}.get(token)
+
+    assert h.collect_stop_token_ids(Minimal()) == [7, 9]
+
+
+def test_ensure_pad_token_is_generic(caplog):
+    tok = mock.Mock(pad_token=None, eos_token="<|im_end|>")
+    h.ensure_pad_token(tok)
+    assert tok.pad_token == "<|im_end|>"
+    tok = mock.Mock(pad_token="<pad>", eos_token="<eos>")  # Gemma: keeps its own pad token
+    h.ensure_pad_token(tok)
+    assert tok.pad_token == "<pad>"
+    tok = mock.Mock(pad_token=None, eos_token=None, unk_token="<unk>")
+    h.ensure_pad_token(tok)
+    assert tok.pad_token == "<unk>"
+    tok = mock.Mock(pad_token=None, eos_token=None, unk_token=None)
+    with caplog.at_level(logging.WARNING, logger="llama_model_handler"):
+        h.ensure_pad_token(tok)
+    assert "neither a pad nor an EOS token" in caplog.text
+
+
+def test_load_model_uses_generation_config_stop_tokens_and_reports_architecture(lora_env, loaders):
+    loaders.merged.generation_config.eos_token_id = [128001, 128008, 128009]
+    loaders.merged.config.model_type = "llama"
+    model = h.CengBotModel()
+    assert model.load_model()
+    assert model._eos_ids == [128001, 128008, 128009]
+    info = model.get_model_info()
+    assert info["architecture"] == "llama" and info["stop_token_ids"] == [128001, 128008, 128009]
+    assert info["trust_remote_code"] is False
+
+
+def test_trust_remote_code_is_opt_in_and_warned(lora_env, loaders, monkeypatch, caplog):
+    monkeypatch.setenv("MODEL_TRUST_REMOTE_CODE", "true")
+    model = h.CengBotModel()
+    with caplog.at_level(logging.WARNING, logger="llama_model_handler"):
+        assert model.load_model()
+    tok_call = loaders.AutoTokenizer.from_pretrained.call_args_list[0]
+    base_call = loaders.AutoModelForCausalLM.from_pretrained.call_args_list[0]
+    assert tok_call.kwargs["trust_remote_code"] is True and base_call.kwargs["trust_remote_code"] is True
+    assert tok_call.kwargs["local_files_only"] is True  # still offline-first
+    assert "SECURITY" in caplog.text and "MODEL_TRUST_REMOTE_CODE" in caplog.text
+    assert model.get_model_info()["trust_remote_code"] is True
+
+
+def test_4bit_inference_is_opt_in_and_keeps_the_adapter_unmerged(lora_env, loaders, monkeypatch):
+    model = h.CengBotModel()
+    assert model.load_model()
+    assert "quantization_config" not in loaders.AutoModelForCausalLM.from_pretrained.call_args.kwargs
+    assert model.get_model_info()["load_in_4bit"] is False
+
+    monkeypatch.setenv("MODEL_LOAD_IN_4BIT", "true")
+    assert model.reload_model()
+    quant = loaders.AutoModelForCausalLM.from_pretrained.call_args.kwargs["quantization_config"]
+    assert quant.load_in_4bit and quant.bnb_4bit_quant_type == "nf4" and quant.bnb_4bit_compute_dtype == torch.bfloat16
+    assert loaders.peft_model.merge_and_unload.call_count == 1  # only the first (bf16) load merged
+    assert model.model is loaders.peft_model
+    assert model.get_model_info()["load_in_4bit"] is True
+
+
+def test_4bit_inference_needs_cuda(lora_env, loaders, monkeypatch, caplog):
+    monkeypatch.setenv("MODEL_LOAD_IN_4BIT", "true")
+    monkeypatch.setenv("USE_CUDA", "false")
+    model = h.CengBotModel()
+    with caplog.at_level(logging.WARNING, logger="llama_model_handler"):
+        assert model.load_model()
+    assert "quantization_config" not in loaders.AutoModelForCausalLM.from_pretrained.call_args.kwargs
+    assert "MODEL_LOAD_IN_4BIT needs a CUDA GPU" in caplog.text
+    assert model.get_model_info()["load_in_4bit"] is False
+
+
+@pytest.mark.parametrize("message,needle", [
+    ("The repository THUDM/chatglm3-6b contains custom code which must be executed to correctly load the model. "
+     "Please pass the argument `trust_remote_code=True` to allow custom code to be run.", "MODEL_TRUST_REMOTE_CODE=true"),
+    ("The checkpoint you are trying to load has model type `newarch` but Transformers does not recognize this "
+     "architecture.", "does not support the architecture"),
+])
+def test_unsupported_architectures_fail_with_a_clear_error(lora_env, loaders, message, needle):
+    loaders.AutoModelForCausalLM.from_pretrained.side_effect = ValueError(message)
+    model = h.CengBotModel()
+    assert model.load_model() is False
+    assert model.last_load_error.startswith("ModelLoadError") and needle in model.last_load_error
+    h.handle_model_error.assert_not_called()  # a clear message, no traceback dump
+
+
+def test_reasoning_blocks_are_not_part_of_the_answer():
+    model = loaded_model("<think>Kullanıcı staj soruyor. Kısa cevap vermeliyim.</think> Evet, staj zorunludur.")
+    assert model.generate_response("Staj zorunlu mu?") == "Evet, staj zorunludur."
+    model = loaded_model("<think>Uzun bir düşünce, hiç bitmeyen")
+    assert model.generate_response("Staj zorunlu mu?") == h._FALLBACK_ANSWER["tr"]
+    model = loaded_model(" Evet.<|im_end|><|im_start|>user teşekkürler")
+    assert model.generate_response("Staj zorunlu mu?") == "Evet."
+
+
+def test_sentence_stopper_ignores_reasoning(monkeypatch):
+    monkeypatch.setenv("MODEL_MAX_NEW_TOKENS", "400")
+    reasoning = "".join(f" Düşünce {i} burada." for i in range(1, 15))
+    continuation = f"<think>{reasoning}</think> Evet, staj zorunludur."
+    model = loaded_model(continuation)
+    answer, info = model.generate_response_with_info("Staj zorunlu mu?")
+    assert answer == "Evet, staj zorunludur."
+    assert model.model.steps == len(continuation)  # never stopped inside the reasoning
+    assert info["stopped_by"] == "eos"
+
+
+class EosAppendingTokenizer(FakeTokenizer):
+    """Appends EOS (id 0) after the text when add_special_tokens=True (e.g. some GPT-style tokenizers)."""
+
+    def __call__(self, text, return_tensors=None, add_special_tokens=True, split_special_tokens=False, **kw):
+        self.calls.append({"text": text, "split_special_tokens": split_special_tokens})
+        ids = ([1] if add_special_tokens else []) + [ord(c) for c in text] + ([0] if add_special_tokens else [])
+        if return_tensors == "pt":
+            return {"input_ids": torch.tensor([ids]), "attention_mask": torch.ones(1, len(ids), dtype=torch.long)}
+        return {"input_ids": ids}
+
+
+def test_appended_special_tokens_are_removed_from_the_prompt():
+    assert h.count_appended_special_tokens(FakeTokenizer()) == 0
+    assert h.count_appended_special_tokens(EosAppendingTokenizer()) == 1
+    assert h.count_appended_special_tokens(mock.MagicMock()) == 0
+    model = loaded_model(" Evet.")
+    model.tokenizer = EosAppendingTokenizer()
+    model._prompt_suffix_tokens = h.count_appended_special_tokens(model.tokenizer)
+    assert model.generate_response("Staj zorunlu mu?") == "Evet."
+    call = model.model.calls[0]
+    ids = call["input_ids"][0].tolist()
+    assert ids[0] == 1 and ids[-1] != 0  # BOS kept, appended EOS removed
+    assert model.tokenizer.decode(ids).endswith("\nAsistan:")
+    assert call["attention_mask"].shape == call["input_ids"].shape
 
 
 # --------------------------------------------------------------------------

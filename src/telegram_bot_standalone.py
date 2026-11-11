@@ -25,6 +25,8 @@ if _ROOT_DIR not in sys.path:
     sys.path.append(_ROOT_DIR)
 
 import asyncio
+import html
+import json
 import logging
 import re
 import time
@@ -283,6 +285,35 @@ def get_model():
     return model_instance
 
 
+GENERIC_MODEL_NAME = "fine-tuned language model"
+
+
+def _short_model_name(name) -> str:
+    return str(name).strip().rstrip("/").split("/")[-1]
+
+
+def model_display_name() -> str:
+    """Name of the active model for /start and /stats, e.g. "Llama-3.2-3B + LoRA".
+    Uses the loaded model's get_model_info(), else the active model directory's
+    adapter_config.json.
+    Falls back to a generic name; never loads the model."""
+    try:
+        if model_instance is not None and hasattr(model_instance, "get_model_info"):
+            base = (model_instance.get_model_info() or {}).get("base_model")
+            if base:
+                return f"{_short_model_name(base)} + LoRA"
+        model_dir = str(config.model_path)
+        for sub in ("", "method1"):
+            path = os.path.join(model_dir, sub, "adapter_config.json")
+            if os.path.isfile(path):
+                with open(path, encoding="utf-8") as f:
+                    base = (json.load(f) or {}).get("base_model_name_or_path")
+                return f"{_short_model_name(base)} + LoRA" if base else GENERIC_MODEL_NAME
+    except Exception as e:
+        logger.debug(f"Could not determine the model name: {e}")
+    return GENERIC_MODEL_NAME
+
+
 def _get_model_executor() -> ThreadPoolExecutor:
     # One thread: generation is serialized (the model is not thread-safe) and
     # never blocks the asyncio event loop.
@@ -297,7 +328,7 @@ async def generate_answer(prompt: str) -> Tuple[str, bool]:
     loop = asyncio.get_running_loop()
     try:
         model = get_model()
-        logger.info("🤖 Generating response with LLaMA 3.2 3B + LoRA...")
+        logger.info("🤖 Generating response...")
         response = await loop.run_in_executor(_get_model_executor(),
                                               model.generate_response, prompt)
     except Exception as e:
@@ -560,7 +591,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     await message.reply_text(
         "🤖 <b>Çukurova University Computer Engineering AI Assistant</b>\n\n"
-        "🧠 <b>AI Engine:</b> LLaMA 3.2 3B + LoRA Fine-tuned\n"
+        f"🧠 <b>AI Engine:</b> {html.escape(model_display_name())}\n"
         "💾 <b>Database:</b> SQLite\n"
         "🔥 <b>Status:</b> Production Ready\n\n"
         "📝 Hello! I'm here to answer your questions about Computer Engineering.\n\n"
@@ -598,7 +629,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             success_rate = f"{(liked / (liked + disliked) * 100):.1f}%"
         stats_text = f"""📊 <b>AI Assistant Statistics</b>
 
-🤖 <b>Model:</b> LLaMA 3.2 3B + LoRA
+🤖 <b>Model:</b> {html.escape(model_display_name())}
 📝 <b>Total Questions:</b> {total}
 👍 <b>Liked:</b> {liked}
 👎 <b>Disliked:</b> {disliked}
@@ -649,12 +680,12 @@ def main() -> None:
         logger.warning("Jailbreak guard (prompt_guard) is NOT active for this bot")
 
     # Load model
-    logger.info("🤖 Loading LLaMA 3.2 3B + LoRA model...")
+    logger.info("🤖 Loading the language model (models/active-model or MODEL_PATH)...")
     if not get_model().load_model():
         logger.error("❌ Model could not be loaded! Stopping bot.")
         raise SystemExit(1)
 
-    logger.info("🎉 AI Model successfully loaded!")
+    logger.info(f"🎉 AI Model successfully loaded: {model_display_name()}")
 
     # Concurrent updates: callbacks/commands are served while the (serialized)
     # model generates in its own thread.

@@ -4,7 +4,7 @@ CengBot AI model worker
 =======================
 
 Consumes questions from RabbitMQ (``config.questions_queue``), answers them with
-the LLaMA model and publishes the answer to ``config.answers_queue``.
+the fine-tuned language model and publishes the answer to ``config.answers_queue``.
 
 Robustness rules (see the 124 GB log incident):
   * The model is loaded once, *before* connecting to RabbitMQ, with exponential

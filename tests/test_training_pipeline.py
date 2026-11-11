@@ -500,6 +500,12 @@ def test_main_end_to_end_tiny_model_produces_drop_in_model_dir(tmp_path, monkeyp
 
     info = json.loads((final_dir / "training_info.json").read_text(encoding="utf-8"))
     assert info["base_model"] in (LLAMA, os.environ.get("BASE_MODEL_NAME"))
+    # default --lora-target-modules auto: a Llama model gets the explicit projection list
+    assert info["lora_target_modules_requested"] == "auto" and info["lora_target_modules_mode"] == "explicit"
+    assert sorted(info["lora_target_modules"]) == sorted(tm.LORA_TARGET_MODULES)
+    assert sorted(adapter_cfg["target_modules"]) == sorted(tm.LORA_TARGET_MODULES)
+    assert info["architecture"] == "llama" and info["trust_remote_code"] is False
+    assert info["tokenizer"]["adds_bos"] is True and info["tokenizer"]["appended_special_tokens_removed"] == 0
     assert info["model_version"] == "v1" and info["version"] == "v1"
     # 40 rows in groups of 4, val target 10 -> 2 whole groups (never split a group to hit the ratio)
     assert info["dataset_size"] == info["train_examples"] == 32 and info["val_examples"] == 8
@@ -518,6 +524,200 @@ def test_main_end_to_end_tiny_model_produces_drop_in_model_dir(tmp_path, monkeyp
     # A second run never overwrites the previous model: it becomes v2.
     monkeypatch.setattr(tm, "_load_env", lambda: None)
     assert tm.get_next_model_version(str(models)) == 2
+
+
+# ---------------------------------------------------------------------------
+# train_model: model families (LoRA targets, remote code, eager attention)
+# ---------------------------------------------------------------------------
+def tiny_phi3():
+    from transformers import Phi3Config, Phi3ForCausalLM
+
+    torch.manual_seed(0)
+    cfg = Phi3Config(vocab_size=256, hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+                     num_attention_heads=2, num_key_value_heads=1, max_position_embeddings=1024,
+                     bos_token_id=1, eos_token_id=2, pad_token_id=0)
+    return Phi3ForCausalLM(cfg)
+
+
+@pytest.mark.parametrize("value,expected", [
+    (None, "auto"), ("", "auto"), ("AUTO", "auto"), ("all-linear", "all-linear"), ("ALL_LINEAR", "all-linear"),
+    ("q_proj, v_proj", ["q_proj", "v_proj"]), ("qkv_proj,", ["qkv_proj"]), (["o_proj", " "], ["o_proj"]),
+])
+def test_parse_lora_target_modules(value, expected):
+    assert tm.parse_lora_target_modules(value) == expected
+
+
+def test_parse_lora_target_modules_rejects_empty_lists():
+    with pytest.raises(ValueError):
+        tm.parse_lora_target_modules(" , ,")
+    with pytest.raises(SystemExit):
+        tm.parse_args(["--lora-target-modules", ","])
+
+
+def test_resolve_lora_targets_auto_explicit_vs_all_linear(caplog):
+    llama, phi3 = tiny_llama(), tiny_phi3()
+    assert tm.linear_module_names(llama) == set(tm.LORA_TARGET_MODULES)  # lm_head excluded
+    assert tm.resolve_lora_target_modules(llama, "auto") == (tm.LORA_TARGET_MODULES, "explicit")
+    assert tm.linear_module_names(phi3) == {"qkv_proj", "o_proj", "gate_up_proj", "down_proj"}
+    assert tm.resolve_lora_target_modules(phi3, "auto") == ("all-linear", "all-linear")
+    assert tm.resolve_lora_target_modules(llama, "all-linear") == ("all-linear", "all-linear")
+    with caplog.at_level("WARNING", logger="train_model"):
+        assert tm.resolve_lora_target_modules(phi3, "qkv_proj,q_proj") == (["qkv_proj", "q_proj"], "custom")
+    assert "q_proj" in caplog.text
+    with pytest.raises(ValueError, match="None of the LoRA target modules"):
+        tm.resolve_lora_target_modules(phi3, ["q_proj", "v_proj"])
+
+
+def test_apply_lora_all_linear_adapts_fused_projections_but_not_lm_head():
+    cfg = tm.Config(lora_r=4, lora_alpha=8, lora_target_modules="auto")
+    model = tm.apply_lora(tiny_phi3(), cfg)
+    assert tm.lora_target_summary(model) == ["down_proj", "gate_up_proj", "o_proj", "qkv_proj"]
+    names = [n for n, _ in model.named_parameters() if "lora_A" in n]
+    assert names and not any("lm_head" in n or "embed_tokens" in n for n in names)
+    llama = tm.apply_lora(tiny_llama(), cfg)
+    assert tm.lora_target_summary(llama) == sorted(tm.LORA_TARGET_MODULES)
+
+
+def test_cli_and_env_for_lora_targets_remote_code_and_cache_dir(monkeypatch):
+    for var in ("LORA_TARGET_MODULES", "MODEL_TRUST_REMOTE_CODE", "MODEL_CACHE_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    cfg = tm.build_config(tm.parse_args([]))
+    assert cfg.lora_target_modules == "auto" and cfg.trust_remote_code is False
+    assert cfg.cache_dir == str(ROOT / "model_cache")
+
+    monkeypatch.setenv("LORA_TARGET_MODULES", "all-linear")
+    monkeypatch.setenv("MODEL_TRUST_REMOTE_CODE", "true")
+    monkeypatch.setenv("MODEL_CACHE_DIR", "hf-cache")
+    cfg = tm.build_config(tm.parse_args([]))
+    assert cfg.lora_target_modules == "all-linear" and cfg.trust_remote_code is True
+    assert cfg.cache_dir == str(ROOT / "hf-cache")
+
+    monkeypatch.setenv("MODEL_TRUST_REMOTE_CODE", "false")
+    cfg = tm.build_config(tm.parse_args(["--lora-target-modules", "q_proj,v_proj", "--trust-remote-code"]))
+    assert cfg.lora_target_modules == ["q_proj", "v_proj"] and cfg.trust_remote_code is True
+
+
+def _save_tiny(model, directory):
+    model.save_pretrained(str(directory), safe_serialization=True)
+    return str(directory)
+
+
+def test_load_base_model_uses_eager_attention_only_for_gemma2(tmp_path):
+    from transformers import Gemma2Config, Gemma2ForCausalLM
+
+    torch.manual_seed(0)
+    gemma = Gemma2ForCausalLM(Gemma2Config(vocab_size=256, hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+                                           num_attention_heads=2, num_key_value_heads=1, head_dim=16,
+                                           bos_token_id=2, eos_token_id=1, pad_token_id=0))
+    precision = tm.detect_precision(force_cpu=True)
+    loaded = tm.load_base_model(tm.Config(model_name=_save_tiny(gemma, tmp_path / "gemma2"), force_cpu=True), precision)
+    assert loaded.config.model_type == "gemma2" and loaded.config._attn_implementation == "eager"
+    loaded = tm.load_base_model(tm.Config(model_name=_save_tiny(tiny_llama(), tmp_path / "llama"), force_cpu=True),
+                                precision)
+    assert loaded.config._attn_implementation != "eager"
+
+
+def test_trust_remote_code_is_passed_only_when_enabled(tmp_path, monkeypatch):
+    calls = []
+
+    def recorder(kind, result):
+        def from_pretrained(name, **kwargs):
+            calls.append((kind, kwargs))
+            return result
+        return SimpleNamespace(from_pretrained=from_pretrained)
+
+    tok = fake_tokenizer()
+    model = tiny_llama()
+    # string targets: patch the transformers module that `from transformers import ...` sees at call time
+    monkeypatch.setattr("transformers.AutoTokenizer", recorder("tokenizer", tok))
+    monkeypatch.setattr("transformers.AutoModelForCausalLM", recorder("model", model))
+    monkeypatch.setattr("transformers.AutoConfig", recorder("config", SimpleNamespace(model_type="chatglm")))
+    local = tmp_path / "base"
+    local.mkdir()
+    precision = tm.detect_precision(force_cpu=True)
+    for enabled in (False, True):
+        calls.clear()
+        cfg = tm.Config(model_name=str(local), force_cpu=True, trust_remote_code=enabled)
+        tm.load_tokenizer(cfg)
+        tm.load_base_model(cfg, precision)
+        assert [kind for kind, _ in calls] == ["tokenizer", "config", "model"]
+        for _, kwargs in calls:
+            assert kwargs["local_files_only"] is True
+            assert kwargs.get("trust_remote_code") is (True if enabled else None)
+
+
+class NoEosTokenizer(FakeTokenizer):
+    """A tokenizer whose config names no EOS token (the model's generation_config does)."""
+
+    eos_token = None
+
+    @property
+    def eos_token_id(self):
+        return 2 if self.eos_token == "<eos>" else None
+
+    def convert_ids_to_tokens(self, token_id):
+        return {2: "<eos>"}[token_id]
+
+
+def test_tokenizer_without_eos_uses_generation_config(tmp_path, monkeypatch):
+    tok = NoEosTokenizer()
+    monkeypatch.setattr("transformers.AutoTokenizer", SimpleNamespace(from_pretrained=lambda name, **kw: tok))
+    monkeypatch.setattr("transformers.GenerationConfig",
+                        SimpleNamespace(from_pretrained=lambda name, **kw: SimpleNamespace(eos_token_id=[2, 7])))
+    loaded = tm.load_tokenizer(tm.Config(model_name=str(tmp_path)))
+    assert loaded.eos_token == "<eos>" and loaded.eos_token_id == 2 and loaded.pad_token == "<eos>"
+
+
+class EosAppendingTokenizer(FakeTokenizer):
+    def _encode(self, text, add_special_tokens):
+        ids = super()._encode(text, add_special_tokens)
+        return ids + [self.eos_token_id] if add_special_tokens else ids
+
+
+def test_prompts_never_end_with_an_appended_eos():
+    tok = EosAppendingTokenizer()
+    tok.pad_token = tok.eos_token
+    assert tm._appended_special_token_count(tok) == 1 and tm._appended_special_token_count(fake_tokenizer()) == 0
+    question, answer = "Kayıt ne zaman?", "Eylülde."
+    features, status = tm.encode_example(tok, question, answer, "turkish", 512)
+    assert status == "ok"
+    prompt_ids = tok(tm.build_prompt(question, "turkish"))["input_ids"][:-1]
+    assert features["input_ids"][:len(prompt_ids)] == prompt_ids
+    assert features["input_ids"].count(tok.eos_token_id) == 1  # only the trained EOS at the very end
+    assert features["labels"][-1] == tok.eos_token_id
+    encoded, _ = tm.tokenize_records([{"question": question, "answer": answer, "language": "turkish"}], tok, 512)
+    assert encoded[0] == features
+    assert tm.check_tokenization_consistency(tok, [{"question": question, "answer": answer, "language": "turkish"}]) == 0
+    assert tm.tokenizer_info(tok)["appended_special_tokens_removed"] == 1
+
+
+def test_remote_code_failure_explains_the_flag(tmp_path, monkeypatch, capsys):
+    stub = types.ModuleType("error_handler")
+    stub.handle_training_error = lambda exc, step, epoch=None: None
+    monkeypatch.setitem(sys.modules, "error_handler", stub)  # never touch the real logs/error.log
+    monkeypatch.setattr(tm, "_load_env", lambda: None)
+
+    def needs_custom_code(cfg=None):
+        raise ValueError("The repository THUDM/chatglm3-6b contains custom code which must be executed to correctly "
+                         "load the model. Please pass the argument `trust_remote_code=True` to allow custom code.")
+
+    monkeypatch.setattr(tm, "load_tokenizer", needs_custom_code)
+    dataset = write_jsonl(tmp_path / "d.jsonl", synthetic_rows(n_groups=2, variants=2))
+    argv = ["--dataset", str(dataset), "--models-dir", str(tmp_path / "m"), "--checkpoint-dir", str(tmp_path / "c"),
+            "--log-dir", str(tmp_path / "logs"), "--dry-run", "--base-model", "THUDM/chatglm3-6b"]
+    assert tm.main(argv) == 1
+    assert "re-run with --trust-remote-code" in capsys.readouterr().err
+
+
+def test_dry_run_with_trust_remote_code_prints_a_security_warning(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(tm, "_load_env", lambda: None)
+    monkeypatch.setattr(tm, "load_tokenizer", lambda cfg=None: fake_tokenizer())
+    dataset = write_jsonl(tmp_path / "d.jsonl", synthetic_rows(n_groups=2, variants=2))
+    argv = ["--dataset", str(dataset), "--models-dir", str(tmp_path / "m"), "--checkpoint-dir", str(tmp_path / "c"),
+            "--log-dir", str(tmp_path / "logs"), "--dry-run", "--trust-remote-code"]
+    assert tm.main(argv) == 0
+    err = capsys.readouterr().err
+    assert "SECURITY" in err and "trust-remote-code" in err
 
 
 def test_main_returns_error_on_empty_dataset(tmp_path, monkeypatch):

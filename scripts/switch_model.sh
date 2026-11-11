@@ -61,10 +61,16 @@ A valid model directory is either
   (1) a PEFT LoRA adapter: adapter_config.json + adapter_model.safetensors,
       directly or in a method1/ subdirectory (legacy v1 layout); or
   (2) a full HF model: config.json + *.safetensors (or pytorch_model*.bin) +
-      tokenizer.json / tokenizer.model.
+      tokenizer files (tokenizer.json / tokenizer.model / vocab.json+merges.txt).
+Any base model architecture works (Llama, Qwen, DeepSeek distills, Mistral,
+Gemma, Phi, GLM, ...). validate also checks that a LoRA's base model
+(base_model_name_or_path, any org/name) is in the Hugging Face cache
+(MODEL_CACHE_DIR, default model_cache/) and that the installed transformers
+supports its architecture.
 
 Environment: CENGBOT_ROOT (project root, default: parent of scripts/),
-             CENGBOT_PYTHON (interpreter used for validation), CENGBOT_NO_RESTART=1
+             CENGBOT_PYTHON (interpreter used for validation), CENGBOT_NO_RESTART=1,
+             BASE_MODEL_NAME, MODEL_CACHE_DIR, MODEL_TRUST_REMOTE_CODE (env or .env)
 EOF
 }
 
@@ -72,11 +78,13 @@ EOF
 # Validation (contract g). One embedded Python program; prints KEY=VALUE lines.
 # ---------------------------------------------------------------------------
 read -r -d '' VALIDATOR_PY <<'PYEOF' || true
-import glob, json, os, struct, sys
+import glob, importlib.util, json, os, struct, sys
 
-d, model_cache, default_base = sys.argv[1], sys.argv[2], sys.argv[3]
+d, model_cache, default_base = sys.argv[1], sys.argv[2], sys.argv[3].strip()
+project_root = sys.argv[4] if len(sys.argv) > 4 else os.path.dirname(model_cache)
+trust_remote_code = (sys.argv[5] if len(sys.argv) > 5 else "").strip().lower() in ("1", "true", "yes", "on")
 problems, warnings = [], []
-out = {"KIND": "", "WEIGHTS": "", "BASE": "", "INFO": ""}
+out = {"KIND": "", "WEIGHTS": "", "BASE": "", "ARCH": "", "INFO": ""}
 
 
 def rel(p):
@@ -131,7 +139,52 @@ def lora_complete(p):
 
 
 def has_tokenizer(p):
-    return any(os.path.isfile(os.path.join(p, t)) for t in ("tokenizer.json", "tokenizer.model"))
+    j = lambda n: os.path.isfile(os.path.join(p, n))  # noqa: E731
+    return (j("tokenizer.json") or j("tokenizer.model") or (j("vocab.json") and j("merges.txt"))
+            or bool(glob.glob(os.path.join(p, "*.tiktoken"))))
+
+
+def has_weights(p):
+    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        idx = os.path.join(p, index_name)
+        if os.path.isfile(idx):
+            data = load_json(idx, required=False) or {}
+            shards = set((data.get("weight_map") or {}).values())
+            return bool(shards) and all(os.path.isfile(os.path.join(p, s)) for s in shards)
+    return bool(glob.glob(os.path.join(p, "*.safetensors")) or glob.glob(os.path.join(p, "pytorch_model*.bin")))
+
+
+def looks_like_local_path(name):
+    # same rule as llama_model_handler: hub ids are "org/name" (or "name")
+    return name.startswith(("/", "./", "../", "~")) or name.count("/") > 1
+
+
+def native_architectures():
+    """model_type names built into the installed transformers (read from its source, no import)."""
+    try:
+        spec = importlib.util.find_spec("transformers")
+        path = os.path.join(os.path.dirname(spec.origin), "models", "auto", "configuration_auto.py")
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except Exception:  # noqa: BLE001 - transformers not installed for this interpreter
+        return None
+
+
+def check_architecture(config_path, what):
+    cfg = load_json(config_path, required=False) or {}
+    model_type = str(cfg.get("model_type") or "")
+    out["ARCH"] = model_type
+    source = native_architectures()
+    if not model_type or source is None or f'("{model_type}",' in source:
+        return
+    if cfg.get("auto_map"):
+        if not trust_remote_code:
+            warnings.append(f"{what} architecture '{model_type}' is not built into the installed transformers and "
+                            "ships custom code (auto_map): loading it needs MODEL_TRUST_REMOTE_CODE=true, which "
+                            "EXECUTES the repository's code - only for repositories you trust (or use a natively "
+                            "supported checkpoint, e.g. the '-hf' variant)")
+    else:
+        warnings.append(f"{what} architecture '{model_type}' is not supported by the installed transformers - loading will fail")
 
 
 m1 = os.path.join(d, "method1")
@@ -151,20 +204,48 @@ elif lora_complete(d) or lora_complete(m1):
         if cfg.get("peft_type") not in (None, "LORA"):
             warnings.append(f"adapter peft_type is {cfg.get('peft_type')!r}, expected 'LORA'")
         base = cfg.get("base_model_name_or_path") or ""
-        if not base:
+        if not base and default_base:
             base = default_base
             warnings.append(f"adapter_config.json has no base_model_name_or_path - BASE_MODEL_NAME ({base}) will be used")
+    base = base.strip()
     out["BASE"] = base
-    if base and not os.path.isdir(base):
+    local_base = os.path.expanduser(base)
+    if base and not os.path.isabs(local_base):
+        local_base = os.path.join(project_root, local_base)
+    if not base:
+        warnings.append("adapter_config.json has no base_model_name_or_path and BASE_MODEL_NAME is not set - "
+                        "set BASE_MODEL_NAME to the base model this adapter was trained on")
+    elif os.path.isdir(local_base):
+        if os.path.isfile(os.path.join(local_base, "config.json")):
+            check_architecture(os.path.join(local_base, "config.json"), "base model")
+        else:
+            warnings.append(f"base model directory {base} has no config.json")
+    elif looks_like_local_path(base):
+        warnings.append(f"base model path {base} does not exist on this machine - the worker falls back to "
+                        "BASE_MODEL_NAME; set it to the base model this adapter was trained on")
+    else:
+        # Hugging Face cache layout: models--<org>--<name>/snapshots/<rev>/ (works for any org/name)
         cache = os.path.join(model_cache, "models--" + base.replace("/", "--"))
-        if not glob.glob(os.path.join(cache, "snapshots", "*", "config.json")):
-            warnings.append(f"base model {base} is not cached in model_cache/ - loading it needs network access to huggingface.co")
+        configs = sorted(glob.glob(os.path.join(cache, "snapshots", "*", "config.json")))
+        if not configs:
+            warnings.append(f"base model {base} is not cached in model_cache/ ({cache}): the first training run or "
+                            "model load needs internet access to huggingface.co once (downloads must be allowed: "
+                            "MODEL_ALLOW_DOWNLOAD not false, HF_HUB_OFFLINE unset; gated models such as meta-llama/* "
+                            "or google/gemma-* also need HUGGING_FACE_TOKEN). Afterwards everything runs offline.")
+        else:
+            complete = [c for c in configs if has_weights(os.path.dirname(c))]
+            if not complete:
+                warnings.append(f"base model {base} is in model_cache/ but no snapshot has complete weight files "
+                                "(interrupted download?) - the next load downloads the missing files if downloads "
+                                "are allowed")
+            check_architecture((complete or configs)[0], "base model")
     if not (has_tokenizer(wdir) or has_tokenizer(d)):
         warnings.append("no tokenizer files in the model dir - the base model tokenizer will be used")
 elif os.path.isfile(os.path.join(d, "config.json")):
     out["KIND"] = "full"
     out["WEIGHTS"] = d
-    load_json(os.path.join(d, "config.json"))
+    if load_json(os.path.join(d, "config.json")) is not None:
+        check_architecture(os.path.join(d, "config.json"), "model")
     st = sorted(glob.glob(os.path.join(d, "*.safetensors")))
     bins = sorted(glob.glob(os.path.join(d, "pytorch_model*.bin")))
     if not st and not bins:
@@ -183,7 +264,7 @@ elif os.path.isfile(os.path.join(d, "config.json")):
             if missing:
                 problems.append(f"{index_name}: missing shard files: {', '.join(missing)}")
     if not has_tokenizer(d):
-        problems.append("full model: no tokenizer.json or tokenizer.model")
+        problems.append("full model: no tokenizer files (tokenizer.json, tokenizer.model or vocab.json + merges.txt)")
 else:
     found_partial = False
     for sub in (d, m1):
@@ -236,21 +317,37 @@ validator_python() {
     fi
 }
 
-# validate_dir DIR -> sets MODEL_KIND MODEL_BASE MODEL_WEIGHTS MODEL_INFO
+# model_cache_dir -> the Hugging Face cache the worker uses (MODEL_CACHE_DIR, env or .env;
+#                    relative paths are relative to the project root; default model_cache/)
+model_cache_dir() {
+    local cache="${MODEL_CACHE_DIR:-$(read_env_key MODEL_CACHE_DIR)}"
+    cache="${cache:-model_cache}"
+    # shellcheck disable=SC2088  # a literal "~/" prefix is expanded by hand
+    if [[ "${cache:0:2}" == '~/' ]]; then
+        cache="$HOME/${cache:2}"
+    elif [[ "$cache" != /* ]]; then
+        cache="$PROJECT_ROOT/$cache"
+    fi
+    printf '%s' "$cache"
+}
+
+# validate_dir DIR -> sets MODEL_KIND MODEL_BASE MODEL_ARCH MODEL_WEIGHTS MODEL_INFO
 #                     MODEL_WARNINGS[] MODEL_ERRORS[]; returns 0 if valid
 # shellcheck disable=SC2034  # MODEL_WEIGHTS is informational (set for callers)
 validate_dir() {
-    local dir="$1" py output line base_default rc=0
-    MODEL_KIND=""; MODEL_BASE=""; MODEL_WEIGHTS=""; MODEL_INFO=""
+    local dir="$1" py output line base_default trust rc=0
+    MODEL_KIND=""; MODEL_BASE=""; MODEL_ARCH=""; MODEL_WEIGHTS=""; MODEL_INFO=""
     MODEL_WARNINGS=(); MODEL_ERRORS=()
     py=$(validator_python)
+    # Used only when adapter_config.json names no base model (no built-in default).
     base_default="${BASE_MODEL_NAME:-$(read_env_key BASE_MODEL_NAME)}"
-    base_default="${base_default:-meta-llama/Llama-3.2-3B}"
-    output=$("$py" -I -c "$VALIDATOR_PY" "$dir" "$PROJECT_ROOT/model_cache" "$base_default" 2>&1) || rc=$?
+    trust="${MODEL_TRUST_REMOTE_CODE:-$(read_env_key MODEL_TRUST_REMOTE_CODE)}"
+    output=$("$py" -I -c "$VALIDATOR_PY" "$dir" "$(model_cache_dir)" "$base_default" "$PROJECT_ROOT" "$trust" 2>&1) || rc=$?
     while IFS= read -r line; do
         case "$line" in
             KIND=*)    MODEL_KIND="${line#KIND=}" ;;
             BASE=*)    MODEL_BASE="${line#BASE=}" ;;
+            ARCH=*)    MODEL_ARCH="${line#ARCH=}" ;;
             WEIGHTS=*) MODEL_WEIGHTS="${line#WEIGHTS=}" ;;
             INFO=*)    MODEL_INFO="${line#INFO=}" ;;
             WARN=*)    MODEL_WARNINGS+=("${line#WARN=}") ;;
@@ -278,7 +375,7 @@ kind_label() {
 report_validation() {
     local name="$1" w e
     if (( ${#MODEL_ERRORS[@]} == 0 )); then
-        print_success "$name: valid - $(kind_label "$MODEL_KIND")${MODEL_BASE:+, base model: $MODEL_BASE}"
+        print_success "$name: valid - $(kind_label "$MODEL_KIND")${MODEL_BASE:+, base model: $MODEL_BASE}${MODEL_ARCH:+ (architecture: $MODEL_ARCH)}"
     else
         print_error "$name: NOT a valid model directory"
     fi

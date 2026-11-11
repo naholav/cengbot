@@ -1,9 +1,14 @@
 """
-LLaMA 3.2 3B (+ LoRA) model handler for CengBot
-================================================
+Causal language model (+ LoRA) handler for CengBot
+==================================================
 
 Loads the active model (``models/active-model`` symlink, overridable with
-``MODEL_PATH``) offline-first and generates short answers.
+``MODEL_PATH``) offline-first and generates short answers. Nothing here is
+specific to one architecture: any decoder-only model that transformers loads
+with ``AutoModelForCausalLM`` works (Llama, Qwen, DeepSeek distills, Mistral,
+Gemma, Phi, GLM, Granite, OLMo, Falcon3, SmolLM, ...). The production model is
+a LoRA adapter on ``meta-llama/Llama-3.2-3B``; the module keeps its historical
+file name because it is imported everywhere.
 
 Model directory contract (``models/<name>/``):
   1. PEFT LoRA adapter: ``adapter_config.json`` + ``adapter_model.safetensors``
@@ -27,7 +32,17 @@ Environment variables (all optional, read when the model is loaded):
   MODEL_MAX_NEW_TOKENS, MODEL_TOP_P, MODEL_TOP_K, MODEL_REPETITION_PENALTY,
   MODEL_PRECISION (bfloat16|float16|float32), USE_CUDA, MODEL_MAX_INPUT_TOKENS,
   MODEL_MAX_SENTENCES (0 = unlimited), MODEL_PROMPT_STYLE (training|legacy),
-  MODEL_MERGE_LORA, MODEL_ALLOW_DOWNLOAD, HUGGING_FACE_TOKEN.
+  MODEL_MERGE_LORA, MODEL_ALLOW_DOWNLOAD, HUGGING_FACE_TOKEN,
+  MODEL_LOAD_IN_4BIT (default false; 4-bit NF4 base on CUDA for models that do
+  not fit in bf16, e.g. >= ~12B on a 24 GB GPU; the LoRA then stays unmerged),
+  MODEL_TRUST_REMOTE_CODE (default false; executes Python code shipped with the
+  model repository - only for legacy remote-code repos such as chatglm3 or
+  internlm2 that you trust).
+
+Generation stops at every end-of-turn token the tokenizer/model knows (EOS,
+``generation_config.eos_token_id`` and the family stop tokens in
+``STOP_TOKEN_CANDIDATES``) and at generated turn markers. Reasoning blocks
+(``<think>...</think>``) are never part of the answer.
 """
 
 import gc
@@ -216,6 +231,8 @@ class ModelConfig:
     max_sentences = 4
     prompt_style = "training"
     merge_lora = True
+    load_in_4bit = False
+    trust_remote_code = False
 
     system_prompt_tr = TRAINING_SYSTEM_PROMPT_TR
     system_prompt_en = TRAINING_SYSTEM_PROMPT_EN
@@ -241,6 +258,8 @@ class ModelConfig:
         self.max_input_tokens = max(64, _env_int("MODEL_MAX_INPUT_TOKENS", cls.max_input_tokens))
         self.max_sentences = max(0, _env_int("MODEL_MAX_SENTENCES", cls.max_sentences))
         self.merge_lora = _env_bool("MODEL_MERGE_LORA", cls.merge_lora)
+        self.load_in_4bit = _env_bool("MODEL_LOAD_IN_4BIT", cls.load_in_4bit)
+        self.trust_remote_code = _env_bool("MODEL_TRUST_REMOTE_CODE", cls.trust_remote_code)
 
         style = _env_str("MODEL_PROMPT_STYLE", cls.prompt_style).lower()
         if style not in ("training", "legacy"):
@@ -599,7 +618,8 @@ class SentenceLimitStoppingCriteria(StoppingCriteria):
             generated = row[self.prompt_length:]
             hit = False
             if self.max_sentences and generated.shape[0] and generated.shape[0] % self.check_every == 0:
-                text = prompt_guard.cut_at_turn_markers(self.tokenizer.decode(generated, skip_special_tokens=True))
+                text = self.tokenizer.decode(generated, skip_special_tokens=True)
+                text = prompt_guard.cut_at_turn_markers(prompt_guard.strip_reasoning(text))
                 complete = sum(1 for s in split_sentences(text) if _ends_complete(s))
                 needed = self.max_sentences + (2 if _URL_RE.search(text) else 4)
                 hit = complete >= needed
@@ -617,6 +637,103 @@ def _strip_partial_marker(text: str) -> str:
         if last and any(prefix.startswith(last) for prefix in _MARKER_PREFIXES):
             return "\n".join(lines[:-1])
     return text
+
+
+# End-of-turn / end-of-text tokens of the common open-weight families. A
+# candidate is only used if the tokenizer really has it (added/special token
+# with a real id), so e.g. Llama 3 gets <|end_of_text|> + <|eot_id|> only.
+STOP_TOKEN_CANDIDATES = (
+    "<|eot_id|>", "<|end_of_text|>",        # Llama 3, Granite, Falcon3
+    "<|im_end|>", "<|endoftext|>",          # ChatML: Qwen, SmolLM, Phi-4; GPT-style EOS (Phi-3, GLM, OLMo)
+    "</s>",                                 # SentencePiece EOS: Mistral, Llama 2
+    "<end_of_turn>", "<eos>",               # Gemma
+    "<|end|>", "<|user|>",                  # Phi-3 / GLM (a new user turn means the answer is over)
+    "<|observation|>",                      # GLM
+    "<｜end▁of▁sentence｜>",                 # DeepSeek (full-width bars)
+)
+
+
+def _int_ids(value) -> List[int]:
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, int):
+        return [value] if value >= 0 else []
+    if isinstance(value, (list, tuple)):
+        return [v for item in value for v in _int_ids(item)]
+    return []
+
+
+def collect_stop_token_ids(tokenizer, model=None) -> List[int]:
+    """All token ids that end an answer: the tokenizer's EOS, the model's
+    ``generation_config.eos_token_id`` (int or list) and every entry of
+    ``STOP_TOKEN_CANDIDATES`` that is a real token of this tokenizer."""
+    ids: List[int] = []
+
+    def add(value) -> None:
+        for token_id in _int_ids(value):
+            if token_id not in ids:
+                ids.append(token_id)
+
+    add(getattr(tokenizer, "eos_token_id", None))
+    if model is not None:
+        add(getattr(getattr(model, "generation_config", None), "eos_token_id", None))
+
+    unk = getattr(tokenizer, "unk_token_id", None)
+    try:
+        added = tokenizer.get_added_vocab()
+    except Exception:
+        added = None
+    specials = getattr(tokenizer, "all_special_tokens", None)
+    known = set()
+    if isinstance(added, dict):
+        known.update(added)
+    if isinstance(specials, (list, tuple, set)):
+        known.update(specials)
+    for token in STOP_TOKEN_CANDIDATES:
+        # Real tokenizers: only added/special tokens (never a plain vocabulary
+        # piece that happens to spell "</s>"). Minimal tokenizers without these
+        # APIs: any id that is not unk.
+        if (isinstance(added, dict) or isinstance(specials, (list, tuple, set))) and token not in known:
+            continue
+        try:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+        except Exception:
+            continue
+        if isinstance(token_id, int) and not isinstance(token_id, bool) and token_id >= 0 and token_id != unk:
+            add(token_id)
+    return ids
+
+
+def ensure_pad_token(tokenizer) -> None:
+    """Tokenizers without a pad token (Llama, Mistral, Qwen base ...) pad with EOS."""
+    if getattr(tokenizer, "pad_token", None) is not None:
+        return
+    if getattr(tokenizer, "eos_token", None) is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    elif getattr(tokenizer, "unk_token", None) is not None:
+        tokenizer.pad_token = tokenizer.unk_token
+    else:
+        logger.warning("Tokenizer has neither a pad nor an EOS token; batching may fail")
+
+
+def count_appended_special_tokens(tokenizer) -> int:
+    """How many special tokens ``tokenizer(text)`` appends AFTER the text (e.g. an
+    EOS added by a post-processor). BOS-style prefixes (Llama, Gemma, Mistral,
+    GLM's [gMASK]<sop>) are fine; a suffix must be removed from prompts, or the
+    model would see "end of text" right before it should answer. Training
+    (train_model._appended_special_token_count) applies the same rule."""
+    probe = "Merhaba, staj zorunlu mu?"
+    try:
+        with_special = list(tokenizer(probe, add_special_tokens=True, split_special_tokens=True)["input_ids"])
+        plain = list(tokenizer(probe, add_special_tokens=False, split_special_tokens=True)["input_ids"])
+    except Exception:
+        return 0
+    if not plain or len(with_special) <= len(plain):
+        return 0
+    for start in range(len(with_special) - len(plain) + 1):
+        if with_special[start:start + len(plain)] == plain:
+            return len(with_special) - start - len(plain)
+    return 0
 
 
 _GREETING_WORDS = {"selam", "selamlar", "merhaba", "meraba", "mrb", "mrhb", "slm", "sa", "hey", "gunaydin",
@@ -652,6 +769,8 @@ class CengBotModel:
         self._load_failures = 0
         self._lock = threading.RLock()
         self._eos_ids: List[int] = []
+        self._prompt_suffix_tokens = 0
+        self._quantized_4bit = False
 
     # ---------------- language -----------------
     def detect_language(self, text: str) -> str:
@@ -718,6 +837,13 @@ class CengBotModel:
                 return True
             self.config = ModelConfig()  # pick up env changes (e.g. after a model switch)
             _warn_legacy_lora_path(self.config.model_path)
+            if self.config.trust_remote_code:
+                logger.warning(
+                    "SECURITY: MODEL_TRUST_REMOTE_CODE is enabled - Python code shipped with the model "
+                    "repository will be EXECUTED while loading. Only use this for legacy remote-code "
+                    "repositories you trust (e.g. chatglm3, internlm2); Llama, Qwen, Mistral, Gemma, Phi, "
+                    "GLM-4 (-hf / 0414), Granite, OLMo ... are native in transformers and do not need it."
+                )
             started = time.monotonic()
             try:
                 spec = resolve_model_spec(self.config)
@@ -734,7 +860,11 @@ class CengBotModel:
 
                 self.model, self.tokenizer, self.spec = model, tokenizer, spec
                 self.device, self.dtype = device, dtype
-                self._eos_ids = self._collect_eos_ids(tokenizer)
+                self._eos_ids = self._collect_eos_ids(tokenizer, model)
+                self._prompt_suffix_tokens = count_appended_special_tokens(tokenizer)
+                logger.info("Stop token ids: %s%s", self._eos_ids,
+                            f" (tokenizer appends {self._prompt_suffix_tokens} special token(s); "
+                            "removed from prompts)" if self._prompt_suffix_tokens else "")
                 self.load_time_s = round(time.monotonic() - started, 2)
                 self.last_load_error = None
                 self._load_failures = 0
@@ -767,6 +897,9 @@ class CengBotModel:
                 return loader(source.name, **local_kwargs)
             except OSError as exc:  # missing/incomplete local files (HF raises OSError subclasses)
                 local_errors.append(f"{source.name}: {type(exc).__name__}: {str(exc)[:200]}")
+            except ValueError as exc:
+                self._raise_if_unsupported(exc, what, source.name)
+                raise
         online_name = next((s.online_name for s in sources if s.online_name), None)
         detail = "; ".join(local_errors)
         if online_name is None:
@@ -782,20 +915,56 @@ class CengBotModel:
         online_kwargs = dict(kwargs, local_files_only=False, cache_dir=self.config.cache_dir)
         if self.config.hf_token:
             online_kwargs["token"] = self.config.hf_token
-        return loader(online_name, **online_kwargs)
+        try:
+            return loader(online_name, **online_kwargs)
+        except ValueError as exc:
+            self._raise_if_unsupported(exc, what, online_name)
+            raise
+
+    @staticmethod
+    def _raise_if_unsupported(exc: Exception, what: str, name: str) -> None:
+        """Turn transformers' "custom code" / "unknown architecture" errors into clear ModelLoadErrors."""
+        message = str(exc)
+        if "trust_remote_code" in message:
+            raise ModelLoadError(
+                f"{what} '{name}' needs custom code from its repository. Prefer a checkpoint that is "
+                "native in transformers (e.g. the '-hf' variant); otherwise set MODEL_TRUST_REMOTE_CODE=true "
+                "(executes the repository's Python code - only for repositories you trust)."
+            ) from exc
+        if "does not recognize this architecture" in message:
+            raise ModelLoadError(
+                f"{what} '{name}': this transformers version does not support the architecture "
+                f"({message[:200]}). Use a natively supported model or a newer transformers."
+            ) from exc
+
+    def _remote_code_kwargs(self) -> Dict[str, Any]:
+        # Only passed when enabled, so the default call never mentions trust_remote_code.
+        return {"trust_remote_code": True} if self.config.trust_remote_code else {}
 
     def _load_tokenizer(self, spec: ModelSpec):
         tokenizer = self._offline_first(AutoTokenizer.from_pretrained, spec.tokenizer_sources, "Tokenizer",
-                                        use_fast=True)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+                                        use_fast=True, **self._remote_code_kwargs())
+        ensure_pad_token(tokenizer)
         tokenizer.padding_side = "left"
         return tokenizer
 
     def _load_weights(self, spec: ModelSpec, dtype, device_map):
-        kwargs: Dict[str, Any] = {"torch_dtype": dtype, "low_cpu_mem_usage": True}
+        kwargs: Dict[str, Any] = {"torch_dtype": dtype, "low_cpu_mem_usage": True, **self._remote_code_kwargs()}
         if device_map is not None:
             kwargs["device_map"] = device_map
+        self._quantized_4bit = False
+        if self.config.load_in_4bit:
+            if device_map is None:
+                logger.warning("MODEL_LOAD_IN_4BIT needs a CUDA GPU (bitsandbytes); loading the model in %s",
+                               str(dtype).replace("torch.", ""))
+            else:
+                from transformers import BitsAndBytesConfig
+
+                kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=dtype,
+                )
+                self._quantized_4bit = True
         model = self._offline_first(AutoModelForCausalLM.from_pretrained, [spec.base],
                                     "Base model" if spec.kind == "lora" else "Model", **kwargs)
         if spec.kind != "lora":
@@ -814,7 +983,9 @@ class CengBotModel:
             raise ModelLoadError(
                 f"LoRA adapter {spec.model_dir} does not match base model {spec.base_model}: {exc}"
             ) from exc
-        if self.config.merge_lora:
+        if self.config.merge_lora and self._quantized_4bit:
+            logger.info("4-bit base model: the LoRA adapter stays unmerged (merging into 4-bit weights loses precision)")
+        elif self.config.merge_lora:
             # Fold the LoRA weights into the base weights: same maths, ~2x faster decoding.
             try:
                 model = model.merge_and_unload()
@@ -823,19 +994,8 @@ class CengBotModel:
         return model
 
     @staticmethod
-    def _collect_eos_ids(tokenizer) -> List[int]:
-        ids: List[int] = []
-        eos = getattr(tokenizer, "eos_token_id", None)
-        if isinstance(eos, int):
-            ids.append(eos)
-        try:
-            eot = tokenizer.convert_tokens_to_ids("<|eot_id|>")
-        except Exception:
-            eot = None
-        unk = getattr(tokenizer, "unk_token_id", None)
-        if isinstance(eot, int) and eot >= 0 and eot != unk and eot not in ids:
-            ids.append(eot)
-        return ids
+    def _collect_eos_ids(tokenizer, model=None) -> List[int]:
+        return collect_stop_token_ids(tokenizer, model)
 
     def _free_memory(self) -> None:
         gc.collect()
@@ -869,6 +1029,12 @@ class CengBotModel:
             "load_time_s": self.load_time_s,
             "last_error": self.last_load_error,
         }
+        model = self.model
+        if model is not None:
+            info["architecture"] = getattr(getattr(model, "config", None), "model_type", None)
+            info["stop_token_ids"] = list(self._eos_ids)
+            info["load_in_4bit"] = self._quantized_4bit
+        info["trust_remote_code"] = self.config.trust_remote_code
         spec = self.spec
         if spec is None:
             try:
@@ -900,9 +1066,13 @@ class CengBotModel:
         """Tokenise the prompt; shorten the *message* (never the template) if it is too long."""
         message = prompt_guard.strip_special_tokens(message)
         limit = self.config.max_input_tokens
+        suffix = getattr(self, "_prompt_suffix_tokens", 0)
         for _ in range(3):
             prompt, _ = self.format_prompt(message, lang)
             encoded = self.tokenizer(prompt, return_tensors="pt", split_special_tokens=True)
+            if suffix:  # e.g. an EOS appended by the tokenizer: the prompt must end with "Assistant:"
+                encoded = {k: (v[..., :-suffix] if k in ("input_ids", "attention_mask") else v)
+                           for k, v in encoded.items()}
             length = encoded["input_ids"].shape[-1]
             if length <= limit:
                 return encoded
@@ -994,7 +1164,9 @@ class CengBotModel:
             return _ERROR_ANSWER, info
 
     def _postprocess(self, raw: str, lang: str, truncated: bool = False) -> str:
-        text = prompt_guard.strip_special_tokens(raw)
+        text = prompt_guard.strip_reasoning(raw)  # <think>...</think> of reasoning models
+        text = prompt_guard.cut_at_end_of_turn(text)
+        text = prompt_guard.strip_special_tokens(text)
         text = prompt_guard.cut_at_turn_markers(text)
         text = _strip_partial_marker(text).strip()
         if not text:

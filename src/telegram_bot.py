@@ -300,6 +300,31 @@ def build_response_texts(display_name: str, question: str, language: str,
     return html_text, plain_text
 
 
+GENERIC_MODEL_NAME = "fine-tuned language model"
+
+
+def _short_model_name(name) -> str:
+    return str(name).strip().rstrip("/").split("/")[-1]
+
+
+def model_display_name() -> str:
+    """Name of the active model for /start and /stats, e.g. "Llama-3.2-3B + LoRA".
+    Read from the active model directory's adapter_config.json (the model runs in
+    the AI worker).
+    Falls back to a generic name; never loads the model."""
+    try:
+        model_dir = str(config.model_path)
+        for sub in ("", "method1"):
+            path = os.path.join(model_dir, sub, "adapter_config.json")
+            if os.path.isfile(path):
+                with open(path, encoding="utf-8") as f:
+                    base = (json.load(f) or {}).get("base_model_name_or_path")
+                return f"{_short_model_name(base)} + LoRA" if base else GENERIC_MODEL_NAME
+    except Exception as e:
+        logger.debug(f"Could not determine the model name: {e}")
+    return GENERIC_MODEL_NAME
+
+
 def check_similarity(db: Session, question: str, exclude_id: Optional[int] = None) -> List[tuple]:
     """
     Check for similar questions in the database using simple text matching.
@@ -812,7 +837,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     welcome_message = (
         "🤖 <b>Çukurova University Computer Engineering AI Assistant</b>\n\n"
-        "🧠 <b>AI Engine:</b> LLaMA 3.2 3B + LoRA Fine-tuned\n"
+        f"🧠 <b>AI Engine:</b> {html.escape(model_display_name())}\n"
         "💾 <b>Database:</b> SQLite\n"
         "🔥 <b>Status:</b> Production Ready\n\n"
         "📝 Hello! I'm here to answer your questions about Computer Engineering department.\n\n"
@@ -866,7 +891,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # Format statistics message
         stats_text = f"""📊 <b>AI Assistant Statistics</b>
 
-🤖 <b>Model:</b> LLaMA 3.2 3B + LoRA
+🤖 <b>Model:</b> {html.escape(model_display_name())}
 📝 <b>Total Questions:</b> {total_questions}
 👍 <b>Liked Responses:</b> {liked_questions}
 👎 <b>Disliked Responses:</b> {disliked_questions}

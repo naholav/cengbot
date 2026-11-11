@@ -21,9 +21,13 @@ LOCK_FILE="$PROJECT_ROOT/.training.lock"
 # train_model.py defaults (used when no --dataset is given; missing files are skipped)
 DEFAULT_DATASETS=("$PROJECT_ROOT/data/merged_qa_data.jsonl" "$PROJECT_ROOT/data/cengbot_qa_augmented.jsonl")
 
+# train_model.py DEFAULT_BASE_MODEL (used when neither --base-model nor BASE_MODEL_NAME is set)
+DEFAULT_BASE_MODEL="meta-llama/Llama-3.2-3B"
+
 DATASETS=()
 FORWARD=()
 OUTPUT_NAME=""
+BASE_MODEL=""
 DRY_RUN=0
 ASSUME_YES="${ASSUME_YES:-0}"
 
@@ -44,6 +48,10 @@ Common train_model.py options (passed through):
                        + data/cengbot_qa_augmented.jsonl)
   --models-dir DIR     Where the model directory is created (default: models/)
   --output-name NAME   Model directory name (default: final-best-model-v<next>)
+  --base-model ID|DIR  Base model, any Hugging Face org/name or a local directory
+                       (default: BASE_MODEL_NAME from env/.env, else $DEFAULT_BASE_MODEL)
+  --load-in-4bit       QLoRA: needed for 7-12B base models on a 24 GB GPU
+  --lora-target-modules auto|all-linear|a,b,c   (default auto)
 
 Output: models/final-best-model-v<N>/ (adapter_config.json + adapter_model.safetensors
 + tokenizer + training_info.json). Activate it with
@@ -75,6 +83,10 @@ while (( $# > 0 )); do
             shift; [[ $# -gt 0 ]] || die "--output-name needs a name"
             OUTPUT_NAME="$1"; FORWARD+=(--output-name "$1") ;;
         --output-name=*) OUTPUT_NAME="${1#--output-name=}"; FORWARD+=("$1") ;;
+        --base-model)
+            shift; [[ $# -gt 0 ]] || die "--base-model needs a model id or directory"
+            BASE_MODEL="$1"; FORWARD+=(--base-model "$1") ;;
+        --base-model=*) BASE_MODEL="${1#--base-model=}"; FORWARD+=("$1") ;;
         *)            FORWARD+=("$1") ;;
     esac
     shift
@@ -132,6 +144,26 @@ expected_model_name() {
     echo "final-best-model-v$(( highest + 1 ))"
 }
 
+# check_base_model_cached - warn when the base model (any org/name) is not in the HF cache
+check_base_model_cached() {
+    local base="${BASE_MODEL:-${BASE_MODEL_NAME:-$(read_env_key BASE_MODEL_NAME)}}" cache token
+    base="${base:-$DEFAULT_BASE_MODEL}"
+    if [[ "$base" == /* || "$base" == ./* || "$base" == ../* || "$base" == "~"* || -d "$base" ]]; then
+        return 0    # local directory: nothing to download
+    fi
+    cache="${MODEL_CACHE_DIR:-$(read_env_key MODEL_CACHE_DIR)}"
+    cache="${cache:-model_cache}"
+    [[ "$cache" == /* ]] || cache="$PROJECT_ROOT/$cache"
+    if compgen -G "$cache/models--${base//\//--}/snapshots/*/config.json" >/dev/null; then
+        return 0
+    fi
+    token="${HUGGING_FACE_TOKEN:-$(read_env_key HUGGING_FACE_TOKEN)}"
+    print_warning "Base model $base is not cached in $cache - the first training run downloads it once (needs internet access to huggingface.co)"
+    if [[ -z "$token" ]]; then
+        print_warning "HUGGING_FACE_TOKEN is empty: downloading a gated base model (e.g. meta-llama/*, google/gemma-*) will fail"
+    fi
+}
+
 main() {
     print_header "CengBot Training"
     require_python
@@ -149,10 +181,7 @@ main() {
     fi
     train_args+=("${FORWARD[@]+"${FORWARD[@]}"}")
 
-    if [[ -z "$(read_env_key HUGGING_FACE_TOKEN)" ]] && \
-       ! compgen -G "$PROJECT_ROOT/model_cache/models--meta-llama--Llama-3.2-3B/snapshots/*/config.json" >/dev/null; then
-        print_warning "Base model is not cached in model_cache/ and HUGGING_FACE_TOKEN is empty - downloading the gated base model will fail"
-    fi
+    check_base_model_cached
 
     if (( DRY_RUN == 1 )); then
         print_status "Dry run: $PYTHON $TRAINING_SCRIPT --dry-run ${train_args[*]}"

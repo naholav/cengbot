@@ -33,12 +33,19 @@ Guarantees (covered by tests/test_training_pipeline.py):
   ``adapter_config.json`` + ``adapter_model.safetensors`` + tokenizer files +
   ``training_info.json`` directly in ``models/<name>/`` (no ``method1/``, no
   optimizer state). Checkpoints live in ``checkpoints/<name>/`` instead.
-* The base model is loaded offline-first from ``model_cache/``.
+* The base model is loaded offline-first from ``model_cache/``. Any
+  decoder-only architecture that transformers supports natively works (Llama,
+  Qwen, DeepSeek distills, Mistral, Gemma, Phi, GLM, Granite, OLMo, Falcon3,
+  SmolLM, ...): ``--lora-target-modules auto`` (default) uses the classic
+  q/k/v/o/gate/up/down projections when the model has all of them and PEFT's
+  ``all-linear`` otherwise (fused ``qkv_proj``/``gate_up_proj`` of Phi-3/4 and
+  GLM). The choice is recorded in ``training_info.json``.
 
 Usage::
 
     python3 src/train_model.py --dry-run     # validate data + tokenization, no model
     python3 src/train_model.py               # full training run
+    python3 src/train_model.py --base-model Qwen/Qwen2.5-7B --load-in-4bit --output-name qwen25-7b-v1
     python3 src/train_model.py --help
 
 Author: naholav
@@ -111,7 +118,14 @@ _FALLBACK_TURN_MARKERS = {"tr": ("Öğrenci", "Asistan"), "en": ("Student", "Ass
 # user text are plain text) - training must do the same.
 TOKENIZER_CALL_KWARGS = {"split_special_tokens": True}
 
+# Explicit LoRA targets (attention + MLP projections of Llama-style models:
+# Llama, Qwen, Mistral, Gemma, Granite, OLMo ...). ``auto`` uses them when the
+# model has all of them, PEFT's "all-linear" otherwise.
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+LORA_TARGET_AUTO = "auto"
+LORA_TARGET_ALL_LINEAR = "all-linear"
+# transformers recommends eager attention for training these (attention logit soft-capping).
+EAGER_ATTENTION_MODEL_TYPES = ("gemma2", "gemma3", "gemma3_text")
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +162,7 @@ class Config:
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.1
-    lora_target_modules: List[str] = field(default_factory=lambda: list(LORA_TARGET_MODULES))
+    lora_target_modules: Any = LORA_TARGET_AUTO  # "auto" | "all-linear" | list of module names
 
     # Validation
     val_split_ratio: float = 0.07
@@ -158,6 +172,7 @@ class Config:
     # Misc
     seed: int = 42
     load_in_4bit: bool = False  # QLoRA (inference uses a bf16 base model)
+    trust_remote_code: bool = False  # execute model-repo code (legacy remote-code models only)
     force_cpu: bool = False
     semantic_dedup: bool = False
     export_from_db: bool = True
@@ -618,8 +633,46 @@ def _assemble_example(
 def _eos_id(tokenizer) -> int:
     eos = getattr(tokenizer, "eos_token_id", None)
     if eos is None:
-        raise ValueError("Tokenizer has no eos_token_id - cannot teach the model to stop")
+        raise ValueError("Tokenizer has no eos_token_id - cannot teach the model to stop "
+                         "(set eos_token in the tokenizer_config.json of the base model)")
     return int(eos)
+
+
+def _appended_special_token_count(tokenizer) -> int:
+    """Number of special tokens ``tokenizer(text)`` appends after the text (e.g. an EOS
+    added by a post-processor). Prompts are cut before them - same rule as inference
+    (llama_model_handler.count_appended_special_tokens). BOS-style prefixes stay."""
+    probe = "Merhaba, staj zorunlu mu?"
+    try:
+        with_special = list(tokenizer(probe, add_special_tokens=True, **TOKENIZER_CALL_KWARGS)["input_ids"])
+        plain = list(tokenizer(probe, add_special_tokens=False, **TOKENIZER_CALL_KWARGS)["input_ids"])
+    except Exception:
+        return 0
+    if not plain or len(with_special) <= len(plain):
+        return 0
+    for start in range(len(with_special) - len(plain) + 1):
+        if with_special[start:start + len(plain)] == plain:
+            return len(with_special) - start - len(plain)
+    return 0
+
+
+def _strip_suffix(ids: Sequence[int], suffix: int) -> List[int]:
+    ids = list(ids)
+    return ids[:-suffix] if suffix else ids
+
+
+def tokenizer_info(tokenizer) -> Dict[str, Any]:
+    """Special-token facts of the tokenizer (recorded in training_info.json)."""
+    probe_ids = list(tokenizer("x", add_special_tokens=True, **TOKENIZER_CALL_KWARGS)["input_ids"])
+    bos = getattr(tokenizer, "bos_token_id", None)
+    return {
+        "class": type(tokenizer).__name__,
+        "bos_token": getattr(tokenizer, "bos_token", None),
+        "eos_token": getattr(tokenizer, "eos_token", None),
+        "pad_token": getattr(tokenizer, "pad_token", None),
+        "adds_bos": bool(bos is not None and probe_ids and probe_ids[0] == bos),
+        "appended_special_tokens_removed": _appended_special_token_count(tokenizer),
+    }
 
 
 def encode_example(
@@ -636,6 +689,7 @@ def encode_example(
     ``ok``/``truncated``/``too_long``/``prompt_too_long``.
     """
     prompt_ids = tokenizer(build_prompt(question, language), add_special_tokens=True, **TOKENIZER_CALL_KWARGS)["input_ids"]
+    prompt_ids = _strip_suffix(prompt_ids, _appended_special_token_count(tokenizer))
     answer_ids = tokenizer(ANSWER_PREFIX + answer, add_special_tokens=False, **TOKENIZER_CALL_KWARGS)["input_ids"]
     return _assemble_example(prompt_ids, answer_ids, _eos_id(tokenizer), max_length, truncation_policy)
 
@@ -650,6 +704,7 @@ def tokenize_records(
 ) -> Tuple[List[Dict[str, List[int]]], Dict[str, Any]]:
     """Batch-tokenize records. Every dropped/truncated example is counted and reported."""
     eos = _eos_id(tokenizer)
+    suffix = _appended_special_token_count(tokenizer)
     encoded: List[Dict[str, List[int]]] = []
     stats: Counter = Counter()
     dropped_examples: List[str] = []
@@ -661,7 +716,7 @@ def tokenize_records(
         prompt_ids = tokenizer(prompts, add_special_tokens=True, **TOKENIZER_CALL_KWARGS)["input_ids"]
         answer_ids = tokenizer(answers, add_special_tokens=False, **TOKENIZER_CALL_KWARGS)["input_ids"]
         for rec, p_ids, a_ids in zip(chunk, prompt_ids, answer_ids):
-            features, status = _assemble_example(p_ids, a_ids, eos, max_length, truncation_policy)
+            features, status = _assemble_example(_strip_suffix(p_ids, suffix), a_ids, eos, max_length, truncation_policy)
             stats[status] += 1
             answer_lengths.append(len(a_ids) + 1)
             if features is None:
@@ -707,12 +762,13 @@ def check_tokenization_consistency(tokenizer, records: Sequence[Dict[str, Any]],
     """Count examples where tokenizing prompt and answer separately differs from
     tokenizing the full text (would mean a train/inference boundary mismatch)."""
     mismatches = 0
+    suffix = _appended_special_token_count(tokenizer)
     for rec in list(records)[:limit]:
         prompt = build_prompt(rec["question"], rec["language"])
-        separate = list(tokenizer(prompt, add_special_tokens=True, **TOKENIZER_CALL_KWARGS)["input_ids"]) + list(
+        separate = _strip_suffix(tokenizer(prompt, add_special_tokens=True, **TOKENIZER_CALL_KWARGS)["input_ids"], suffix) + list(
             tokenizer(ANSWER_PREFIX + rec["answer"], add_special_tokens=False, **TOKENIZER_CALL_KWARGS)["input_ids"]
         )
-        joint = list(tokenizer(prompt + ANSWER_PREFIX + rec["answer"], add_special_tokens=True, **TOKENIZER_CALL_KWARGS)["input_ids"])
+        joint = _strip_suffix(tokenizer(prompt + ANSWER_PREFIX + rec["answer"], add_special_tokens=True, **TOKENIZER_CALL_KWARGS)["input_ids"], suffix)
         if separate != joint:
             mismatches += 1
     if mismatches:
@@ -724,7 +780,8 @@ def check_tokenization_consistency(tokenizer, records: Sequence[Dict[str, Any]],
 
 class CausalLMCollator:
     """Right-pads input_ids/attention_mask/labels. Labels are padded with -100,
-    so padding (pad == eos for Llama) never hides the real EOS label."""
+    so padding (pad == eos for tokenizers without a pad token) never hides the
+    real EOS label."""
 
     def __init__(self, pad_token_id: int, pad_to_multiple_of: Optional[int] = 8, label_pad_token_id: int = IGNORE_INDEX):
         if pad_token_id is None:
@@ -965,7 +1022,8 @@ def resolve_model_source(model_name: str, cache_dir: Optional[str]) -> Dict[str,
     if token is None:
         logger.warning(
             "Base model '%s' is not cached and HUGGING_FACE_TOKEN is not set - the download "
-            "will fail for gated models such as Llama",
+            "will fail for gated models (e.g. meta-llama/*, google/gemma-*, some mistralai/*: accept "
+            "the license on huggingface.co and set HUGGING_FACE_TOKEN)",
             model_name,
         )
     logger.warning("Base model '%s' not cached - downloading into %s", model_name, cache_dir)
@@ -989,17 +1047,49 @@ def detect_precision(force_cpu: bool = False) -> Dict[str, Any]:
     return {"cuda": cuda, "bf16": bf16, "fp16": fp16, "tf32": tf32, "dtype": dtype}
 
 
+def _remote_code_kwargs(cfg: Config) -> Dict[str, Any]:
+    # Only passed when enabled, so default runs never mention trust_remote_code.
+    return {"trust_remote_code": True} if cfg.trust_remote_code else {}
+
+
+def _generation_config_eos(cfg: Config, source: Dict[str, Any]) -> Optional[int]:
+    try:
+        from transformers import GenerationConfig
+
+        eos = GenerationConfig.from_pretrained(cfg.model_name, **source).eos_token_id
+    except Exception:
+        return None
+    if isinstance(eos, (list, tuple)):
+        eos = eos[0] if eos else None
+    return int(eos) if isinstance(eos, int) else None
+
+
 def load_tokenizer(cfg: Optional[Config] = None):
     from transformers import AutoTokenizer
 
     cfg = cfg or config
     source = resolve_model_source(cfg.model_name, cfg.cache_dir)
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True, **source)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True, **source, **_remote_code_kwargs(cfg))
+    if getattr(tokenizer, "eos_token_id", None) is None:
+        eos = _generation_config_eos(cfg, source)
+        if eos is not None:
+            tokenizer.eos_token = tokenizer.convert_ids_to_tokens(eos)
+            logger.warning("Tokenizer has no EOS token - using %r (id %d) from generation_config.json",
+                           tokenizer.eos_token, eos)
     _eos_id(tokenizer)
-    if tokenizer.pad_token is None:
+    if tokenizer.pad_token is None:  # no pad token (Llama, Mistral, Qwen base ...): pad with EOS
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"  # training; saved as "left" for inference
     return tokenizer
+
+
+def _model_type(cfg: Config, source: Dict[str, Any]) -> Optional[str]:
+    try:
+        from transformers import AutoConfig
+
+        return AutoConfig.from_pretrained(cfg.model_name, **source, **_remote_code_kwargs(cfg)).model_type
+    except Exception:  # from_pretrained of the model reports the real problem
+        return None
 
 
 def load_base_model(cfg: Optional[Config] = None, precision: Optional[Dict[str, Any]] = None):
@@ -1008,7 +1098,11 @@ def load_base_model(cfg: Optional[Config] = None, precision: Optional[Dict[str, 
     cfg = cfg or config
     precision = precision or detect_precision(cfg.force_cpu)
     source = resolve_model_source(cfg.model_name, cfg.cache_dir)
-    kwargs: Dict[str, Any] = {"torch_dtype": precision["dtype"], **source}
+    kwargs: Dict[str, Any] = {"torch_dtype": precision["dtype"], **source, **_remote_code_kwargs(cfg)}
+    model_type = _model_type(cfg, source)
+    if model_type in EAGER_ATTENTION_MODEL_TYPES:
+        kwargs["attn_implementation"] = "eager"
+        logger.info("%s model: training with eager attention (recommended by transformers)", model_type)
     if cfg.load_in_4bit:
         if not precision["cuda"]:
             raise RuntimeError("--load-in-4bit requires a CUDA GPU")
@@ -1025,20 +1119,101 @@ def load_base_model(cfg: Optional[Config] = None, precision: Optional[Dict[str, 
     model = AutoModelForCausalLM.from_pretrained(cfg.model_name, **kwargs)
     model.config.use_cache = False  # incompatible with gradient checkpointing
     logger.info(
-        "Loaded base model %s (dtype=%s, 4bit=%s, params=%.2fB)",
+        "Loaded base model %s (architecture=%s, dtype=%s, 4bit=%s, attention=%s, params=%.2fB)",
         cfg.model_name,
+        getattr(model.config, "model_type", "?"),
         precision["dtype"],
         cfg.load_in_4bit,
+        getattr(model.config, "_attn_implementation", "?"),
         sum(p.numel() for p in model.parameters()) / 1e9,
     )
     return model
 
 
-def apply_lora(model, cfg: Optional[Config] = None):
-    """Wrap the base model with LoRA adapters (QLoRA prep only for 4-bit models)."""
+def parse_lora_target_modules(value: Any) -> Any:
+    """``"auto"`` | ``"all-linear"`` | ``"q_proj,v_proj"`` (or a list) -> "auto" | "all-linear" | [names]."""
+    if value is None:
+        return LORA_TARGET_AUTO
+    if isinstance(value, (list, tuple, set)):
+        names = [str(v).strip() for v in value if str(v).strip()]
+    else:
+        text = str(value).strip()
+        if not text or text.lower() == LORA_TARGET_AUTO:
+            return LORA_TARGET_AUTO
+        if text.lower() in (LORA_TARGET_ALL_LINEAR, "all_linear"):
+            return LORA_TARGET_ALL_LINEAR
+        names = [n.strip() for n in text.split(",") if n.strip()]
+    if not names:
+        raise ValueError(f"Invalid LoRA target modules {value!r}: use auto, all-linear or a comma separated list")
+    return names
+
+
+def linear_module_names(model) -> set:
+    """Leaf names of the Linear layers LoRA can adapt (the output head excluded)."""
+    try:
+        from transformers.pytorch_utils import Conv1D
+        linear_types: Tuple[type, ...] = (torch.nn.Linear, Conv1D)
+    except ImportError:  # pragma: no cover
+        linear_types = (torch.nn.Linear,)
+    try:
+        output_head = model.get_output_embeddings()
+    except Exception:
+        output_head = None
+    return {
+        name.rsplit(".", 1)[-1]
+        for name, module in model.named_modules()
+        if name and module is not output_head and isinstance(module, linear_types)  # bnb Linear4bit is a Linear
+    }
+
+
+def resolve_lora_target_modules(model, spec: Any) -> Tuple[Any, str]:
+    """Return ``(target_modules for LoraConfig, mode)``; mode is explicit | all-linear | custom.
+
+    ``auto``: the explicit projection list if the model has every one of those
+    Linear layers (Llama, Qwen, Mistral, Gemma, Granite ...), else ``all-linear``
+    (fused projections: Phi-3/4 ``qkv_proj``/``gate_up_proj``, GLM ``gate_up_proj``).
+    PEFT's all-linear never adapts the output head (lm_head).
+    """
+    spec = parse_lora_target_modules(spec)
+    if spec == LORA_TARGET_ALL_LINEAR:
+        return LORA_TARGET_ALL_LINEAR, "all-linear"
+    available = linear_module_names(model)
+    if spec == LORA_TARGET_AUTO:
+        if set(LORA_TARGET_MODULES) <= available:
+            return list(LORA_TARGET_MODULES), "explicit"
+        logger.info("LoRA targets (auto): the model has no %s layers (Linear layers: %s) - using all-linear",
+                    "/".join(sorted(set(LORA_TARGET_MODULES) - available)), ", ".join(sorted(available)))
+        return LORA_TARGET_ALL_LINEAR, "all-linear"
+    missing = [name for name in spec if name not in available]
+    if len(missing) == len(spec):
+        raise ValueError(f"None of the LoRA target modules {spec} exist in this model "
+                         f"(Linear layers: {', '.join(sorted(available))})")
+    if missing:
+        logger.warning("LoRA target modules not found in this model and ignored: %s", ", ".join(missing))
+    return list(spec), "custom"
+
+
+def lora_target_summary(model) -> List[str]:
+    """Sorted leaf names of the modules a PeftModel actually adapts."""
+    try:
+        targets = model.peft_config["default"].target_modules
+    except Exception:
+        return []
+    if isinstance(targets, str):
+        return [targets]
+    return sorted({str(t).rsplit(".", 1)[-1] for t in targets})
+
+
+def apply_lora(model, cfg: Optional[Config] = None, target_modules: Any = None):
+    """Wrap the base model with LoRA adapters (QLoRA prep only for 4-bit models).
+
+    ``target_modules`` defaults to ``resolve_lora_target_modules(model, cfg.lora_target_modules)``.
+    """
     from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 
     cfg = cfg or config
+    if target_modules is None:
+        target_modules, _ = resolve_lora_target_modules(model, cfg.lora_target_modules)
     if cfg.load_in_4bit:
         model = prepare_model_for_kbit_training(
             model, use_gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -1051,7 +1226,7 @@ def apply_lora(model, cfg: Optional[Config] = None):
     lora_config = LoraConfig(
         r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,
-        target_modules=list(cfg.lora_target_modules),
+        target_modules=target_modules if isinstance(target_modules, str) else list(target_modules),
         lora_dropout=cfg.lora_dropout,
         bias="none",
         task_type=TaskType.CAUSAL_LM,
@@ -1382,12 +1557,14 @@ def run_database_export(cfg: Config) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     d = Config()
-    p = argparse.ArgumentParser(description="Fine-tune the CengBot LoRA adapter (LLaMA 3.2 3B).")
+    p = argparse.ArgumentParser(description="Fine-tune the CengBot LoRA adapter on a causal LM base model "
+                                             f"(default {DEFAULT_BASE_MODEL}).")
     p.add_argument("--dataset", nargs="+", default=None,
                    help="JSONL dataset file(s) (default: env TRAINING_DATASET or "
                         "data/merged_qa_data.jsonl + data/cengbot_qa_augmented.jsonl)")
     p.add_argument("--base-model", default=None, help="Base model id/path (default: env BASE_MODEL_NAME or %s)" % DEFAULT_BASE_MODEL)
-    p.add_argument("--cache-dir", default=d.cache_dir, help="HF cache dir for the base model (default: model_cache/)")
+    p.add_argument("--cache-dir", default=_default_cache_dir(),
+                   help="HF cache dir for the base model (default: env MODEL_CACHE_DIR or model_cache/)")
     p.add_argument("--models-dir", default=d.output_dir, help="Where the final model dir is created (default: models/)")
     p.add_argument("--output-name", default=None, help="Final model dir name (default: final-best-model-v<next>)")
     p.add_argument("--checkpoint-dir", default=d.checkpoint_root, help="Root for Trainer checkpoints (default: checkpoints/)")
@@ -1407,7 +1584,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--lora-r", type=int, default=d.lora_r)
     p.add_argument("--lora-alpha", type=int, default=d.lora_alpha)
     p.add_argument("--lora-dropout", type=float, default=d.lora_dropout)
-    p.add_argument("--load-in-4bit", action="store_true", help="QLoRA (4-bit base). Default: bf16 base like inference")
+    p.add_argument("--lora-target-modules", default=None, type=_lora_targets_arg,
+                   help="auto (default; env LORA_TARGET_MODULES): q/k/v/o/gate/up/down_proj if the model has "
+                        "them all, else all-linear | all-linear | comma separated module names")
+    p.add_argument("--load-in-4bit", action="store_true",
+                   help="QLoRA (4-bit NF4 base; needed for 7-12B models on a 24 GB GPU). Default: bf16 base like inference")
+    p.add_argument("--trust-remote-code", action="store_true",
+                   help="Execute Python code from the model repository (env MODEL_TRUST_REMOTE_CODE). SECURITY RISK - "
+                        "only for legacy remote-code models (chatglm3, internlm2) from repositories you trust")
     p.add_argument("--cpu", action="store_true", help="Force CPU (debugging only)")
     p.add_argument("--workers", type=int, default=d.dataloader_num_workers, help="DataLoader workers (GPU runs)")
     p.add_argument("--semantic-dedup", action="store_true", help="Also remove near-duplicates (sentence-transformers)")
@@ -1417,6 +1601,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true",
                    help="Load, clean, split and tokenize the data and print stats; no model, no writes")
     return p.parse_args(argv)
+
+
+def _default_cache_dir() -> str:
+    value = os.getenv("MODEL_CACHE_DIR", "").strip()
+    if not value:
+        return str(PROJECT_ROOT / "model_cache")
+    path = Path(value).expanduser()
+    return str(path if path.is_absolute() else PROJECT_ROOT / path)
+
+
+def _lora_targets_arg(value: str) -> Any:
+    try:
+        return parse_lora_target_modules(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def build_config(args: argparse.Namespace) -> Config:
@@ -1453,6 +1652,9 @@ def build_config(args: argparse.Namespace) -> Config:
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         load_in_4bit=args.load_in_4bit,
+        lora_target_modules=(args.lora_target_modules if args.lora_target_modules is not None
+                             else parse_lora_target_modules(os.getenv("LORA_TARGET_MODULES"))),
+        trust_remote_code=bool(args.trust_remote_code) or _truthy(os.getenv("MODEL_TRUST_REMOTE_CODE")),
         force_cpu=args.cpu,
         dataloader_num_workers=max(0, args.workers),
         semantic_dedup=args.semantic_dedup,
@@ -1519,6 +1721,13 @@ def prepare_data(cfg: Config, tokenizer) -> Dict[str, Any]:
 
 def _run(cfg: Config, dry_run: bool, history_version: Optional[int], log_files: Dict[str, str]) -> int:
     started = time.time()
+    if cfg.trust_remote_code:
+        logger.warning(
+            "SECURITY: --trust-remote-code / MODEL_TRUST_REMOTE_CODE is enabled - Python code from the "
+            "repository of %s will be EXECUTED. Only use it for legacy remote-code models (chatglm3, "
+            "internlm2) from repositories you trust; inference needs MODEL_TRUST_REMOTE_CODE=true too.",
+            cfg.model_name,
+        )
     if cfg.export_from_db and not dry_run:
         run_database_export(cfg)
 
@@ -1543,7 +1752,15 @@ def _run(cfg: Config, dry_run: bool, history_version: Optional[int], log_files: 
 
     precision = detect_precision(cfg.force_cpu)
     logger.info("Precision: %s", {k: v for k, v in precision.items() if k != "dtype"})
-    model = apply_lora(load_base_model(cfg, precision), cfg)
+    base_model = load_base_model(cfg, precision)
+    architecture = getattr(getattr(base_model, "config", None), "model_type", None)
+    attn_implementation = getattr(getattr(base_model, "config", None), "_attn_implementation", None)
+    target_modules, target_mode = resolve_lora_target_modules(base_model, cfg.lora_target_modules)
+    model = apply_lora(base_model, cfg, target_modules=target_modules)
+    lora_targets = lora_target_summary(model) or (
+        [target_modules] if isinstance(target_modules, str) else list(target_modules))
+    logger.info("LoRA target modules (%s, requested %r): %s", target_mode, cfg.lora_target_modules,
+                ", ".join(lora_targets))
     # The base model is now local - keep every later library call off the network
     # (PEFT checks the Hub for the base config on every checkpoint save otherwise).
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -1595,7 +1812,13 @@ def _run(cfg: Config, dry_run: bool, history_version: Optional[int], log_files: 
         "lora_r": cfg.lora_r,
         "lora_alpha": cfg.lora_alpha,
         "lora_dropout": cfg.lora_dropout,
-        "lora_target_modules": list(cfg.lora_target_modules),
+        "lora_target_modules": lora_targets,
+        "lora_target_modules_mode": target_mode,
+        "lora_target_modules_requested": cfg.lora_target_modules,
+        "architecture": architecture,
+        "attn_implementation": attn_implementation,
+        "trust_remote_code": cfg.trust_remote_code,
+        "tokenizer": tokenizer_info(tokenizer),
         "load_in_4bit": cfg.load_in_4bit,
         "precision": "bf16" if precision["bf16"] else ("fp16" if precision["fp16"] else "fp32"),
         "learning_rate": cfg.learning_rate,
@@ -1656,6 +1879,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _run(cfg, args.dry_run, history_version, log_files)
     except Exception as exc:
         logger.error("Training failed: %s", exc, exc_info=True)
+        if "trust_remote_code" in str(exc) and not cfg.trust_remote_code:
+            logger.error("The base model %s needs custom code from its repository: prefer a checkpoint that is "
+                         "native in transformers (e.g. the '-hf' variant), or re-run with --trust-remote-code "
+                         "(SECURITY: executes that code; inference then needs MODEL_TRUST_REMOTE_CODE=true)",
+                         cfg.model_name)
         try:
             from error_handler import handle_training_error
 

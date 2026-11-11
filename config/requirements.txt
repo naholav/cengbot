@@ -12,6 +12,10 @@ accelerate>=1.8.1                # validated on GPU. Security: >=1.15 fixes path
 peft>=0.16.0
 bitsandbytes>=0.46.0             # BitsAndBytesConfig (4-bit loading / training)
 datasets>=5.0.1,<6               # train_model.py; <5.0.1: path traversal in folder builders
+# Tokenizer back-ends some model families need (SentencePiece-only / slow tokenizers,
+# e.g. older Mistral, Gemma and Llama-2 style checkpoints, remote-code repos)
+sentencepiece>=0.2.1,<0.3        # <0.2.1: heap overflow (CVE-2026-1260)
+protobuf>=7.36.1,<8              # sentencepiece 0.2.3's generated code needs runtime >=7.36.1; works with 0.2.1-0.2.3 + transformers 4.53
 
 # Telegram Bot
 python-telegram-bot==20.7        # pins httpx~=0.25.2 (do not upgrade httpx separately)
@@ -64,7 +68,7 @@ h11>=0.16.0
 # - Python 3.11
 # - Node.js 18+ (for React frontend: cd admin_frontend && npm install)
 # - RabbitMQ Server (sudo apt install rabbitmq-server)
-# - CUDA compatible GPU (recommended for LLaMA 3.2 3B model)
+# - CUDA compatible GPU (24 GB: 3-4B models in bf16, 7-12B with train_model.py --load-in-4bit)
 # - Minimum 8GB RAM (16GB+ recommended for model inference)
 #
 # Installation (from the project root):

@@ -304,7 +304,7 @@ class CengBotDataAugmenter:
         # Turkish prompt for augmentation
         self.turkish_prompt = """Sen yıllardır doğal dil işleme ve veri zenginleştirme alanında uzmanlaşmış bir AI mühendisisin. Üniversite öğrencilerinin chatbot'larla nasıl konuştuğunu çok iyi biliyorsun.
 
-ÖNEMLİ: Bu varyasyonlar Llama 3.2 3B modelini fine-tune etmek için kullanılacak. Varyasyonların kalitesi, çeşitliliği ve doğallığı modelin performansını doğrudan etkileyecek.
+ÖNEMLİ: Bu varyasyonlar küçük bir dil modelini fine-tune etmek için kullanılacak. Varyasyonların kalitesi, çeşitliliği ve doğallığı modelin performansını doğrudan etkileyecek.
 
 MUTLAK KURALLAR:
 1. Link, isim, sayı, tarih ASLA değişmez
@@ -374,7 +374,7 @@ JSON array formatında döndür. Her varyasyonda 'question' ve 'answer' alanlar�
         # English prompt for augmentation
         self.english_prompt = """You are an AI engineer with years of expertise in natural language processing and data augmentation. You know very well how university students interact with chatbots.
 
-IMPORTANT: These variations will be used to fine-tune the Llama 3.2 3B model. The quality, diversity, and naturalness of the variations will directly affect the model's performance.
+IMPORTANT: These variations will be used to fine-tune a small language model. The quality, diversity, and naturalness of the variations will directly affect the model's performance.
 
 ABSOLUTE RULES:
 1. Links, names, numbers, dates NEVER change

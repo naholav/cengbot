@@ -2,9 +2,9 @@
 Prompt guard for CengBot (Turkish + English)
 =============================================
 
-A small, offline, dependency-free filter that sits in front of the LLaMA model
-(the single choke point is ``ai_model_worker``; the standalone bot can call it
-too). It is deliberately rule based: no ML models, no network, microseconds per
+A small, offline, dependency-free filter that sits in front of the language
+model (the single choke point is ``ai_model_worker``; the standalone bot can
+call it too). It is deliberately rule based: no ML models, no network, microseconds per
 message.
 
 Input side (``guard_input``):
@@ -14,8 +14,12 @@ Input side (``guard_input``):
   * Neutralisation of things that can forge turns in the plain-text prompt
     template (``"{system}\\n\\nStudent: {message}\\nAssistant:"`` and its Turkish
     variant ``Öğrenci:/Asistan:``): role markers such as ``Student:``,
-    ``Asistan:``, ``System:`` lose their colon, special tokens such as
-    ``<|eot_id|>`` / ``[INST]`` / ``<<SYS>>`` are removed, ``###`` is reduced.
+    ``Asistan:``, ``System:`` lose their colon, the chat/special tokens of
+    the common open-weight model families are removed (Llama ``<|eot_id|>``,
+    ChatML ``<|im_start|>``, Llama-2/Mistral ``[INST]`` / ``<<SYS>>`` /
+    ``<s>`` / ``</s>``, Gemma ``<start_of_turn>`` / ``<eos>``, Phi/GLM
+    ``<|user|>`` / ``[gMASK]``, DeepSeek full-width ``<｜User｜>``, reasoning
+    ``<think>`` tags), ``###`` is reduced.
   * A small weighted rule set that detects common jailbreak / prompt-injection
     phrasings in both languages, including ASCII-folded Turkish ("talimatlari
     unut"), leetspeak ("1gn0re") and spaced-out letters ("j a i l b r e a k").
@@ -23,8 +27,12 @@ Input side (``guard_input``):
     is then not called at all and the user gets a refusal in their language.
 
 Output side (``guard_output``):
-  * Cut the answer at the first generated turn marker, remove leaked special
-    tokens.
+  * Drop reasoning blocks (``<think>...</think>``, also an unterminated
+    ``<think>`` or a bare ``</think>`` whose opening tag was in the prompt) of
+    reasoning models (DeepSeek-R1 distills, Qwen3) before anything else.
+  * Cut the answer at the first generated end-of-turn / new-turn special token
+    (``<|eot_id|>``, ``<|im_end|>``, ``<end_of_turn>``, ``</s>``, ``<|user|>`` ...)
+    and at the first generated turn marker, remove leaked special tokens.
   * Replace the answer with a safe fallback if it contains a substantial
     verbatim chunk of a registered protected text (the system prompts; the
     model handler registers them via ``register_protected_text``).
@@ -62,6 +70,8 @@ __all__ = [
     "normalize_text",
     "neutralize_markers",
     "strip_special_tokens",
+    "strip_reasoning",
+    "cut_at_end_of_turn",
     "cut_at_turn_markers",
     "find_turn_marker",
     "contains_protected_text",
@@ -255,11 +265,17 @@ def _matching_views(text: str) -> Tuple[List[str], List[str]]:
 # ---------------------------------------------------------------------------
 
 _SPECIAL_TOKEN_RE = re.compile(
-    r"<\|[^<>|\n]{1,64}\|>"          # <|begin_of_text|>, <|eot_id|>, <|start_header_id|>, <|im_start|> ...
-    r"|\[/?INST\]"                    # [INST] [/INST]
-    r"|<</?SYS>>"                     # <<SYS>> <</SYS>>
-    r"|</?s>"                         # <s> </s>
-    r"|</?(?:start|end)_of_turn>",    # <start_of_turn> (gemma style)
+    # <|begin_of_text|> <|eot_id|> (Llama 3), <|im_start|> <|im_end|> <|endoftext|> (ChatML: Qwen, SmolLM,
+    # Phi-4), <|user|> <|end|> (Phi-3, GLM, OLMo, Falcon3), <|start_of_role|> (Granite) and DeepSeek's
+    # full-width-bar tokens <｜User｜> <｜end▁of▁sentence｜> (NFKC maps "｜" to "|", raw text may still have it)
+    r"<[|｜][^<>|｜\n]{1,64}[|｜]>"
+    r"|\[/?(?:INST|SYSTEM_PROMPT|AVAILABLE_TOOLS|TOOL_RESULTS|TOOL_CALLS)\]"  # Llama 2 / Mistral
+    r"|<</?SYS>>"                     # <<SYS>> <</SYS>> (Llama 2)
+    r"|</?s>"                         # <s> </s> (SentencePiece BOS/EOS: Llama 2, Mistral)
+    r"|</?(?:start|end)_of_turn>"     # <start_of_turn> <end_of_turn> (Gemma)
+    r"|<(?:bos|eos)>"                 # <bos> <eos> (Gemma)
+    r"|</?(?:think|tool_call|tool_response)>"  # reasoning / tool tags (DeepSeek-R1, Qwen3, Hermes)
+    r"|\[[gs]MASK\]|<[se]op>",         # [gMASK] <sop> <eop> (GLM)
     re.IGNORECASE,
 )
 _HASHES_RE = re.compile(r"#{3,}")
@@ -278,6 +294,55 @@ def strip_special_tokens(text: str) -> str:
     """Remove chat/special tokens that could open or close turns."""
     text = _SPECIAL_TOKEN_RE.sub(" ", text or "")
     return _HASHES_RE.sub("#", text)
+
+
+_THINK_OPEN_RE = re.compile(r"<think>", re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(r"</think>", re.IGNORECASE)
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+
+
+def strip_reasoning(text: str) -> str:
+    """Remove the reasoning of reasoning models (DeepSeek-R1 distills, Qwen3 ...).
+
+    * ``<think>...</think>`` blocks are removed;
+    * a ``</think>`` without an opening tag before it means the chat template
+      opened the block in the prompt: everything up to it is reasoning;
+    * an unterminated ``<think>`` (generation stopped while thinking): everything
+      from it on is reasoning.
+    """
+    text = text or ""
+    if "think>" not in text.lower():
+        return text
+    first_close = _THINK_CLOSE_RE.search(text)
+    first_open = _THINK_OPEN_RE.search(text)
+    if first_close and (first_open is None or first_close.start() < first_open.start()):
+        text = text[first_close.end():]
+    text = _THINK_BLOCK_RE.sub(" ", text)
+    unterminated = _THINK_OPEN_RE.search(text)
+    if unterminated:
+        text = text[:unterminated.start()]
+    return _THINK_CLOSE_RE.sub(" ", text)
+
+
+# Output side: a generated end-of-turn / new-turn token ends the answer (whatever follows is
+# a new dialogue turn). Granite's <|end_of_role|> follows the role name at the START of a
+# turn and is only stripped.
+_END_OF_TURN_RE = re.compile(
+    r"<[|｜](?:eot_id|end_of_text|endoftext|im_end|im_start|end|user|assistant|system|observation"
+    r"|start_header_id|start_of_role|end▁of▁sentence)[|｜]>"
+    r"|<(?:start|end)_of_turn>|</s>|<eos>|\[INST\]",
+    re.IGNORECASE,
+)
+
+
+def cut_at_end_of_turn(text: str) -> str:
+    """Drop everything from the first end-of-turn / new-turn special token that follows
+    some answer text (leading special tokens are skipped)."""
+    text = text or ""
+    for match in _END_OF_TURN_RE.finditer(text):
+        if strip_special_tokens(text[:match.start()]).strip():
+            return text[:match.start()]
+    return text
 
 
 def neutralize_markers(text: str) -> str:
@@ -427,7 +492,7 @@ _RULES: List[Tuple[str, int, "re.Pattern[str]"]] = [
     ("en_bad_mode", 4, _r(r"\b(?:unrestricted|unfiltered|uncensored|jailbroken|jailbreak|evil|dan|chaos|opposite"
                           r"|god)\s+mode\b")),
     ("en_developer_mode", 1, _r(r"\b(?:developer|dev)\s+mode\b")),
-    ("en_developer_mode_ai", 2, _r(r"\b(?:chatgpt|gpt|claude|llama|assistant|bot|model|ai)\b.{0,30}\bdeveloper\s+mode\b"
+    ("en_developer_mode_ai", 2, _r(r"\b(?:chatgpt|gpt|claude|llama|qwen|mistral|gemma|deepseek|assistant|bot|model|ai)\b.{0,30}\bdeveloper\s+mode\b"
                                    r"|\bdeveloper\s+mode\s+(?:enabled|activated)\b")),
     ("en_do_anything_now", 4, _r(r"\bdo\s+anything\s+now\b")),
     ("en_dan", 3, _r(r"\b(?:you\s+(?:are|re)|act\s+as|be|become|pretend\s+to\s+be|called|named|as)\s+dan\b"
@@ -622,7 +687,9 @@ def guard_output(text: str, language: Optional[str] = None) -> str:
     if not is_enabled():
         return raw
     lang = _lang(language, raw)
-    cleaned = strip_special_tokens(raw)
+    cleaned = strip_reasoning(raw)  # before everything else: reasoning is never part of the answer
+    cleaned = cut_at_end_of_turn(cleaned)
+    cleaned = strip_special_tokens(cleaned)
     cleaned = cut_at_turn_markers(cleaned)
     cleaned = _HSPACE_RE.sub(" ", cleaned).strip()
     if contains_protected_text(cleaned):

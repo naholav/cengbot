@@ -7,7 +7,7 @@ it lists and edits the collected questions, manages the training data, reports
 statistics and duplicates, and shows the project's documentation and logs.
 
 - **Base URL**: `http://localhost:8001` (`API_HOST` / `API_PORT` in `.env`;
-  the template uses `127.0.0.1`, the code default when unset is `0.0.0.0`)
+  default `127.0.0.1`; expose it through the nginx `/api/` proxy, not `0.0.0.0`)
 - **Interactive docs**: `http://localhost:8001/docs` (Swagger UI) and
   `http://localhost:8001/redoc`
 - **Start**: `.venv/bin/python src/admin_rest_api.py` (also started by
@@ -452,4 +452,8 @@ CORS_ORIGINS=http://localhost:3000,https://admin.example.edu
 ```
 
 The panel's API base URL (`REACT_APP_API_URL`, default `http://localhost:8001`)
-is baked into the frontend at build time.
+is baked into the frontend by Vite when the dev server starts or the build
+runs. `scripts/deploy_production.sh` builds the panel with `/api` (default of
+`PANEL_API_URL`) and nginx
+proxies `/api/` to `127.0.0.1:8001`, so in production panel and API share one
+origin and CORS is not involved.

@@ -2,6 +2,98 @@
 
 All notable changes to CengBot are listed here.
 
+## 2026-11-11 - Vite admin panel, any base model family, benchmark
+
+Follow-up to the hardening release below: the admin panel moves to Vite, the
+training and serving stack is no longer tied to Llama, and every model can now
+be scored on a fixed benchmark.
+
+### Admin panel: Create React App -> Vite
+
+- The panel is built with **Vite 8** and tested with **Vitest 5** (Testing
+  Library, jsdom); TypeScript 5.9. `react-scripts` is gone; `index.html` and
+  `vite.config.ts` replace `public/` and `.env.production`.
+- **Node.js 22.13+ or 24+** is required. `setup_system.sh` and `start_system.sh`
+  no longer install the distribution's (too old) Node.js: they check the version
+  and print an install hint; `start_system.sh` then starts everything except
+  the panel.
+- Commands: `npm start` (dev server on `localhost:3000` only;
+  `npm start -- --host` exposes it), `npm run build` (type check + build into
+  `build/`), `npm run preview`, `npm test`, `npm run test:watch`,
+  `npm run typecheck`.
+- `REACT_APP_API_URL` and `REACT_APP_ADMIN_USERNAME` keep working (Vite exposes
+  the `REACT_APP_` and `VITE_` prefixes). Source maps stay off
+  (`build.sourcemap: false`).
+- `deploy_production.sh` builds the panel with `REACT_APP_API_URL=/api`
+  (`PANEL_API_URL` to change it) behind the nginx `/api/` proxy, and removes
+  the files of the previous build from `/var/www/cengbot` before copying.
+
+### Any open-weight base model family
+
+- Training, validation, swapping and inference work with any causal LM that
+  transformers supports natively: Llama, Qwen2.5/Qwen3, DeepSeek-R1 distills,
+  Mistral, Gemma 2/3, Phi-3.5/Phi-4, GLM-4, Granite, OLMo 2, Falcon3, SmolLM.
+  The production model stays Llama-3.2-3B + LoRA v1.2.
+- `train_model.py --base-model` (or `BASE_MODEL_NAME`) with
+  `--lora-target-modules auto|all-linear|list`: `auto` uses the explicit
+  projection list and falls back to all-linear for fused projections (Phi,
+  GLM); Gemma trains with eager attention; `--load-in-4bit` (QLoRA) for 7-12B
+  bases.
+- Stop tokens come from the tokenizer, `generation_config` and the known
+  end-of-turn tokens of each family; generic pad/BOS handling; `<think>`
+  reasoning is removed from answers and the prompt guard knows the families'
+  special tokens.
+- New settings: `MODEL_LOAD_IN_4BIT` (4-bit inference for ~12B+ bases),
+  `MODEL_TRUST_REMOTE_CODE` (opt-in, off by default) and `LORA_TARGET_MODULES`.
+- `switch_model.sh validate` checks the base-model cache for any org/name, the
+  architecture against the installed transformers, and explains remote-code
+  models. The model loader turns unsupported-architecture and remote-code
+  errors into clear messages.
+- `sentencepiece` and `protobuf` added to `config/requirements.txt` for
+  tokenizers of some families.
+- Runbook: "Retrain on a different base model" in `docs/MODEL_SWAP.md`.
+
+### Benchmark
+
+- `benchmark/`: 100 verified questions (50 Turkish, 50 English) from the
+  department's official pages, `run_benchmark.py` (production answer path),
+  `grader.py` (deterministic checks plus an optional Claude API judge with
+  cached judgments) and `LEADERBOARD.md`.
+- Baseline, deterministic scoring: Llama-3.2-3B + LoRA v1.2 scores **30.2/100**
+  (key-fact coverage 20.3%, correct link 32%, wrong official link 56%,
+  invented URLs 0%). The LLM judge has not run yet (the API key was rejected);
+  `run_benchmark.py --regrade benchmark/results/<run>` adds it later.
+- Finding: the training data cites pages that now return 404 (for example
+  `bmb.cu.edu.tr/cu/student/internship`); refresh the links before the next
+  retrain.
+
+### Ops
+
+- `rotate_logs.sh` tail-trims any log above 1 GiB (`CENGBOT_LOG_PRETRIM_BYTES`)
+  before logrotate, so `copytruncate` never needs to copy a runaway log.
+- Services started by the scripts never inherit the locks of
+  `switch_model.sh` / `train_model.sh`.
+- `backup_data.sh` and `health_check.sh` use the database `DATABASE_URL` points
+  to, like the services.
+
+### Docs
+
+- README with a demo GIF rendered from real benchmark answers
+  (`docs/assets/make_demo_gif.py`), Mermaid architecture diagrams, supported
+  base models and the benchmark; `docs/MODEL_SWAP.md` with the family table and
+  troubleshooting for new families.
+
+### Upgrade notes
+
+1. Install Node.js 22.13+ or 24+ (e.g. `nvm install 22`), then
+   `cd admin_frontend && npm install` (`start_system.sh` does this when the Vite
+   install is missing).
+2. `.venv/bin/python -m pip install -r config/requirements.txt`
+3. Production: re-run `sudo ./scripts/deploy_production.sh` (or rebuild with
+   `REACT_APP_API_URL=/api npm run build` and replace `/var/www/cengbot`).
+4. The Admin API now binds `127.0.0.1` by default. If an existing `.env` sets
+   `API_HOST=0.0.0.0`, change it to `127.0.0.1` and use the nginx `/api/` proxy.
+
 ## 2026-11-11 - Security, reliability and model-swap release
 
 A hardening release: no more hardcoded credentials, an authenticated admin API,
@@ -32,7 +124,8 @@ prompts match inference, and a one-command model swap for the next retrain.
   silenced), and user and model text is HTML-escaped in Telegram replies.
 - Vote buttons are validated: well-formed callback data from the allowed chat,
   on the bot's own reply message only.
-- Models are loaded without `trust_remote_code`; CORS origins come from
+- `trust_remote_code` is opt-in: models are loaded without it unless
+  `MODEL_TRUST_REMOTE_CODE=true` (added in the follow-up release); CORS origins come from
   `CORS_ORIGINS` instead of a hardcoded list; database errors return a generic
   message; the deploy script keeps `.env` at mode 600 instead of making the
   project world-readable.
@@ -146,8 +239,8 @@ prompts match inference, and a one-command model swap for the next retrain.
   and scripts. They use a temporary database and log directory and never touch
   Telegram, RabbitMQ, Hugging Face or the Claude API. The GPU test is opt-in
   (`RUN_GPU_TESTS=1`); shellcheck runs when available (`SHELLCHECK=`).
-- Frontend tests with Jest and Testing Library:
-  `cd admin_frontend && CI=true npx react-scripts test --watchAll=false`.
+- Frontend tests with Jest and Testing Library (at the time; replaced by
+  Vitest, `cd admin_frontend && npm test`, in the follow-up release).
 
 ### Upgrade notes
 

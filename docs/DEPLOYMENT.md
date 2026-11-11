@@ -9,15 +9,21 @@ script: [scripts/README.md](../scripts/README.md).
 
 ## 📋 Requirements
 
-- **Python 3.11** (the pinned web stack needs it), **Node.js 18+** and npm
+- **Python 3.11** (the pinned web stack needs it)
+- **Node.js 22.13+ or 24+** and npm for the admin panel build (Vite 8). Ubuntu's
+  apt package is too old and the scripts do not install Node.js: use
+  [nvm](https://github.com/nvm-sh/nvm) (`nvm install 22`; the deploy script
+  loads `~/.nvm/nvm.sh` of the service user) or the packages from
+  [nodejs.org](https://nodejs.org)
 - **RabbitMQ** (`rabbitmq-server`)
 - **NVIDIA GPU** with a working driver and CUDA for inference and training
   (CPU works but is very slow)
 - Disk space for the base model cache (`model_cache/`), the adapters
   (`models/`), checkpoints, logs and backups
-- A Hugging Face account with access to the gated
-  [`meta-llama/Llama-3.2-3B`](https://huggingface.co/meta-llama/Llama-3.2-3B),
-  once, to download the base model
+- Once, to download the base model: network access to huggingface.co, and for
+  a gated base such as the current
+  [`meta-llama/Llama-3.2-3B`](https://huggingface.co/meta-llama/Llama-3.2-3B) a
+  Hugging Face account that accepted its licence (`HUGGING_FACE_TOKEN`)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather), and the bot
   added to the department group
 
@@ -29,9 +35,10 @@ cd cu_ceng_bot
 ./scripts/setup_system.sh            # [--upgrade] [--yes]
 ```
 
-`setup_system.sh` installs the apt packages (Python, Node.js, RabbitMQ,
-logrotate, build tools; `sudo` asks for *your* password), enables RabbitMQ and
-its management plugin, creates `.venv` only if it does not exist yet, installs
+`setup_system.sh` installs the apt packages (Python, RabbitMQ, logrotate,
+build tools; `sudo` asks for *your* password), checks the Node.js version
+(it never installs Node.js: install it first), enables RabbitMQ and its
+management plugin, creates `.venv` only if it does not exist yet, installs
 `config/requirements.txt` and the npm packages, creates the database tables and
 copies `.env.example` to `.env` (mode 600) if `.env` is missing. It runs
 `apt upgrade` only with `--upgrade`, because a full upgrade can replace the
@@ -90,10 +97,11 @@ mkdir -p models
 ./scripts/switch_model.sh current
 ```
 
-The base model is downloaded into `model_cache/` the first time the worker
-loads the model, if `HUGGING_FACE_TOKEN` is set and downloads are allowed. You
-can also copy an existing Hugging Face cache directory
-(`models--meta-llama--Llama-3.2-3B`) into `model_cache/`. When it is cached,
+The base model named in the adapter is downloaded into `model_cache/` the
+first time the worker loads the model, if downloads are allowed (and, for a
+gated base, `HUGGING_FACE_TOKEN` is set). You can also copy an existing Hugging
+Face cache directory (`models--<org>--<name>`, today
+`models--meta-llama--Llama-3.2-3B`) into `model_cache/`. When it is cached,
 set `MODEL_ALLOW_DOWNLOAD=false` (or `HF_HUB_OFFLINE=1`) so the server never
 downloads model files. `./scripts/test_environment.sh` shows whether the base
 model is cached.
@@ -106,7 +114,7 @@ systemd units are active.
 ### Manual mode
 
 ```bash
-./scripts/start_system.sh                 # worker, Admin API, bot, React dev server
+./scripts/start_system.sh                 # worker, Admin API, bot, Vite dev server
 ./scripts/start_system.sh --no-frontend   # without the dev server
 ./scripts/stop_system.sh
 ./scripts/health_check.sh
@@ -114,7 +122,9 @@ systemd units are active.
 
 Output is appended to `logs/worker.log`, `logs/bot.log`, `logs/admin.log` and
 `logs/frontend.log`; PIDs are kept in `.pids`. A crashed service is **not**
-restarted, so use systemd in production.
+restarted, so use systemd in production. If Node.js is missing or older than
+22.13, the panel is skipped with an install hint and the other services start.
+The dev server listens on `localhost:3000` only.
 
 ### systemd units
 
@@ -130,7 +140,7 @@ This writes `/etc/systemd/system/cengbot-{worker,bot,admin,monitor}.service`
 (`CENGBOT_SERVICE_USER` to change), with `Restart=always`, and append their
 output to `logs/worker.log`, `bot.log`, `admin.log` and `monitor.log`. The
 worker unit allows 60 s to stop (GPU memory release). There is no unit for the
-React dev server; serve a static build instead (next section).
+Vite dev server; serve the static build instead (next section).
 
 ```bash
 sudo systemctl status cengbot-worker cengbot-bot cengbot-admin cengbot-monitor
@@ -152,14 +162,19 @@ sudo ./scripts/deploy_production.sh --dry-run                 # show the plan
 sudo ./scripts/deploy_production.sh [--with-firewall] [--tune-system] [--yes]
 ```
 
+Before step 1 it checks that the service user has Node.js 22.13+ (or 24+)
+and npm, and stops without changing anything if not.
+
 1. **backup**: archive of the project (code, `.env`, data, database, models;
    without logs, `.venv`, `model_cache`, `node_modules`, build) in
    `<parent dir>/cengbot_deploy_backups/` (mode 600)
 2. **stop**: the `cengbot-*` units and processes started by `start_system.sh`
 3. **packages**: `nginx`, `rabbitmq-server`, `logrotate`, `curl`
 4. **app**: `pip install -r config/requirements.txt` into `.venv` (which must
-   exist), database tables, `npm install && npm run build`, the build copied to
-   `/var/www/cengbot`, `.env` set to mode 600
+   exist), database tables, `npm install` and
+   `REACT_APP_API_URL=${PANEL_API_URL:-/api} npm run build` as the service user,
+   the files of the previous build removed from `/var/www/cengbot` and the new
+   build copied there, `.env` set to mode 600
 5. **units**: `optimize_linux.sh --only services,logrotate` (all steps with `--tune-system`)
 6. **nginx**: `/etc/nginx/sites-available/cengbot` on port 80: the panel from
    `/var/www/cengbot`, `/api/` → `http://127.0.0.1:8001/`, `/health`
@@ -170,18 +185,18 @@ sudo ./scripts/deploy_production.sh [--with-firewall] [--tune-system] [--yes]
    denies other incoming traffic
 9. **start**: enables and starts the units and checks `/health`
 
-> ⚠️ **Set the panel's API URL before deploying.** `REACT_APP_API_URL` is
-> baked into the build and defaults to `http://localhost:8001`, which only works
-> in a browser on the server itself. Behind this nginx configuration the panel
-> should call the API through `/api` on the same origin:
->
-> ```bash
-> echo "REACT_APP_API_URL=/api" > admin_frontend/.env.production.local   # gitignored, read by npm run build
-> ```
->
-> The build runs as the service user in a login shell, so a variable exported
-> in your own shell is not seen. Because panel and API then share one origin,
-> CORS is not involved.
+**The panel's API URL.** `REACT_APP_API_URL` is baked into the build. The
+deploy script sets it to `/api`, so the panel calls the API through nginx on
+the same origin and CORS is not involved. To use another URL (an API on a
+different origin; the panel's origin must then be in `CORS_ORIGINS`), pass
+`PANEL_API_URL` through sudo:
+
+```bash
+sudo PANEL_API_URL=https://api.example.edu ./scripts/deploy_production.sh
+```
+
+The value set by the script overrides `admin_frontend/.env.production.local`
+(in Vite a shell variable wins over `.env` files).
 
 **HTTPS.** The nginx site listens on plain HTTP (port 80), and HTTP Basic sends
 the admin password with every request. Add TLS before using the panel over a
@@ -208,6 +223,10 @@ sudo certbot --nginx -d admin.example.edu
 sudo ./scripts/optimize_linux.sh --only logrotate   # system-wide: /etc/logrotate.d/cengbot + /etc/cron.hourly
 ```
 
+`rotate_logs.sh` first tail-trims any log above 1 GiB
+(`CENGBOT_LOG_PRETRIM_BYTES`, keeping the last 10 MiB as `<log>.1.gz`), because
+`copytruncate` copies the whole file and a runaway log would need that much
+free disk. The system-wide cron job runs logrotate directly, without this step.
 Do not add `logs/*.log` to another logrotate rule: it would also rotate
 `error.log` and `system_monitor.log`, which Python already rotates. As a safety
 net, `start_system.sh` (and the worker restart in `switch_model.sh`) rotates a
@@ -227,7 +246,8 @@ Check sizes and free disk space at any time:
 ```
 
 The archive holds a consistent snapshot of the SQLite database (online backup
-API), `data/`, `models/` (`--no-models` to skip), the last part of big logs and
+API; the file `DATABASE_URL` points to, default `university_bot.db`), `data/`,
+`models/` (`--no-models` to skip), the last part of big logs and
 `.env.example` (never `.env`). The 5 newest archives are kept (`--keep N` or
 `KEEP_BACKUPS`). Copy the archives to another machine; `backups/` contains user
 data, so never commit it.
@@ -240,8 +260,9 @@ git pull
 .venv/bin/python -m pip install -r config/requirements.txt
 .venv/bin/python -c "import sys; sys.path.insert(0, 'src'); from database_models import init_db; init_db()"   # adds missing tables only
 sudo systemctl restart cengbot-worker cengbot-bot cengbot-admin cengbot-monitor
-# frontend changes: rebuild and copy (or re-run deploy_production.sh)
-(cd admin_frontend && npm install && npm run build) && sudo cp -a admin_frontend/build/. /var/www/cengbot/
+# frontend changes: re-run deploy_production.sh, or rebuild with the same API URL and replace the web root
+(cd admin_frontend && npm install && REACT_APP_API_URL=/api npm run build) \
+  && sudo find /var/www/cengbot -mindepth 1 -delete && sudo cp -a admin_frontend/build/. /var/www/cengbot/
 ```
 
 In manual mode use `./scripts/stop_system.sh` and `./scripts/start_system.sh
@@ -274,6 +295,7 @@ together with the next retrain, after testing on the GPU.
 | Bot logs `409 Conflict` / "Telegram connectivity problem: Conflict" | Another poller uses the token: a second instance, the legacy or the standalone bot (`./scripts/health_check.sh` warns) |
 | Users always get the fallback reply | Worker not running or still loading; `sudo rabbitmqctl list_queues` (growing `questions` queue) |
 | Panel: login fails | Password set and ASCII? API restarted after editing `.env`? |
-| Panel: network errors | `REACT_APP_API_URL` used at build time; `CORS_ORIGINS` contains the panel origin (when the API is on another origin) |
+| Panel: network errors | `REACT_APP_API_URL` used at build time (`PANEL_API_URL` for the deploy script, default `/api`); `CORS_ORIGINS` contains the panel origin (when the API is on another origin) |
+| `npm run build` fails / panel not started | `node --version` must be 22.13+ or 24+ for the service user (nvm: `~/.nvm/nvm.sh` is loaded by the deploy script) |
 | `start_system.sh`: `... is active (systemd mode)` | The units are running; use `systemctl` instead of the script |
 | Database | `.venv/bin/python -c "import sqlite3; print(sqlite3.connect('university_bot.db').execute('PRAGMA integrity_check').fetchone())"` |

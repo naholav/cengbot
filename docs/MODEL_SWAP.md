@@ -19,13 +19,26 @@ running.
 >   it (`switch_model.sh current` warns about it). Normally leave it empty.
 > - `LORA_MODEL_PATH` is **legacy and ignored**. The worker logs a warning if it
 >   points somewhere else; delete the line.
-> - Loading is **offline-first**. The base model (`meta-llama/Llama-3.2-3B`)
->   comes from `model_cache/` (or the default Hugging Face cache) with
->   `local_files_only=True`; huggingface.co is contacted only if files are
->   missing and downloads are allowed. In production set
->   `MODEL_ALLOW_DOWNLOAD=false` or `HF_HUB_OFFLINE=1`: a model whose base is not
->   cached then fails to load instead of downloading, and `validate` warns about
->   this in advance.
+> - Loading is **offline-first**. The base model named in the adapter
+>   (today `meta-llama/Llama-3.2-3B`) comes from `model_cache/` (or the default
+>   Hugging Face cache) with `local_files_only=True`; huggingface.co is
+>   contacted only if files are missing and downloads are allowed. In
+>   production set `MODEL_ALLOW_DOWNLOAD=false` or `HF_HUB_OFFLINE=1`: a model
+>   whose base is not cached then fails to load instead of downloading, and
+>   `validate` warns about this in advance.
+> - `MODEL_LOAD_IN_4BIT=true` loads the base model in 4-bit NF4 (bitsandbytes,
+>   CUDA only) for bases that do not fit in bf16, about 12B and larger on a
+>   24 GB GPU. It is slower, and the LoRA adapter then stays unmerged. Default
+>   `false`.
+> - `MODEL_TRUST_REMOTE_CODE=true` **executes Python code from the model
+>   repository** (training and inference). Only legacy remote-code models such
+>   as `THUDM/chatglm3-6b` or `internlm/internlm2_5-7b-chat` need it; leave it
+>   `false` (the default) for every family in the table below.
+> - `LORA_TARGET_MODULES` (training only; `--lora-target-modules` wins):
+>   `auto` (default) adapts `q/k/v/o/gate/up/down_proj` when the model has all
+>   of them, otherwise every linear layer (`all-linear`, for the fused
+>   projections of Phi-3/4 and GLM); `all-linear`; or a comma-separated list of
+>   module names.
 
 All commands run from the project root. The scripts find the project from
 their own location, so they also work from any other directory.
@@ -60,6 +73,9 @@ Check that `MODEL_PATH` is empty in `.env` (see above).
   `src/train_model.py`, for example `--epochs 3`, `--lr 1e-4`,
   `--load-in-4bit`, `--semantic-dedup`, `--output-name NAME`. See
   `.venv/bin/python src/train_model.py --help` for the full list.
+- **Base model.** `--base-model ID|DIR` (default `BASE_MODEL_NAME` from `.env`,
+  else `meta-llama/Llama-3.2-3B`). For another family see
+  [Retrain on a different base model](#retrain-on-a-different-base-model).
 - **GPU memory.** If the AI worker is running, `train_model.sh` warns that it
   shares the GPU with training. If the GPU cannot hold both, stop the worker
   first (systemd: `sudo systemctl stop cengbot-worker`; manual mode:
@@ -104,7 +120,11 @@ A valid model directory is **one of**:
 | Type | Required files |
 |---|---|
 | LoRA adapter (normal case) | `adapter_config.json` + `adapter_model.safetensors`, directly in the directory or in `method1/` (the legacy layout of `final-best-model-v1`). Optional: tokenizer files, `training_info.json`. The base model comes from `base_model_name_or_path` in `adapter_config.json` (fallback `BASE_MODEL_NAME`). |
-| Full / merged model | `config.json` + `*.safetensors` (or `pytorch_model*.bin`) + `tokenizer.json` or `tokenizer.model` |
+| Full / merged model | `config.json` + `*.safetensors` (or `pytorch_model*.bin`) + tokenizer files (`tokenizer.json`, `tokenizer.model`, or `vocab.json` + `merges.txt`) |
+
+Any architecture that the installed transformers supports natively works
+(Llama, Qwen, DeepSeek distills, Mistral, Gemma, Phi, GLM, ...). `validate`
+also checks that.
 
 `adapter_model.bin` alone is **not** accepted by `switch_model.sh`. Re-save the
 adapter with `save_pretrained(..., safe_serialization=True)`.
@@ -117,8 +137,9 @@ adapter with `save_pretrained(..., safe_serialization=True)`.
 ```
 
 `validate` checks the files above, that the JSON files parse, that every
-safetensors header fits its file (this catches truncated or half-copied files)
-and whether the base model is cached in `model_cache/`. It reads nothing big and
+safetensors header fits its file (this catches truncated or half-copied files),
+whether the base model is cached in `model_cache/` and whether the installed
+transformers supports its architecture. It reads nothing big and
 changes nothing. Exit code 0 means valid; warnings (for example "base model ...
 is not cached") do not make it fail.
 
@@ -173,7 +194,7 @@ however, get the bot's fallback reply in Telegram, because the bot waits only
 ```bash
 ./scripts/switch_model.sh current          # symlink target + validation (exit code 1 if invalid)
 tail -f logs/worker.log                    # in systemd mode the units also write to this file
-#   expect: "Loading lora model .../models/final-best-model-v2 (base=meta-llama/Llama-3.2-3B, cached=True, ...)"
+#   expect: "Loading lora model .../models/final-best-model-v2 (base=<base model>, cached=True, ...)"
 #           "Model final-best-model-v2 loaded in ...s"
 #           "Connected to RabbitMQ (questions=questions, answers=answers)"
 #           "Waiting for questions on 'questions'..."
@@ -193,6 +214,11 @@ Every answer stores the name of the model that produced it in
 .venv/bin/python -c "import sqlite3; c=sqlite3.connect('university_bot.db'); print(c.execute('SELECT id, model_version, answered_at FROM raw_data ORDER BY id DESC LIMIT 5').fetchall())"
 ```
 
+**Benchmark.** `.venv/bin/python benchmark/run_benchmark.py --label <name>`
+scores the active model on the 100-question benchmark and adds it to
+[`benchmark/LEADERBOARD.md`](../benchmark/LEADERBOARD.md); see step 9 of
+[Retrain on a different base model](#retrain-on-a-different-base-model).
+
 ## 6. Geri al / Rollback
 
 ```bash
@@ -204,12 +230,89 @@ Every answer stores the name of the model that produced it in
 `rollback` swaps the current and the previous model, so running it twice brings
 you back. It only accepts models inside `models/`.
 
+## Retrain on a different base model
+
+The production model is Llama-3.2-3B + LoRA, but nothing in training,
+validation, switching or inference is tied to Llama. Train a LoRA adapter on
+another open-weight base and swap it in like any other model; the adapter
+records its base (`base_model_name_or_path`), so the worker loads the right
+one. Family details are handled in code: the stop tokens of each family, BOS
+handling, `<think>` blocks of reasoning models (removed from answers), LoRA
+target modules (`auto`) and eager attention for Gemma training. The prompt is
+the same plain `Öğrenci:` / `Student:` template for every family (no chat
+template), so instruct and base checkpoints both work.
+
+```bash
+./scripts/switch_model.sh current                      # 1. note the rollback target
+
+# 2. Gated base (Llama, Gemma, most Mistral): accept the licence on huggingface.co and set
+#    HUGGING_FACE_TOKEN in .env. The first run downloads the base into model_cache/ once
+#    (MODEL_ALLOW_DOWNLOAD not false, HF_HUB_OFFLINE unset). Optional: BASE_MODEL_NAME=<base> in .env.
+#    Legacy remote-code repositories only: MODEL_TRUST_REMOTE_CODE=true in .env (training and worker).
+BASE=Qwen/Qwen2.5-7B-Instruct
+
+./scripts/train_model.sh --dry-run --base-model "$BASE"   # 3. data + tokenization check (fetches only the tokenizer)
+sudo systemctl stop cengbot-worker                        # 4. 7B+: free the GPU (manual mode: ./scripts/stop_system.sh)
+./scripts/train_model.sh --yes --base-model "$BASE" --load-in-4bit   # 5. train; <= 4B: drop --load-in-4bit
+./scripts/switch_model.sh validate final-best-model-v2   # 6. validate
+
+# 7. Base of ~12B or more: MODEL_LOAD_IN_4BIT=true in .env (4-bit inference).
+
+./scripts/switch_model.sh switch final-best-model-v2 --yes   # 8. switch ...
+sudo systemctl start cengbot-worker                          #    ... start the worker again if you stopped it (manual mode: ./scripts/start_system.sh)
+./scripts/switch_model.sh current; tail -f logs/worker.log   #    ... verify (section 5)
+#    bad answers? ./scripts/switch_model.sh rollback --yes
+
+.venv/bin/python benchmark/run_benchmark.py --label v2-qwen2.5-7b   # 9. score the new model
+```
+
+**Step 9, benchmark.** Score every new model on the fixed 100-question
+benchmark and compare it with the earlier runs on
+[`benchmark/LEADERBOARD.md`](../benchmark/LEADERBOARD.md) (current baseline:
+Llama-3.2-3B + LoRA v1.2, 30.2/100 deterministic). The benchmark loads its own
+copy of the model: a 3-4B model fits next to the running worker; for a 7B+
+model run it before step 8, while the worker is still stopped, with
+`--model-path models/final-best-model-v2`, which also shows the score before any
+user sees the new model. Before retraining, refresh the links in the training
+data: the v1.2 answers often point to wrong or dead pages
+([README: Benchmark](../README.md#-benchmark), [benchmark/README.md](../benchmark/README.md)).
+
+### Families
+
+"Gated" means: accept the licence on the model page and set
+`HUGGING_FACE_TOKEN` before the first download. Licences change, so check the
+model page.
+
+| Family | Example Hugging Face ids | On a 24 GB GPU (RTX 3090) | Gated | Notes |
+|---|---|---|---|---|
+| Llama 3.x | `meta-llama/Llama-3.2-3B` (current), `meta-llama/Llama-3.1-8B-Instruct` | 3B: bf16. 8B: train with `--load-in-4bit`, inference bf16 (~16 GB) | yes | explicit LoRA targets |
+| Qwen2.5 / Qwen3 | `Qwen/Qwen2.5-7B-Instruct`, `Qwen/Qwen3-8B`, `Qwen/Qwen2.5-14B-Instruct` | ≤ 4B: bf16. 7-8B: QLoRA + bf16 inference. 14B: QLoRA + `MODEL_LOAD_IN_4BIT=true` | no | no BOS token (handled); `<think>` blocks removed |
+| DeepSeek-R1 distills | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B`, `deepseek-ai/DeepSeek-R1-Distill-Llama-8B` | QLoRA + bf16 inference | no | Qwen2 / Llama architecture; a reasoning model, not ideal for short answers |
+| Mistral | `mistralai/Mistral-7B-Instruct-v0.3`, `mistralai/Mistral-Nemo-Instruct-2407` (12B) | 7B: QLoRA + bf16 inference. 12B: QLoRA + 4-bit inference | most | |
+| Gemma 2 / 3 | `google/gemma-2-2b-it`, `google/gemma-2-9b-it`, `google/gemma-3-1b-it` | 2B: bf16. 9B: QLoRA; inference bf16 (~19 GB, tight) or 4-bit | yes | BOS required (handled); eager attention for training; large vocabulary: `--batch-size 2 --grad-accum 32`; Gemma 3 4B+ (multimodal) untested |
+| Phi-3.5 / Phi-4 | `microsoft/Phi-3.5-mini-instruct`, `microsoft/Phi-4-mini-instruct`, `microsoft/phi-4` (14B) | mini: bf16. 14B: QLoRA + 4-bit inference | no | fused projections: `auto` uses all-linear |
+| GLM-4 | `THUDM/glm-4-9b-chat-hf`, `THUDM/GLM-4-9B-0414` | QLoRA; inference bf16 (~19 GB) or 4-bit | check | all-linear; the non-`-hf` `glm-4-9b-chat` and `chatglm3` need remote code |
+| Granite 3.x | `ibm-granite/granite-3.3-2b-instruct`, `ibm-granite/granite-3.3-8b-instruct` | 2B: bf16. 8B: QLoRA + bf16 inference | no | |
+| OLMo 2 | `allenai/OLMo-2-0425-1B-Instruct`, `allenai/OLMo-2-1124-7B-Instruct` | 1B: bf16. 7B: QLoRA + bf16 inference | no | |
+| Falcon3 | `tiiuae/Falcon3-3B-Instruct`, `tiiuae/Falcon3-7B-Instruct`, `tiiuae/Falcon3-10B-Instruct` | 3B: bf16. 7-10B: QLoRA; 10B: 4-bit inference | no | Llama architecture |
+| SmolLM2 / 3 | `HuggingFaceTB/SmolLM2-1.7B-Instruct`, `HuggingFaceTB/SmolLM3-3B` | bf16 | no | weak Turkish |
+| Legacy remote code | `THUDM/chatglm3-6b`, `internlm/internlm2_5-7b-chat` | `--trust-remote-code` + `MODEL_TRUST_REMOTE_CODE=true` | - | executes repository code: not recommended |
+
+Rule of thumb: bf16 inference fits up to about 9-10B parameters; from about
+12B set `MODEL_LOAD_IN_4BIT=true`. Stop the worker while training a 7B+ base.
+For reference, a short QLoRA run on Llama-3.2-3B peaked at 4.5 GiB of GPU
+memory, and 4-bit inference of the same model at 2.3 GiB.
+
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | `NOT a valid model directory` | The lines below it list the missing or broken files. Copy the model again. |
-| `base model ... is not cached in model_cache/` (warning) | Loading needs network access plus `HUGGING_FACE_TOKEN` with access to the gated Llama model, and is impossible with `MODEL_ALLOW_DOWNLOAD=false` / `HF_HUB_OFFLINE=1`. Download the base model once, or use a model trained on the cached `meta-llama/Llama-3.2-3B`. |
+| `base model ... is not cached in model_cache/` (warning) | The first load or training run downloads the base once: it needs network access, downloads must be allowed (`MODEL_ALLOW_DOWNLOAD` not `false`, `HF_HUB_OFFLINE` unset), and a gated base (Llama, Gemma, most Mistral) also needs `HUGGING_FACE_TOKEN` with the licence accepted. Afterwards everything runs offline. |
+| Base not cached, but the server must stay offline (any family, e.g. a Qwen or Phi model) | Download it once on a machine with network access, for example `.venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-7B-Instruct', cache_dir='model_cache')"`, and copy the directory `model_cache/models--<org>--<name>` into the server's `model_cache/`. Or switch to a model whose base is already cached. |
+| `architecture '...' is not supported by the installed transformers` (warning), or the worker logs `this transformers version does not support the architecture` | The base is newer than the installed transformers (`config/requirements.txt` pins `<5`). Use a natively supported model from the table above, or upgrade transformers and test on the GPU before switching. |
+| `ships custom code (auto_map): loading it needs MODEL_TRUST_REMOTE_CODE=true` (warning), or the worker logs `needs custom code from its repository` | The repository needs remote code. Prefer a checkpoint that is native in transformers (for GLM the `-hf` or `-0414` variant). Only for a repository you trust: `MODEL_TRUST_REMOTE_CODE=true` in `.env` (and `--trust-remote-code` for training); this executes the repository's Python code. |
+| `CUDA out of memory` while training | Stop the worker first, train with `--load-in-4bit`, and/or use `--batch-size 2 --grad-accum 32` (same effective batch). |
 | `The AI worker exited right after starting` | Check `logs/worker.log`, then `./scripts/switch_model.sh rollback --yes`. |
 | Worker keeps logging `Model load failed ... Retrying in Ns` | The worker retries with exponential backoff (5 s up to 300 s) instead of exiting. Fix the cause shown in the log, or roll back. |
 | `models/active-model exists and is NOT a symlink` | Someone replaced the link with a directory. Move it away (`mv models/active-model models/<name>`), then `switch <name>`. |
@@ -242,4 +345,5 @@ scripts/switch_model.sh [options] <command> [model]
 | `--move` | Move instead of copy an outside model (same filesystem only; otherwise it is copied) |
 
 Environment: `CENGBOT_ROOT` (project root), `CENGBOT_PYTHON` (interpreter used
-for validation), `CENGBOT_NO_RESTART=1`.
+for validation), `CENGBOT_NO_RESTART=1`; `BASE_MODEL_NAME`, `MODEL_CACHE_DIR`
+and `MODEL_TRUST_REMOTE_CODE` are read from the environment or `.env`.

@@ -11,13 +11,15 @@ worker loads the model.
 | Telegram bot | `src/telegram_bot_rabbitmq.py` | Receives questions, publishes them, delivers answers, records votes | `logs/bot.log` |
 | AI worker | `src/ai_model_worker.py` | Consumes questions, runs the prompt guard and the model, stores and publishes answers | `logs/worker.log` |
 | Admin API | `src/admin_rest_api.py` | FastAPI backend of the admin panel (port 8001) | `logs/admin.log` |
-| Admin panel | `admin_frontend/` | React + TypeScript + Ant Design (dev server on port 3000, or a static build) | `logs/frontend.log` |
+| Admin panel | `admin_frontend/` | React + TypeScript + Ant Design, built with Vite (dev server on `localhost:3000`, or the static build served by nginx) | `logs/frontend.log` |
 | System monitor | `src/system_monitor.py` | Host, database, process and log-size metrics and alerts (systemd unit only) | `logs/monitor.log`, `logs/system_monitor.log` |
 | RabbitMQ | system service (`rabbitmq-server`) | Durable queues `questions` and `answers` | RabbitMQ's own logs |
 
 They are started either by `scripts/start_system.sh` (manual mode: worker, API,
-bot, React dev server) or by the systemd units `cengbot-worker`, `cengbot-bot`,
+bot, Vite dev server) or by the systemd units `cengbot-worker`, `cengbot-bot`,
 `cengbot-admin` and `cengbot-monitor` installed by `scripts/optimize_linux.sh`.
+In production `scripts/deploy_production.sh` serves the built panel with nginx,
+which proxies `/api/` to the Admin API on `127.0.0.1:8001`.
 
 Other entrypoints, **not for production**:
 
@@ -29,6 +31,54 @@ Never run either of them next to the production bot: they poll Telegram with
 the same token (Telegram answers the second poller with `409 Conflict`), and the
 legacy bot would also consume the same `answers` queue. `start_system.sh` and
 `stop_system.sh` stop them if they are running; `health_check.sh` warns about them.
+
+The whole system at a glance (the request path in detail follows below):
+
+```mermaid
+flowchart TB
+    users(["Telegram users<br/>department group"])
+    db[("SQLite<br/>university_bot.db")]
+
+    subgraph serving["Answering a question"]
+        bot["Production bot<br/>telegram_bot_rabbitmq.py"]
+        mq[["RabbitMQ<br/>questions / answers queues"]]
+        worker["AI worker<br/>ai_model_worker.py"]
+        guard{{"Prompt guard<br/>TR + EN"}}
+        model["Model: LoRA adapter on its base<br/>models/active-model symlink<br/>now Llama-3.2-3B + v1.2"]
+    end
+
+    subgraph adminside["Admin"]
+        panel["Admin panel<br/>React + Vite"]
+        proxy["nginx /api/<br/>production"]
+        api["Admin API<br/>FastAPI, Basic auth"]
+    end
+
+    subgraph retrain["Review and retrain loop"]
+        approve["Admin approval<br/>in the panel"]
+        td["training_data"]
+        exp["Export<br/>export_training_data.sh"]
+        aug["Augmentation<br/>Claude API, optional"]
+        trainer["train_model.py"]
+        newmodel["models/final-best-model-vN"]
+        sw["switch_model.sh"]
+        bench["Benchmark<br/>run_benchmark.py"]
+    end
+
+    users <-->|"question / answer + 👍 👎"| bot
+    bot <--> mq
+    mq <--> worker
+    worker --> guard
+    guard -->|allowed| model
+    bot -->|"questions, votes"| db
+    worker -->|answers| db
+    panel --> proxy
+    proxy --> api
+    api <--> db
+    db -->|"answers + votes"| approve
+    approve --> td --> exp --> aug --> trainer --> newmodel --> sw
+    sw -->|"repoints active-model"| model
+    model -.->|"score each new model"| bench
+```
 
 ## 🔄 Data Flow
 
@@ -119,8 +169,15 @@ legacy bot would also consume the same `answers` queue. `start_system.sh` and
   The symlink is resolved, and the directory must be either a PEFT LoRA adapter
   (`adapter_config.json` + weights, directly or in the legacy `method1/`
   sub-directory) or a full Hugging Face model. `LORA_MODEL_PATH` is ignored.
+- **Any family.** The base can be any causal LM that the installed
+  transformers supports natively (Llama, Qwen, DeepSeek distills, Mistral,
+  Gemma, Phi, GLM, Granite, OLMo, Falcon3, SmolLM, ...); today it is
+  `meta-llama/Llama-3.2-3B`. Code from a model repository is executed only with
+  `MODEL_TRUST_REMOTE_CODE=true` (legacy remote-code models; off by default).
+  An unsupported architecture or a model that needs remote code fails with a
+  clear `ModelLoadError` instead of a transformers traceback.
 - **Offline-first.** The base model named in `adapter_config.json`
-  (`meta-llama/Llama-3.2-3B`; fallback `BASE_MODEL_NAME`) is looked up in
+  (fallback `BASE_MODEL_NAME`) is looked up in
   `MODEL_CACHE_DIR` (`model_cache/`) and in the default Hugging Face cache and
   loaded with `local_files_only=True`. Only if that fails, and downloads are
   allowed (not `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`, `MODEL_ALLOW_DOWNLOAD`
@@ -128,6 +185,9 @@ legacy bot would also consume the same `answers` queue. `start_system.sh` and
 - **Loading.** bfloat16 on CUDA by default (`MODEL_PRECISION`, `USE_CUDA`;
   float32 on CPU). The LoRA weights are merged into the base weights at load
   time for faster decoding (`MODEL_MERGE_LORA`, default true).
+  `MODEL_LOAD_IN_4BIT=true` loads the base in 4-bit NF4 instead (bitsandbytes,
+  for bases of about 12B and more on a 24 GB GPU); the adapter then stays
+  unmerged.
 - **Prompt.** The template the adapter was trained with
   (`MODEL_PROMPT_STYLE=training`, default):
   `"{system prompt}\n\nÖğrenci: {question}\nAsistan:"` for Turkish and
@@ -138,9 +198,12 @@ legacy bot would also consume the same `answers` queue. `start_system.sh` and
   question is shortened, never the template.
 - **Generation.** Up to `MODEL_MAX_NEW_TOKENS` (200) new tokens (30 for
   greetings), sampling with `MODEL_TEMPERATURE` / `MODEL_TOP_P` / `MODEL_TOP_K`,
-  `MODEL_REPETITION_PENALTY`. Generation stops at EOS, at a new dialogue turn
-  marker, or after `MODEL_MAX_SENTENCES` (4) sentences; the answer keeps at most
-  one question sentence.
+  `MODEL_REPETITION_PENALTY`. Generation stops at every end-of-turn token the
+  tokenizer and model know (EOS, `generation_config.eos_token_id` and the
+  family tokens such as `<|eot_id|>`, `<|im_end|>`, `<end_of_turn>`), at a new
+  dialogue turn marker, or after `MODEL_MAX_SENTENCES` (4) sentences; the
+  answer keeps at most one question sentence. `<think>` blocks of reasoning
+  models are removed.
 
 ## 🛡️ Prompt Guard
 
@@ -189,7 +252,9 @@ compared with older training answers (threshold 0.85). The admin API's
 ```
 university_bot.db --(database_to_training.py)--> data/cengbot_qa_augmented.jsonl --+
                      (data_augmentation.py: optional, adds variants)                +--> train_model.py --> models/final-best-model-v<N>/
-data/merged_qa_data.jsonl (base corpus) --------------------------------------------+
+data/merged_qa_data.jsonl (base corpus) --------------------------------------------+        |
+                                                                                             v
+                                            switch_model.sh --> models/active-model --> benchmark/run_benchmark.py
 ```
 
 - `src/database_to_training.py` exports active, non-rejected training rows (one
@@ -203,13 +268,20 @@ data/merged_qa_data.jsonl (base corpus) ----------------------------------------
   inference prompt and masks the prompt so the loss covers the answer and the
   EOS token only, trains the LoRA adapter (Hugging Face Trainer, early stopping,
   separate Turkish and English validation loss) and writes the model directory
-  atomically. It never changes the active model.
+  atomically. It never changes the active model. The base is `--base-model`
+  (default `BASE_MODEL_NAME`); `--load-in-4bit` trains QLoRA for 7-12B bases;
+  `--lora-target-modules auto` adapts `q/k/v/o/gate/up/down_proj`, or every
+  linear layer for models with fused projections (Phi, GLM); Gemma is trained
+  with eager attention.
+- `benchmark/run_benchmark.py` scores a model on 100 verified Turkish and
+  English questions through the production path (prompt guard, handler) and
+  updates `benchmark/LEADERBOARD.md`; see [benchmark/README.md](../benchmark/README.md).
 
 ## 📝 Logging and Monitoring
 
 | File | Written by | Rotation |
 |---|---|---|
-| `logs/worker.log`, `bot.log`, `admin.log`, `frontend.log`, `monitor.log` | stdout/stderr of the services (shell redirect or systemd `StandardOutput=append:`) | logrotate (`config/logrotate/cengbot.conf`: 50 MB, 5 compressed generations, `copytruncate`) + start-time safety net in `scripts/_common.sh` |
+| `logs/worker.log`, `bot.log`, `admin.log`, `frontend.log`, `monitor.log` | stdout/stderr of the services (shell redirect or systemd `StandardOutput=append:`) | logrotate (`config/logrotate/cengbot.conf`: 50 MB, 5 compressed generations, `copytruncate`; `scripts/rotate_logs.sh` first tail-trims logs above 1 GiB) + start-time safety net in `scripts/_common.sh` |
 | `logs/error.log` | `src/error_handler.py` (first occurrence of an error with its full traceback; identical errors within `ERROR_DEDUP_WINDOW`, 300 s, as one line with a repeat counter) | Python `RotatingFileHandler`, 10 MB × 5 |
 | `logs/system_monitor.log`, `logs/monitoring/*.jsonl` | `src/system_monitor.py` (service mode) | Python `RotatingFileHandler` (10 MB × 3); JSONL entries older than 30 days are dropped |
 | `logs/excel_export.log`, `deployment.log`, `optimization.log` | the corresponding scripts | logrotate |
@@ -234,18 +306,25 @@ resources, log sizes), `GET /health` on the Admin API, and
   HTML-escaped in replies; callback data is validated and checked against the
   stored message id.
 - **Model**: blocked prompts never reach the model; offline loading can be
-  enforced with `MODEL_ALLOW_DOWNLOAD=false` or `HF_HUB_OFFLINE=1`.
+  enforced with `MODEL_ALLOW_DOWNLOAD=false` or `HF_HUB_OFFLINE=1`; code from a
+  model repository runs only with `MODEL_TRUST_REMOTE_CODE=true`.
 - **Scripts**: root actions use interactive `sudo` (no stored passwords),
   system-wide changes are shown and confirmed first, and only processes of this
-  project are stopped.
+  project are stopped. Services started by the scripts never inherit the locks
+  of `train_model.sh` or `switch_model.sh`.
 
 ## 🔧 Technology Stack
 
 - **Backend:** Python 3.11, FastAPI + uvicorn, SQLAlchemy 2.0 + SQLite, pika
   (RabbitMQ), python-telegram-bot 20.7
 - **ML:** PyTorch, transformers, PEFT, accelerate, datasets, bitsandbytes
-  (optional 4-bit training), langdetect, sentence-transformers (optional)
-- **Frontend:** React 18, TypeScript, Ant Design 5, TanStack Query, axios,
-  Create React App (`react-scripts`)
-- **Operations:** bash scripts, systemd, logrotate, nginx (via
-  `scripts/deploy_production.sh`)
+  (QLoRA training and optional 4-bit inference), langdetect,
+  sentence-transformers (optional); base model today Llama-3.2-3B, any
+  natively supported open-weight family possible
+- **Frontend:** React 18, TypeScript 5.9, Ant Design 5, TanStack Query, axios;
+  Vite 8 (dev server and build), Vitest 5 + Testing Library (tests); Node.js
+  22.13+ or 24+
+- **Evaluation:** `benchmark/` (deterministic grader, optional LLM judge via
+  the Claude API)
+- **Operations:** bash scripts, systemd, logrotate, nginx (static panel and
+  `/api/` proxy, via `scripts/deploy_production.sh`)

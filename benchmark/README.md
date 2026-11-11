@@ -1,6 +1,6 @@
 # CengBot benchmark
 
-A fixed, verified question set plus a grader, so that every model (LLaMA-3.2-3B + LoRA today; Qwen, Gemma,
+A fixed, verified question set plus a grader, so that every model (Llama-3.2-3B + LoRA today; Qwen, Gemma,
 Mistral, ... after retraining) is scored the same way and can be compared on
 [`LEADERBOARD.md`](LEADERBOARD.md).
 
@@ -71,7 +71,9 @@ Difficulty: 22 easy, 58 medium, 20 hard.
 
 ## Running
 
-GPU jobs must hold the shared GPU lock (`flock <lock file> <command>`).
+The runner loads its own copy of the model on the GPU: a 3-4B model fits next to the running AI worker, a
+7B+ model needs the worker stopped. The examples serialise GPU jobs with `flock` on a shared lock file; drop
+the prefix if nothing else uses the GPU.
 
 ```bash
 # the production model (models/active-model), LLM judge if a valid API key is configured

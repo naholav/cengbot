@@ -2,8 +2,11 @@
 
 ## 🚀 Setup
 
-Requirements: Python 3.11, Node.js 18+ and npm, RabbitMQ, and a CUDA GPU if
-you want to run the real model (the tests do not need one).
+Requirements: Python 3.11, **Node.js 22.13+ or 24+** and npm (Vite 8 and
+Vitest 5 need it; Ubuntu's apt package is too old, use
+[nvm](https://github.com/nvm-sh/nvm) or [nodejs.org](https://nodejs.org)),
+RabbitMQ, and a CUDA GPU if you want to run the real model (the tests do not
+need one).
 
 ```bash
 git clone https://github.com/naholav/cu_ceng_bot.git
@@ -24,15 +27,16 @@ installing it never upgrades torch or transformers in an existing environment.
 
 ## ▶️ Running the components
 
-All at once: `./scripts/start_system.sh` (`--no-frontend` without the React
-dev server), stop with `./scripts/stop_system.sh`. Or one by one, from the
+All at once: `./scripts/start_system.sh` (`--no-frontend` without the Vite
+dev server; with a missing or too old Node.js it skips the panel and prints an
+install hint), stop with `./scripts/stop_system.sh`. Or one by one, from the
 project root:
 
 ```bash
 .venv/bin/python src/ai_model_worker.py          # needs RabbitMQ + the model (GPU)
 .venv/bin/python src/telegram_bot_rabbitmq.py    # needs RabbitMQ + TELEGRAM_BOT_TOKEN
 .venv/bin/python src/admin_rest_api.py           # http://localhost:8001 (API_RELOAD=true for auto-reload)
-(cd admin_frontend && npm start)                 # http://localhost:3000
+(cd admin_frontend && npm start)                 # Vite dev server, http://localhost:3000 (localhost only)
 ```
 
 Use a **separate test bot token** and test group for development: two pollers
@@ -59,7 +63,8 @@ src/                 application code; modules import each other WITHOUT a "src.
 config/env_loader.py .env loading and typed settings
 scripts/             bash tools; all source scripts/_common.sh
 tests/               pytest suite
-admin_frontend/src/  React + TypeScript (Ant Design, TanStack Query, axios)
+admin_frontend/src/  React + TypeScript (Ant Design, TanStack Query, axios), built with Vite
+benchmark/           benchmark questions, grader and runner (see benchmark/README.md)
 ```
 
 - **Configuration** goes through `config/env_loader.py`. It loads `.env` once
@@ -118,22 +123,48 @@ harmless question.
 `save_final_model` in `src/train_model.py` must agree on the contract in
 [MODEL_SWAP.md](MODEL_SWAP.md).
 
-**Frontend.** `npm start` reads `REACT_APP_API_URL` (default
-`http://localhost:8001`) and `REACT_APP_ADMIN_USERNAME` at build time, from
-the shell or `admin_frontend/.env.local`. The dev server origin
-`http://localhost:3000` is in the default `CORS_ORIGINS`. Credentials are kept
-in memory and `sessionStorage` only (`src/services/api.ts`); keep it that way.
+**Frontend.** The panel is built with Vite (`admin_frontend/vite.config.ts`,
+entry page `admin_frontend/index.html`):
+
+```bash
+cd admin_frontend
+npm start               # dev server, http://localhost:3000 (localhost only; npm start -- --host to expose it)
+npm run build           # tsc --noEmit + vite build -> build/ (no source maps)
+npm run preview         # serve build/ on http://localhost:3000
+npm test                # Vitest, once
+npm run test:watch      # Vitest, watch mode
+npm run typecheck       # tsc --noEmit
+```
+
+`REACT_APP_API_URL` (default `http://localhost:8001`) and
+`REACT_APP_ADMIN_USERNAME` are read when the dev server starts or the build
+runs, from the shell or `admin_frontend/.env.local` (also `.env.development.local`
+/ `.env.production.local`); a shell variable wins. Read them through
+`import.meta.env` (typed in `src/vite-env.d.ts`); `process.env` does not exist
+in Vite. Only `REACT_APP_*` and `VITE_*` variables reach the bundle, so never
+put secrets in them. The dev server origin `http://localhost:3000` is in the
+default `CORS_ORIGINS`. Credentials are kept in memory and `sessionStorage`
+only (`src/services/api.ts`); keep it that way.
+
+**Base model families.** Family-specific behaviour lives in
+`src/llama_model_handler.py` (stop tokens in `STOP_TOKEN_CANDIDATES`, BOS and
+appended-EOS handling, 4-bit loading, remote-code errors), `src/train_model.py`
+(LoRA target modules, eager attention for Gemma) and
+`src/prompt_guard.strip_reasoning` (`<think>` blocks). Add a family to
+`tests/test_model_families.py` when you touch one of them; see
+[MODEL_SWAP.md](MODEL_SWAP.md#retrain-on-a-different-base-model).
 
 ## 🧪 Testing
 
 ```bash
-.venv/bin/python -m pytest                                  # whole suite (~940 tests)
+.venv/bin/python -m pytest                                  # whole suite (~1,400 tests)
 .venv/bin/python -m pytest tests/test_prompt_guard.py -q    # one file
 .venv/bin/python -m pytest -k switch                        # by name
 RUN_GPU_TESTS=1 .venv/bin/python -m pytest -m gpu           # opt-in: loads the real model on the GPU
 SHELLCHECK=/usr/bin/shellcheck .venv/bin/python -m pytest tests/test_shell_scripts.py
 
-cd admin_frontend && CI=true npx react-scripts test --watchAll=false   # frontend (Jest + Testing Library)
+cd admin_frontend && npm test                               # frontend (Vitest + Testing Library, jsdom)
+cd admin_frontend && npm run typecheck                      # TypeScript
 ```
 
 The Python tests run offline. `tests/conftest.py` (do not bypass it) runs
@@ -148,7 +179,8 @@ before any project module is imported and:
   fresh schema) and fails the run if the real `university_bot.db` changes.
 
 Mock pika, Telegram, torch/transformers and the Anthropic client; never load
-the real model outside tests marked `gpu`. The `gpu` test is skipped unless
+the real model outside tests marked `gpu` (tiny randomly initialised models
+built from a config are fine). The `gpu` tests are skipped unless
 `RUN_GPU_TESTS=1`; the shellcheck test is skipped unless `shellcheck` is on
 `PATH` or `SHELLCHECK` points to it. Markers are defined in `pytest.ini`
 (`gpu`, `slow`).
@@ -160,6 +192,9 @@ the real model outside tests marked `gpu`. The `gpu` test is skipped unless
 | `test_telegram_bot_rabbitmq.py` | answer router, rate limit, message splitting, votes |
 | `test_telegram_bot_legacy.py` | the legacy and standalone bots |
 | `test_llama_model_handler.py` | model resolution, offline-first loading, post-processing (+ the opt-in GPU test) |
+| `test_model_families.py` | Qwen, DeepSeek, Mistral, Gemma, Phi, GLM, ... with tiny random models: train, validate, load, generate (+ an opt-in QLoRA GPU test) |
+| `test_switch_model_families.py` | `switch_model.sh` / `train_model.sh` with non-Llama bases in a temporary project |
+| `test_benchmark.py` | question set schema, grader, LLM judge (mocked), benchmark runner with a fake model |
 | `test_prompt_guard.py` | blocked attacks and allowed questions (TR + EN) |
 | `test_training_pipeline.py` | prompt alignment, label masking, group split, export, augmentation |
 | `test_database_models.py` | schema, duplicates, votes and `like` sync |

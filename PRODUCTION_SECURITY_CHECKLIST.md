@@ -29,12 +29,12 @@ python3 -c "import hashlib,getpass; print(hashlib.sha256(getpass.getpass().encod
 - [ ] No tokens, passwords or password hashes in docs, issues or commit messages
 
 ### 3. Network
-- [ ] `API_HOST=127.0.0.1` (the code default when unset is `0.0.0.0`)
+- [ ] `API_HOST` is `127.0.0.1` (the default) - never `0.0.0.0` on a public host
 - [ ] The panel and the API are reachable only through nginx **with HTTPS**
       (HTTP Basic sends the password with every request)
 - [ ] `CORS_ORIGINS` lists only the real panel origin(s)
-- [ ] The panel is built with the right `REACT_APP_API_URL` (e.g. `/api` behind
-      the nginx site from `deploy_production.sh`)
+- [ ] The panel is built with the right `REACT_APP_API_URL` (`deploy_production.sh`
+      uses `/api` behind its nginx site; `PANEL_API_URL` overrides it)
 - [ ] Firewall: only SSH, 80 and 443 (`deploy_production.sh --with-firewall`)
 - [ ] RabbitMQ: not reachable from outside; own credentials (`RABBITMQ_USER` /
       `RABBITMQ_PASSWORD`) if it is not on localhost. The management UI
@@ -42,10 +42,14 @@ python3 -c "import hashlib,getpass; print(hashlib.sha256(getpass.getpass().encod
 
 ### 4. Model and dependencies
 - [ ] `MODEL_ALLOW_DOWNLOAD=false` or `HF_HUB_OFFLINE=1`
+- [ ] `MODEL_TRUST_REMOTE_CODE` unset or `false`. `true` executes Python code
+      from the model repository; use it only for a legacy remote-code model
+      from a repository you trust
 - [ ] `./scripts/switch_model.sh current` reports a valid model
 - [ ] `PROMPT_GUARD_ENABLED` not disabled
 - [ ] Dependencies installed from `config/requirements.txt`; audit regularly:
-      `pip install pip-audit && pip-audit -r config/requirements.txt`
+      `pip install pip-audit && pip-audit -r config/requirements.txt` and
+      `cd admin_frontend && npm audit --omit=dev`
 - [ ] Plan the ML stack upgrade (torch ≥ 2.10, transformers ≥ 4.57.6,
       accelerate ≥ 1.15) together with the next retrain, after GPU testing
       (see the comments in `config/requirements.txt`). Load only model files you
@@ -72,7 +76,9 @@ python3 -c "import hashlib,getpass; print(hashlib.sha256(getpass.getpass().encod
 - Database errors return a generic message (details only in the server log)
 - The panel keeps credentials in memory and `sessionStorage` (cleared when the
   tab closes), never in `localStorage`, and logs out on 401; production builds
-  ship without source maps
+  ship without source maps (`build.sourcemap: false` in
+  `admin_frontend/vite.config.ts`), and only `REACT_APP_*` / `VITE_*` variables
+  reach the bundle
 
 **Telegram bot**
 - Answers only in `TELEGRAM_ALLOWED_CHAT_ID`; private chats and other groups are
@@ -86,6 +92,8 @@ python3 -c "import hashlib,getpass; print(hashlib.sha256(getpass.getpass().encod
   and over-long questions before they reach the model, and stops answers that
   leak the system prompt
 - Offline-first model loading; downloads can be disabled completely
+- Code from a model repository is never executed unless
+  `MODEL_TRUST_REMOTE_CODE=true`
 
 **Scripts**
 - No stored passwords; root actions use interactive `sudo`

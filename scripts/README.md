@@ -13,20 +13,20 @@ scripts show what they will do and ask first (`--yes` skips the question,
 
 | Script | What it does | Changes the system? |
 |---|---|---|
-| `start_system.sh` | Start worker, Admin API, Telegram bot, React dev server (manual mode) | starts processes; `sudo` only to install/start RabbitMQ |
+| `start_system.sh` | Start worker, Admin API, Telegram bot, Vite dev server of the admin panel (manual mode) | starts processes; `sudo` only to install/start RabbitMQ |
 | `stop_system.sh` | Stop the processes of **this** project (verified PIDs, never other processes) | stops processes |
-| `health_check.sh` | Services, `/health`, active model, disk/memory/GPU, log sizes, ports | read-only |
+| `health_check.sh` | Services, `/health`, active model, database file (`DATABASE_URL`), disk/memory/GPU, log sizes, ports | read-only |
 | `switch_model.sh` | List / validate / switch / roll back the active model, restart only the AI worker | `models/active-model` symlink |
-| `train_model.sh` | Checks + `src/train_model.py` + validation of the new model directory | GPU training, `models/`, `checkpoints/` |
+| `train_model.sh` | Checks + `src/train_model.py` (any base model family) + validation of the new model directory | GPU training, `models/`, `checkpoints/` |
 | `view_training_history.sh` | `list` / `view vN` / `compare vA vB` / `best` for `logs/training_history/` | read-only |
 | `export_training_data.sh` | DB -> `data/cengbot_qa_augmented.jsonl` via `src/database_to_training.py` | `data/` |
 | `augment_training_data.sh` | Claude API augmentation of the approved training data (costs money, asks first) | `data/` |
 | `export_database.sh` | DB -> Excel (`excel/`) via `src/export_to_excel.py` | `excel/` |
 | `backup_data.sh` | `backups/backup_<ts>.tar.gz` (DB snapshot, data, models, log tails) | `backups/` |
-| `rotate_logs.sh` | Size-based log rotation without root (logrotate) | `logs/` |
+| `rotate_logs.sh` | Size-based log rotation without root (logrotate; tail-trims logs above 1 GiB first) | `logs/` |
 | `test_environment.sh` | Python packages, CUDA, base model cache, datasets, active model | read-only |
 | `cleanup_system.sh` | Python caches; optional temp files / logs / node_modules / build / model cache | asks per item |
-| `setup_system.sh` | apt packages, venv (only if missing), dependencies, DB tables, `.env` | system packages |
+| `setup_system.sh` | apt packages, Node.js version check, venv (only if missing), dependencies, DB tables, `.env` | system packages |
 | `optimize_linux.sh` | sysctl, limits, GPU persistence, CPU governor, systemd units, logrotate | **system-wide**, root |
 | `deploy_production.sh` | backup, systemd units, nginx, monitoring cron, optional firewall | **system-wide**, root |
 
@@ -39,8 +39,14 @@ scripts show what they will do and ask first (`--yes` skips the question,
 ./scripts/stop_system.sh
 ```
 
-`start_system.sh` installs dependencies only when the venv / `node_modules` is
-missing, or with `--install-deps`; `--no-frontend` skips the React dev server.
+`start_system.sh` installs dependencies only when the venv / `node_modules`
+(Vite) is missing, or with `--install-deps`; `--no-frontend` skips the Vite dev
+server of the admin panel (`npm start`, `localhost:3000` only, output in
+`logs/frontend.log`). The panel needs **Node.js 22.13+ or 24+**: when Node.js
+or npm is missing or too old, the script prints an install hint (nvm or
+nodejs.org; the apt package is too old) and starts the other services without
+the panel. `setup_system.sh` checks the version the same way and never
+installs Node.js itself.
 It stops older instances of this project's services (and the legacy/standalone
 bots) first, and refuses to start when the systemd units (`cengbot-*.service`)
 are active - use one mode, not both. In manual mode a crashed service is not
@@ -48,7 +54,9 @@ restarted; for production use the systemd units
 (`sudo ./scripts/optimize_linux.sh --only services,logrotate`, then
 `sudo systemctl enable --now cengbot-worker cengbot-bot cengbot-admin cengbot-monitor`),
 which have `Restart=always`. `stop_system.sh` does not stop systemd-managed
-services; it prints the `systemctl stop` command instead.
+services; it prints the `systemctl stop` command instead. Services started by
+the scripts never inherit the lock files of `train_model.sh` or
+`switch_model.sh` (a long-running worker would otherwise hold the lock).
 
 ## Switching the model (new training -> production)
 
@@ -89,8 +97,13 @@ without changing anything. Models are never deleted. Options: `-n/--dry-run`,
   training data. The API key is read from `ANTHROPIC_API_KEY` / `CLAUDE_API_KEY`
   or asked for (hidden); it is never stored. A lock file prevents two runs at once.
 - `train_model.sh` options: `-n/--dry-run`, `-y/--yes`; `--dataset FILE...`,
-  `--models-dir DIR` and `--output-name NAME` are checked by the wrapper; every
-  other option is passed to `src/train_model.py` (`.venv/bin/python src/train_model.py --help`).
+  `--models-dir DIR`, `--output-name NAME` and `--base-model ID|DIR` are checked
+  by the wrapper; every other option is passed to `src/train_model.py`
+  (`.venv/bin/python src/train_model.py --help`), for example `--load-in-4bit`
+  (QLoRA for 7-12B bases) and `--lora-target-modules auto|all-linear|a,b,c`.
+  The wrapper warns when the base model (any Hugging Face org/name, default
+  `BASE_MODEL_NAME`) is not in `model_cache/` yet, and when a gated base would
+  need `HUGGING_FACE_TOKEN`. Other base families: [docs/MODEL_SWAP.md](../docs/MODEL_SWAP.md#retrain-on-a-different-base-model).
   Output: `models/final-best-model-v<N>/` (adapter + tokenizer +
   `training_info.json`), checkpoints in `checkpoints/<name>/`, wrapper log in
   `logs/training/auto_training_<ts>.log`. The script validates the new
@@ -108,7 +121,8 @@ without changing anything. Models are never deleted. Options: `-n/--dry-run`,
 - `export_database.sh`: default the `raw_data` table to
   `excel/cengbot_database_export_<ts>.xlsx`; keeps the 10 newest default
   exports (`KEEP_EXPORTS=N`); log in `logs/excel_export.log`.
-- `backup_data.sh`: SQLite online-backup snapshot, `data/`, `models/` (the
+- `backup_data.sh`: SQLite online-backup snapshot of the database
+  `DATABASE_URL` points to (default `university_bot.db`), `data/`, `models/` (the
   `active-model` symlink stays a symlink), small logs completely and the last
   10 MiB of big logs, `.env.example` (never `.env`). Keeps the 5 newest archives
   (`--keep N` or `KEEP_BACKUPS`). `backups/` contains user data: do not commit it.
@@ -139,8 +153,11 @@ Choose one way to run it:
   ```
 
   It runs `logrotate -s logs/.logrotate.state logs/.logrotate.conf` (the config
-  rendered with this project's path). Without logrotate installed it falls back
-  to the built-in size check below.
+  rendered with this project's path). Before that it tail-trims every service
+  log bigger than 1 GiB (`CENGBOT_LOG_PRETRIM_BYTES`) to its last 10 MiB as
+  `<name>.log.1.gz`: `copytruncate` copies the whole file first, so a runaway
+  multi-GB log would need that much free disk. Without logrotate installed it
+  falls back to the built-in size check below.
 
 * **System-wide (root)** - `sudo ./scripts/optimize_linux.sh --only logrotate`
   installs `/etc/logrotate.d/cengbot` (with `su <user> <group>`) and
@@ -173,6 +190,10 @@ systemd units `cengbot-worker`, `cengbot-bot`, `cengbot-admin`,
 | `CENGBOT_BASE_PYTHON` | interpreter used to create `.venv` (`setup_system.sh`, `start_system.sh`) |
 | `CENGBOT_NO_RESTART=1` | `switch_model.sh` never restarts the worker |
 | `CENGBOT_SERVICE_USER` | user for systemd units / logrotate `su` (default: owner of the project dir) |
+| `CENGBOT_LOG_PRETRIM_BYTES` | `rotate_logs.sh`: tail-trim logs bigger than this before logrotate (default 1 GiB) |
+| `CENGBOT_LOG_MAX_BYTES`, `CENGBOT_LOG_KEEP_BYTES`, `CENGBOT_LOG_GENERATIONS` | start-time safety net: rotate above 50 MiB, keep the last 10 MiB, 5 generations |
+| `PANEL_API_URL` | `deploy_production.sh`: API URL baked into the panel build (default `/api`; pass it as `sudo PANEL_API_URL=... ./scripts/deploy_production.sh`) |
+| `DATABASE_URL` | the SQLite database that `backup_data.sh` and `health_check.sh` use (same rules as the services) |
 | `ASSUME_YES=1` | same as `--yes` |
 | `KEEP_EXPORTS`, `KEEP_BACKUPS` | how many Excel exports / backup archives to keep |
 | `NO_COLOR=1` | no ANSI colours |

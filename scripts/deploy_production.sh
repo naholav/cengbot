@@ -300,6 +300,15 @@ start_services() {
     info "The AI worker needs a few minutes to load the model: tail -f $PROJECT_DIR/logs/worker.log"
 }
 
+# Fail BEFORE anything is stopped if the panel cannot be built: Vite needs
+# Node.js ^22.13 or >=24 for the service user (nvm is loaded by as_service_user).
+preflight_build_tools() {
+    info "Checking build prerequisites for $SERVICE_USER..."
+    if ! as_service_user "node -e 'const [a, b] = process.versions.node.split(\".\").map(Number); process.exit(a >= 24 || (a === 22 && b >= 13) ? 0 : 1)' && command -v npm >/dev/null"; then
+        error "Node.js 22.13+ (or 24+) with npm is required for $SERVICE_USER to build the admin panel. $NODE_INSTALL_HINT"
+    fi
+}
+
 main() {
     print_header "CengBot production deployment"
     sed -n '6,20p' "$0" | sed 's/^# \{0,1\}//'
@@ -313,6 +322,7 @@ main() {
         mkdir -p "$PROJECT_DIR/logs"
         touch "$LOG_FILE" && chown "$SERVICE_USER:$SERVICE_GROUP" "$LOG_FILE" 2>/dev/null || true
     fi
+    preflight_build_tools
     create_backup
     stop_services
     install_dependencies

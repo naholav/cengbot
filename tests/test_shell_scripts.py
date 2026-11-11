@@ -940,6 +940,27 @@ def test_system_scripts_dry_run_change_nothing(fake_project, script, args):
     assert snapshot(fake_project.parent) == before
 
 
+def test_deploy_checks_node_before_stopping_anything(fake_project):
+    """Vite needs Node 22.13+/24+: the deploy must fail before services are stopped,
+    not after (which would leave production down)."""
+    venv = fake_project / ".venv" / "bin"
+    venv.mkdir(parents=True)
+    (venv / "python").symlink_to(sys.executable)
+    proc = run(SCRIPTS / "deploy_production.sh", "--dry-run", root=fake_project,
+               CENGBOT_DEPLOY_BACKUP_DIR=fake_project.parent / "bk",
+               CENGBOT_SYSTEMD_DIR=fake_project.parent / "systemd")
+    assert proc.returncode == 0, out(proc)
+    text = proc.stdout
+    pre = text.find("Checking build prerequisites")
+    assert pre != -1, out(proc)
+    for later in ("backup", "Stopping"):
+        idx = text.lower().find(later.lower(), pre)
+        assert idx == -1 or idx > pre
+    body = (SCRIPTS / "deploy_production.sh").read_text(encoding="utf-8")
+    main = body[body.index("main() {"):]
+    assert main.index("preflight_build_tools") < main.index("create_backup") < main.index("stop_services")
+
+
 @pytest.mark.parametrize("script", ["optimize_linux.sh", "deploy_production.sh", "cleanup_system.sh",
                                     "setup_system.sh", "train_model.sh", "switch_model.sh"])
 def test_dangerous_scripts_require_confirmation(script):

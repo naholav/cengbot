@@ -1,0 +1,4 @@
+# This directory is for database export files
+# Excel export files are excluded from git for security
+# Database exports will be saved here with timestamps:
+# - cengbot_database_export_YYYYMMDD_HHMMSS.xlsx

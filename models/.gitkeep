@@ -1,0 +1,10 @@
+# This directory is for trained model files
+# Model files are excluded from git due to size
+# Download the trained model from HuggingFace:
+# https://huggingface.co/Naholav/cengbot-lora-tr-en-cukurova
+# 
+# Directory structure should be:
+# models/
+# ├── final-best-model-v1/
+# │   └── method1/
+# └── active-model -> final-best-model-v1

@@ -44,7 +44,9 @@ yarn-debug.log*
 yarn-error.log*
 
 # Logs
-logs/
+logs/*
+!logs/.gitkeep
+!logs/train_logs_*/
 *.log
 
 # Database
@@ -53,8 +55,10 @@ logs/
 *.sqlite3
 
 # Model cache and checkpoints
-model_cache/
-models/
+model_cache/*
+!model_cache/.gitkeep
+models/*
+!models/.gitkeep
 checkpoints/
 
 # IDE
@@ -83,8 +87,10 @@ coverage.xml
 .pytest_cache/
 
 # Project data, exports and runtime state
-data/
-excel/
+data/*
+!data/.gitkeep
+excel/*
+!excel/.gitkeep
 .pids
 .production_pids
 
@@ -107,3 +113,6 @@ backups/
 .training.lock
 .augmentation_lock
 models/.switch.lock
+
+# Published training metrics of released models (override the *.log rule above)
+!logs/train_logs_*/**

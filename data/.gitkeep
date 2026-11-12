@@ -1,0 +1,5 @@
+# This directory is for training data files
+# Files in this directory are excluded from git for security
+# Place your training data files here:
+# - merged_qa_data.jsonl
+# - any other training datasets

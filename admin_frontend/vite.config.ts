@@ -23,6 +23,20 @@ export default defineConfig({
     // The minifier drops license comments; ship the bundled packages'
     // licenses next to the bundle instead (Create React App's *.LICENSE.txt).
     license: { fileName: 'THIRD_PARTY_LICENSES.md' },
+    rolldownOptions: {
+      output: {
+        // Third-party code gets its own chunks, grouped by the screens that use
+        // it, so a release that only changes the panel's own code leaves the
+        // cached libraries valid. React changes least often and has its own
+        // chunk, which also keeps every chunk under the 500 kB warning limit.
+        codeSplitting: {
+          groups: [
+            { name: 'react', test: /[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/, priority: 2 },
+            { name: 'vendor', test: /[\\/]node_modules[\\/]/, entriesAware: true, priority: 1 },
+          ],
+        },
+      },
+    },
   },
   test: {
     environment: 'jsdom',

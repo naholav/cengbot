@@ -2,7 +2,8 @@ import React from 'react';
 import { render, screen, waitFor, within, fireEvent } from '@testing-library/react';
 import userEvent, { PointerEventsCheckLevel } from '@testing-library/user-event';
 import { InternalAxiosRequestConfig } from 'axios';
-import App, { clampPage } from './App';
+import App from './App';
+import { clampPage } from './components/Dashboard';
 import { AUTH_STORAGE_KEY, clearAuth, encodeBasicAuth, getAuthHeader } from './services/api';
 import { authHeaderOf, failOnRealRequests, MockReply, mockApi, paginated, restoreApi } from './testUtils';
 import { RawDataItem } from './types/api';
@@ -123,6 +124,20 @@ describe('App', () => {
     const first = rawDataCalls(calls)[0];
     expect(first.params).toEqual({ page: 1, page_size: 20, only_unapproved: false });
     expect(calls.every((c) => authHeaderOf(c) === HEADER)).toBe(true);
+  });
+
+  it('loads the documentation tab on demand', async () => {
+    loggedIn();
+    const calls = mockBackend();
+    render(<App />);
+    await screen.findByText('Where is the CENG building?');
+    expect(calls.some((c) => c.url === '/docs/list')).toBe(false);
+
+    await user.click(screen.getByText('Documentation'));
+
+    expect(await screen.findByText('Documentation & Logs')).toBeInTheDocument();
+    expect(await screen.findByText('No documents found')).toBeInTheDocument();
+    expect(calls.some((c) => c.url === '/docs/list')).toBe(true);
   });
 
   it('shows an error instead of an empty table when loading fails', async () => {

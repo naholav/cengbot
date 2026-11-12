@@ -363,7 +363,7 @@ def test_load_model_is_offline_first_and_safe(lora_env, loaders):
     assert base_call.args == (BASE_ID,)
     assert base_call.kwargs["local_files_only"] is True
     assert base_call.kwargs["cache_dir"] == str(lora_env["cache"])
-    assert base_call.kwargs["torch_dtype"] == torch.bfloat16
+    assert base_call.kwargs["dtype"] == torch.bfloat16
     assert base_call.kwargs["device_map"] == "auto"
     assert "token" not in base_call.kwargs
 
@@ -465,7 +465,7 @@ def test_cpu_fallback_uses_float32_without_device_map(lora_env, loaders, monkeyp
     model = h.CengBotModel()
     assert model.load_model()
     call = loaders.AutoModelForCausalLM.from_pretrained.call_args_list[0]
-    assert call.kwargs["torch_dtype"] == torch.float32 and "device_map" not in call.kwargs
+    assert call.kwargs["dtype"] == torch.float32 and "device_map" not in call.kwargs
     loaders.merged.to.assert_called_once_with(torch.device("cpu"))
     assert model.device.type == "cpu"
 
@@ -474,14 +474,14 @@ def test_use_cuda_false_forces_cpu(lora_env, loaders, monkeypatch):
     monkeypatch.setenv("USE_CUDA", "false")
     model = h.CengBotModel()
     assert model.load_model()
-    assert loaders.AutoModelForCausalLM.from_pretrained.call_args.kwargs["torch_dtype"] == torch.float32
+    assert loaders.AutoModelForCausalLM.from_pretrained.call_args.kwargs["dtype"] == torch.float32
 
 
 def test_bf16_unsupported_gpu_uses_fp16(lora_env, loaders, monkeypatch):
     monkeypatch.setattr(h.torch.cuda, "is_bf16_supported", lambda: False)
     model = h.CengBotModel()
     assert model.load_model()
-    assert loaders.AutoModelForCausalLM.from_pretrained.call_args.kwargs["torch_dtype"] == torch.float16
+    assert loaders.AutoModelForCausalLM.from_pretrained.call_args.kwargs["dtype"] == torch.float16
 
 
 def test_full_model_loading(tmp_path, monkeypatch, loaders):

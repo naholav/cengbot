@@ -1019,7 +1019,7 @@ class CengBotModel:
         return tokenizer
 
     def _load_weights(self, spec: ModelSpec, dtype, device_map):
-        kwargs: Dict[str, Any] = {"torch_dtype": dtype, "low_cpu_mem_usage": True, **self._remote_code_kwargs()}
+        kwargs: Dict[str, Any] = {"dtype": dtype, "low_cpu_mem_usage": True, **self._remote_code_kwargs()}
         if device_map is not None:
             kwargs["device_map"] = device_map
         self._quantized_4bit = False

@@ -1200,7 +1200,7 @@ def load_base_model(cfg: Optional[Config] = None, precision: Optional[Dict[str, 
     cfg = cfg or config
     precision = precision or detect_precision(cfg.force_cpu)
     source = resolve_model_source(cfg.model_name, cfg.cache_dir)
-    kwargs: Dict[str, Any] = {"torch_dtype": precision["dtype"], **source, **_remote_code_kwargs(cfg)}
+    kwargs: Dict[str, Any] = {"dtype": precision["dtype"], **source, **_remote_code_kwargs(cfg)}
     model_type = _model_type(cfg, source)
     if model_type in EAGER_ATTENTION_MODEL_TYPES:
         kwargs["attn_implementation"] = "eager"

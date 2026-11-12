@@ -18,7 +18,8 @@ script: [scripts/README.md](../scripts/README.md).
   loads `~/.nvm/nvm.sh` of the service user) or the packages from
   [nodejs.org](https://nodejs.org)
 - **RabbitMQ** (`rabbitmq-server`)
-- **NVIDIA GPU** with a working driver and CUDA for inference and training
+- **NVIDIA GPU** with driver 580 or newer (the PyTorch 2.15 wheels bundle the
+  CUDA 13 runtime; `nvidia-smi` must show CUDA 13.x) for inference and training
   (CPU works but is very slow)
 - Disk space for the base model cache (`model_cache/`), the adapters
   (`models/`), checkpoints, logs and backups

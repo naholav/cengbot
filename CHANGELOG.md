@@ -4,7 +4,16 @@ All notable changes to CengBot are listed here.
 
 ## 2026-11-12 - Verified and faster training, WAL database, late answers, det-v3 benchmark
 
-<!-- Round 2026-11-12: the lead adds the lines of the other areas (serving, benchmark, ...). -->
+### Dependencies
+
+- ML stack upgraded after GPU and benchmark checks: torch 2.15.0 (CUDA 13.2
+  wheels), transformers 4.57.6, accelerate 1.15.0, peft 0.21.2, bitsandbytes
+  0.50.2. Closes the torch `weights_only` unpickler bypass (<2.10) and the
+  accelerate sharded-checkpoint path traversal (<1.15). Same answer quality
+  and speed on v1.2 (benchmark 30.2 vs 31.4 det-v2, 36.9 vs 36.5 tok/s; all
+  CPU, GPU and live tests pass). Models load with `dtype=` (the old
+  `torch_dtype=` is deprecated). Minimums in `config/requirements.txt` follow
+  the validated versions.
 
 ### Training
 

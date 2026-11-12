@@ -33,6 +33,15 @@ ROOT = Path(__file__).resolve().parent.parent
 REAL_DB = ROOT / "university_bot.db"
 
 
+def copy_real_db(target: Path) -> None:
+    """Copy the real DB read-only; in WAL mode recent commits may still be in
+    the -wal file, so copy that too (SQLite replays it when the copy is opened)."""
+    shutil.copyfile(REAL_DB, target)
+    wal = REAL_DB.with_name(REAL_DB.name + "-wal")
+    if wal.exists():
+        shutil.copyfile(wal, target.with_name(target.name + "-wal"))
+
+
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
@@ -246,7 +255,7 @@ class TestRealSchemaCompatibility:
     @pytest.fixture
     def real_copy_engine(self, tmp_path):
         copy = tmp_path / "real_copy.db"
-        shutil.copyfile(REAL_DB, copy)  # read-only access to the real file
+        copy_real_db(copy)  # read-only access to the real file
         eng = create_engine(f"sqlite:///{copy}")
         yield eng
         eng.dispose()
@@ -262,14 +271,21 @@ class TestRealSchemaCompatibility:
                 if not col.primary_key:
                     assert bool(real_cols[name]["nullable"]) == bool(col.nullable), (table.name, name)
 
-    def test_init_db_is_noop_on_real_schema(self, real_copy_engine, monkeypatch, capsys):
+    def test_init_db_only_adds_missing_model_indexes_on_real_schema(self, real_copy_engine,
+                                                                    monkeypatch, capsys):
         before = {t: {i["name"] for i in inspect(real_copy_engine).get_indexes(t)}
                   for t in inspect(real_copy_engine).get_table_names()}
+        model = {t.name: {i.name for i in t.indexes} for t in dm.Base.metadata.sorted_tables}
         monkeypatch.setattr(dm, "engine", real_copy_engine)
         dm.init_db()
         insp = inspect(real_copy_engine)
         after = {t: {i["name"] for i in insp.get_indexes(t)} for t in insp.get_table_names()}
-        assert after == before
+        assert set(after) == set(before)  # no table added or removed
+        for table, names in after.items():
+            # init_db never drops (that is db_migrations' job) and only adds model indexes
+            assert before[table] <= names
+            assert names - before[table] <= model.get(table, set())
+            assert model.get(table, set()) <= names
 
 
 # --------------------------------------------------------------------------- #

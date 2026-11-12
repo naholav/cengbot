@@ -62,6 +62,8 @@ def _isolate(monkeypatch):
 
     monkeypatch.setattr(api, "handle_database_error", fake_handle_database_error)
     monkeypatch.setattr(api, "_gpu_info", lambda: {"available": False})
+    # Fresh failed-login limiter per test (many tests send wrong credentials).
+    monkeypatch.setattr(api, "login_rate_limiter", api.LoginRateLimiter())
     return calls
 
 
@@ -332,6 +334,10 @@ def test_cors_preflight(client):
 
     evil = client.options("/raw-data", headers={**headers, "Origin": "http://evil.example"})
     assert "access-control-allow-origin" not in evil.headers
+
+    # the panel can read the lockout / paging headers of cross-origin responses
+    exposed = client.get("/", headers={"Origin": allowed}).headers["access-control-expose-headers"]
+    assert {"Retry-After", "X-Total-Count"} <= {h.strip() for h in exposed.split(",")}
 
 
 # --------------------------------------------------------------------------- #
@@ -632,12 +638,107 @@ def test_duplicates_groups(client, db_session):
     db_session.commit()
     add_votes(db_session, b.id, [1])
 
-    groups = client.get("/duplicates", auth=AUTH).json()
+    resp = client.get("/duplicates", auth=AUTH)
+    groups = resp.json()
+    assert resp.headers["X-Total-Count"] == "1"
     assert len(groups) == 1
     assert groups[0]["original"]["id"] == a.id
     assert [x["id"] for x in groups[0]["duplicates"]] == [b.id, c.id]
     assert groups[0]["duplicates"][0]["likes"] == 1
     assert groups[0]["duplicates"][0]["similarity_score"] == pytest.approx(0.9)
+
+
+def test_duplicates_are_paged_by_group(client, db_session, test_engine):
+    rows = seed_raw(db_session, 12)
+    originals = rows[:4]
+    for i, dup in enumerate(rows[4:]):  # 2 duplicates per original
+        dup.is_duplicate, dup.duplicate_of_id = True, originals[i % 4].id
+    rows[11].duplicate_of_id = 999_999  # dangling link (legacy data): no group
+    db_session.commit()
+
+    statements = []
+    listener = lambda *a, **k: statements.append(a[2])  # noqa: E731
+    event.listen(test_engine, "before_cursor_execute", listener)
+    try:
+        resp = client.get("/duplicates", params={"limit": 2, "offset": 1}, auth=AUTH)
+    finally:
+        event.remove(test_engine, "before_cursor_execute", listener)
+    assert resp.status_code == 200 and resp.headers["X-Total-Count"] == "4"
+    groups = resp.json()
+    assert [g["original"]["id"] for g in groups] == [originals[1].id, originals[2].id]
+    assert [[d["id"] for d in g["duplicates"]] for g in groups] == [
+        [rows[5].id, rows[9].id], [rows[6].id, rows[10].id]]
+    assert len(statements) <= 4  # count + page + duplicates + votes, no N+1
+
+    assert client.get("/duplicates", params={"offset": 4}, auth=AUTH).json() == []
+    everything = client.get("/duplicates", auth=AUTH).json()
+    assert len(everything) == 4 and sum(len(g["duplicates"]) for g in everything) == 7
+
+
+@pytest.mark.parametrize("params", [{"limit": 0}, {"limit": 1001}, {"offset": -1}, {"limit": "x"}])
+def test_duplicates_invalid_params(client, params):
+    assert client.get("/duplicates", params=params, auth=AUTH).status_code == 422
+
+
+def test_stats_feedback_counts_match_the_point_rule(client, db_session):
+    """liked/disliked == number of rows whose ``_point`` is 1 / -1 (legacy
+    ``like`` wins, otherwise the vote score), on mixed legacy data."""
+    import random
+
+    rnd = random.Random(7)
+    rows = seed_raw(db_session, 60)
+    for row in rows:
+        row.like = rnd.choice([None, None, 1, -1, 0])
+    db_session.commit()
+    for row in rows:
+        add_votes(db_session, row.id, [rnd.choice([1, -1, None]) for _ in range(rnd.randint(0, 4))])
+
+    expected = {1: 0, -1: 0}
+    for row in rows:
+        votes = [v.current_vote for v in db_session.query(UserVotes).filter(UserVotes.raw_data_id == row.id)]
+        point = api._point(row.like, sum(v for v in votes if v in (1, -1)))
+        if point in expected:
+            expected[point] += 1
+    body = client.get("/stats", auth=AUTH).json()
+    assert (body["liked_questions"], body["disliked_questions"]) == (expected[1], expected[-1])
+
+
+def _page_query_plans(test_engine, client, path, params):
+    """EXPLAIN QUERY PLAN of the SELECTs an endpoint runs (fresh schema = migrated schema)."""
+    captured = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        captured.append((statement, parameters))
+
+    event.listen(test_engine, "before_cursor_execute", capture)
+    try:
+        assert client.get(path, params=params, auth=AUTH).status_code == 200
+    finally:
+        event.remove(test_engine, "before_cursor_execute", capture)
+    plans = {}
+    with test_engine.connect() as conn:
+        for statement, parameters in captured:
+            if statement.lstrip().upper().startswith("SELECT"):
+                rows = conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).fetchall()
+                plans[statement] = " | ".join(r[3] for r in rows)
+    return plans
+
+
+def test_unapproved_page_walks_the_created_at_index(client, db_session, test_engine):
+    seed_raw(db_session, 3)
+    plans = _page_query_plans(test_engine, client, "/raw-data", {"only_unapproved": "true"})
+    page = next(p for s, p in plans.items() if "ORDER BY" in s and "LIMIT" in s)
+    # one page is read in index order, not every pending row collected and sorted
+    assert "idx_raw_data_created_at" in page and "TEMP B-TREE" not in page
+
+
+def test_duplicate_groups_use_the_duplicate_of_index(client, db_session, test_engine):
+    a, b = seed_raw(db_session, 2)
+    b.is_duplicate, b.duplicate_of_id = True, a.id
+    db_session.commit()
+    plans = _page_query_plans(test_engine, client, "/duplicates", {})
+    assert all("SCAN raw_data" not in plan or "INDEX" in plan for plan in plans.values()), plans
+    assert any("idx_raw_data_duplicate_of_id" in plan for plan in plans.values())
 
 
 # --------------------------------------------------------------------------- #

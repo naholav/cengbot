@@ -14,6 +14,16 @@ Credentials come from the environment and are read at request time:
 
 There is no default password: if neither is configured every login is
 rejected with 401 and an ERROR is logged at startup.
+
+Failed logins are rate limited per client address (in memory, per process):
+after ``ADMIN_LOGIN_MAX_FAILURES`` (default 10) wrong passwords within
+``ADMIN_LOGIN_WINDOW_SECONDS`` (default 900) that address gets HTTP 429 with
+``Retry-After`` for ``ADMIN_LOGIN_LOCKOUT_SECONDS`` (default 900), even with
+the right password; ``ADMIN_LOGIN_MAX_FAILURES=0`` disables the limiter. The
+client address is the ASGI peer address: behind a reverse proxy it is the
+proxy's, unless uvicorn's proxy-header support resolves the real client
+(``FORWARDED_ALLOW_IPS``, uvicorn's default trusts only 127.0.0.1/::1 - set it
+to the proxy's address; ``X-Forwarded-For`` from anyone else is ignored).
 """
 
 import os
@@ -29,13 +39,16 @@ for _p in (SRC_DIR, PROJECT_ROOT):
         sys.path.insert(0, _p)
 
 import hashlib  # noqa: E402
+import ipaddress  # noqa: E402
 import logging  # noqa: E402
 import math  # noqa: E402
 import re  # noqa: E402
 import secrets  # noqa: E402
 import shutil  # noqa: E402
 import subprocess  # noqa: E402
+import threading  # noqa: E402
 import time  # noqa: E402
+from collections import OrderedDict, deque  # noqa: E402
 from contextlib import asynccontextmanager  # noqa: E402
 from datetime import datetime  # noqa: E402
 from pathlib import Path as FsPath, PurePosixPath  # noqa: E402
@@ -43,12 +56,12 @@ from typing import Dict, Generic, Iterable, List, Optional, Sequence, Tuple, Typ
 
 import psutil  # noqa: E402
 import uvicorn  # noqa: E402
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Query, Request, status  # noqa: E402
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Query, Request, Response, status  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse, PlainTextResponse  # noqa: E402
 from fastapi.security import HTTPBasic, HTTPBasicCredentials  # noqa: E402
 from pydantic import BaseModel, ConfigDict, Field, field_validator  # noqa: E402
-from sqlalchemy import and_, case, func, or_, select, text, update  # noqa: E402
+from sqlalchemy import case, func, or_, select, text, update  # noqa: E402
 from sqlalchemy.exc import IntegrityError  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
@@ -176,14 +189,180 @@ def credentials_are_valid(credentials: Optional[HTTPBasicCredentials]) -> bool:
     return username_ok and password_ok
 
 
-def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)) -> str:
-    """FastAPI dependency: 401 unless the HTTP Basic credentials are valid."""
+# =============================================================================
+# Failed-login rate limiting
+# =============================================================================
+
+DEFAULT_LOGIN_MAX_FAILURES = 10
+DEFAULT_LOGIN_WINDOW_SECONDS = 900.0
+DEFAULT_LOGIN_LOCKOUT_SECONDS = 900.0
+LOGIN_LIMITER_MAX_CLIENTS = 10_000  # bounded memory: least recently seen clients are forgotten
+
+
+class LoginRateLimiter:
+    """Counts failed logins per client key; locks a key out after too many.
+
+    ``max_failures`` failures within ``window_seconds`` lock the key for
+    ``lockout_seconds``. A successful login clears only its own key. At most
+    ``max_clients`` keys are tracked (least recently seen ones are dropped).
+    Thread-safe (sync endpoints run in a thread pool).
+    """
+
+    def __init__(
+        self,
+        max_failures: int = DEFAULT_LOGIN_MAX_FAILURES,
+        window_seconds: float = DEFAULT_LOGIN_WINDOW_SECONDS,
+        lockout_seconds: float = DEFAULT_LOGIN_LOCKOUT_SECONDS,
+        max_clients: int = LOGIN_LIMITER_MAX_CLIENTS,
+        clock=time.monotonic,
+    ):
+        self.max_failures = max(0, int(max_failures))
+        self.window_seconds = float(window_seconds)
+        self.lockout_seconds = float(lockout_seconds)
+        self.max_clients = max(1, int(max_clients))
+        self._clock = clock
+        self._lock = threading.Lock()
+        # key -> [deque of failure times, locked_until]
+        self._clients: "OrderedDict[str, list]" = OrderedDict()
+
+    @classmethod
+    def from_env(cls) -> "LoginRateLimiter":
+        return cls(
+            max_failures=_env_number("ADMIN_LOGIN_MAX_FAILURES", DEFAULT_LOGIN_MAX_FAILURES, int),
+            window_seconds=_env_number("ADMIN_LOGIN_WINDOW_SECONDS", DEFAULT_LOGIN_WINDOW_SECONDS, float, 1.0),
+            lockout_seconds=_env_number("ADMIN_LOGIN_LOCKOUT_SECONDS", DEFAULT_LOGIN_LOCKOUT_SECONDS, float, 1.0),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_failures > 0
+
+    @property
+    def tracked_clients(self) -> int:
+        return len(self._clients)
+
+    def _seconds_left(self, locked_until: float, now: float) -> int:
+        return max(1, math.ceil(locked_until - now))
+
+    def retry_after(self, key: str) -> int:
+        """Seconds until ``key`` may try again (0 = not locked out)."""
+        if not self.enabled:
+            return 0
+        now = self._clock()
+        with self._lock:
+            state = self._clients.get(key)
+            if state is None or state[1] <= now:
+                return 0
+            return self._seconds_left(state[1], now)
+
+    def record_failure(self, key: str) -> int:
+        """Count a failed login; returns the lockout in seconds if ``key`` is now locked, else 0."""
+        if not self.enabled:
+            return 0
+        now = self._clock()
+        with self._lock:
+            state = self._clients.get(key)
+            if state is None:
+                while len(self._clients) >= self.max_clients:
+                    self._clients.popitem(last=False)
+                state = [deque(maxlen=self.max_failures), 0.0]
+                self._clients[key] = state
+            else:
+                self._clients.move_to_end(key)
+            failures, locked_until = state
+            if locked_until > now:
+                return self._seconds_left(locked_until, now)
+            while failures and failures[0] <= now - self.window_seconds:
+                failures.popleft()
+            failures.append(now)
+            if len(failures) < self.max_failures:
+                return 0
+            failures.clear()
+            state[1] = now + self.lockout_seconds
+        logger.warning(
+            "Admin login: %d failed attempts from %s within %ds; blocked for %ds.",
+            self.max_failures, key, int(self.window_seconds), int(self.lockout_seconds),
+        )
+        return self._seconds_left(now + self.lockout_seconds, now)
+
+    def record_success(self, key: str) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self._clients.pop(key, None)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._clients.clear()
+
+
+def _env_number(name: str, default, cast, minimum=0):
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = cast(raw)
+        if not math.isfinite(value) or value < minimum:
+            raise ValueError
+        return value
+    except ValueError:
+        logger.warning("Invalid %s=%r; using the default %s.", name, raw, default)
+        return default
+
+
+login_rate_limiter = LoginRateLimiter.from_env()
+
+
+def client_key(request: Request) -> str:
+    """Rate-limit key of the client: its IP address (IPv6: its /64 network).
+
+    ``request.client`` is the TCP peer, or - only for peers listed in uvicorn's
+    ``FORWARDED_ALLOW_IPS`` - the client named in ``X-Forwarded-For``. The
+    header itself is never read here, so other clients cannot spoof it.
+    """
+    host = request.client.host if request.client else ""
+    if not host:
+        return "unknown"
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if address.version == 6:
+        if address.ipv4_mapped is not None:
+            return str(address.ipv4_mapped)
+        # one host usually owns a whole /64: count it as one client
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return str(address)
+
+
+def _too_many_attempts(retry_after: int) -> HTTPException:
+    # No WWW-Authenticate header: browsers must not pop up a login dialog.
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail=f"Too many failed login attempts. Try again in {retry_after} seconds.",
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+def verify_credentials(
+    request: Request, credentials: HTTPBasicCredentials = Depends(security)
+) -> str:
+    """FastAPI dependency: 401 unless the HTTP Basic credentials are valid,
+    429 while the client is locked out after too many failed attempts."""
+    key = client_key(request)
+    retry_after = login_rate_limiter.retry_after(key)
+    if retry_after:
+        raise _too_many_attempts(retry_after)
     if not credentials_are_valid(credentials):
+        retry_after = login_rate_limiter.record_failure(key)
+        if retry_after:
+            raise _too_many_attempts(retry_after)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Basic"},
         )
+    login_rate_limiter.record_success(key)
     return credentials.username
 
 
@@ -266,6 +445,8 @@ app.add_middleware(
     allow_credentials=_cors["allow_credentials"],
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Accept"],
+    # readable by the panel: login lockout, /duplicates total, /docs/read info
+    expose_headers=["Retry-After", "X-Total-Count", "X-Content-Truncated", "X-File-Size"],
 )
 
 # Every route registered on this router requires valid admin credentials.
@@ -394,6 +575,39 @@ def _vote_stats_for(db: Session, raw_ids: Sequence[int]) -> Dict[int, Dict[str, 
 
 
 _NO_VOTES = {"likes": 0, "dislikes": 0, "total_votes": 0, "score": 0}
+
+
+def _feedback_counts(db: Session) -> Tuple[int, int]:
+    """(liked, disliked) question counts with the rule of ``_point``: the legacy
+    ``raw_data.like`` value wins, rows without one count by their vote score.
+
+    Only rows whose ``like`` is NULL need their votes summed (database_models
+    keeps ``like`` in sync with the votes), so the vote aggregate is computed
+    once and only for those rows - not over the whole user_votes table twice.
+    """
+    vote_sign = case((UserVotes.current_vote == 1, 1), (UserVotes.current_vote == -1, -1), else_=0)
+    null_like_scores = (
+        select(func.sum(vote_sign).label("score"))
+        .select_from(RawData)
+        .join(UserVotes, UserVotes.raw_data_id == RawData.id)
+        .where(RawData.like.is_(None))
+        .group_by(UserVotes.raw_data_id)
+        .cte("null_like_scores")
+    )
+
+    def with_like(value: int):
+        return select(func.count()).select_from(RawData).where(RawData.like == value).scalar_subquery()
+
+    def with_score(condition):
+        return select(func.count()).select_from(null_like_scores).where(condition).scalar_subquery()
+
+    liked, disliked = db.execute(
+        select(
+            with_like(1) + with_score(null_like_scores.c.score > 0),
+            with_like(-1) + with_score(null_like_scores.c.score < 0),
+        )
+    ).one()
+    return int(liked or 0), int(disliked or 0)
 
 
 def _point(legacy_like: Optional[int], vote_score: int) -> Optional[int]:
@@ -616,8 +830,29 @@ def _model_path() -> str:
     return model_path
 
 
+def _health_authenticated(request: Request, credentials: Optional[HTTPBasicCredentials]) -> bool:
+    """Credentials check for /health under the same rate limit as the login.
+
+    A wrong password counts as a failed login (otherwise /health would be an
+    unlimited password oracle); a locked-out client simply gets the public view.
+    """
+    if credentials is None:
+        return False
+    key = client_key(request)
+    if login_rate_limiter.retry_after(key):
+        return False
+    if credentials_are_valid(credentials):
+        login_rate_limiter.record_success(key)
+        return True
+    login_rate_limiter.record_failure(key)
+    return False
+
+
 @app.get("/health")
-def health_check(credentials: Optional[HTTPBasicCredentials] = Depends(optional_credentials)):
+def health_check(
+    request: Request,
+    credentials: Optional[HTTPBasicCredentials] = Depends(optional_credentials),
+):
     """System health check.
 
     Public: status, timestamp, database and model availability (HTTP 503 when
@@ -642,7 +877,7 @@ def health_check(credentials: Optional[HTTPBasicCredentials] = Depends(optional_
         "model": {"available": os.path.exists(_model_path())},
     }
 
-    if credentials_are_valid(credentials):
+    if _health_authenticated(request, credentials):
         try:
             memory = psutil.virtual_memory()
             disk = psutil.disk_usage(PROJECT_ROOT)
@@ -683,9 +918,11 @@ def get_raw_data(
     try:
         query = db.query(RawData)
         if only_unapproved:
-            query = query.filter(
-                or_(RawData.admin_approved == 0, RawData.admin_approved.is_(None))
-            )
+            # == "admin_approved = 0 OR admin_approved IS NULL", written so that
+            # SQLite walks idx_raw_data_created_at in ORDER BY order and stops
+            # after one page, instead of collecting every pending row through
+            # the (low-selectivity) admin_approved index and sorting them all.
+            query = query.filter(func.coalesce(RawData.admin_approved, 0) == 0)
 
         total = query.with_entities(func.count(RawData.id)).scalar() or 0
         total_pages, skip = _paginate(total, page, page_size)
@@ -854,37 +1091,7 @@ def get_statistics(db: Session = Depends(get_db)):
             db.query(func.count(RawData.id)).filter(RawData.admin_approved == 1).scalar() or 0
         )
 
-        vote_scores = (
-            select(
-                UserVotes.raw_data_id.label("raw_data_id"),
-                func.sum(
-                    case(
-                        (UserVotes.current_vote == 1, 1),
-                        (UserVotes.current_vote == -1, -1),
-                        else_=0,
-                    )
-                ).label("score"),
-            )
-            .group_by(UserVotes.raw_data_id)
-            .subquery()
-        )
-
-        def _count_feedback(legacy_value: int, score_condition):
-            return (
-                db.query(func.count(RawData.id))
-                .outerjoin(vote_scores, vote_scores.c.raw_data_id == RawData.id)
-                .filter(
-                    or_(
-                        RawData.like == legacy_value,
-                        and_(RawData.like.is_(None), score_condition),
-                    )
-                )
-                .scalar()
-                or 0
-            )
-
-        liked_questions = _count_feedback(1, vote_scores.c.score > 0)
-        disliked_questions = _count_feedback(-1, vote_scores.c.score < 0)
+        liked_questions, disliked_questions = _feedback_counts(db)
         training_data_count = db.query(func.count(TrainingData.id)).scalar() or 0
         duplicate_count = (
             db.query(func.count(RawData.id)).filter(RawData.is_duplicate.is_(True)).scalar() or 0
@@ -912,33 +1119,43 @@ def get_statistics(db: Session = Depends(get_db)):
         raise _db_error(e, "select", "raw_data")
 
 
+MAX_DUPLICATE_GROUPS = 1000
+
+
 @protected.get("/duplicates")
-def get_duplicate_groups(db: Session = Depends(get_db)):
-    """Get duplicate question groups: [{original, duplicates: [...]}, ...]"""
+def get_duplicate_groups(
+    response: Response,
+    limit: int = Query(500, ge=1, le=MAX_DUPLICATE_GROUPS),
+    offset: int = Query(0, ge=0, le=MAX_DB_ID),
+    db: Session = Depends(get_db),
+):
+    """Get duplicate question groups: [{original, duplicates: [...]}, ...]
+
+    Groups are ordered by original id; ``limit``/``offset`` page through them
+    and the ``X-Total-Count`` header holds the total number of groups.
+    """
     try:
-        duplicates = (
-            db.query(RawData)
-            .filter(RawData.duplicate_of_id.isnot(None))
-            .order_by(RawData.duplicate_of_id, RawData.id)
-            .all()
-        )
-        if not duplicates:
+        group_ids = select(RawData.duplicate_of_id).where(RawData.duplicate_of_id.isnot(None))
+        originals_query = db.query(RawData).filter(RawData.id.in_(group_ids))
+        total = originals_query.with_entities(func.count(RawData.id)).scalar() or 0
+        response.headers["X-Total-Count"] = str(total)
+        originals = originals_query.order_by(RawData.id).offset(offset).limit(limit).all()
+        if not originals:
             return []
-        originals = (
-            db.query(RawData)
-            .filter(
-                RawData.id.in_(
-                    select(RawData.duplicate_of_id).where(RawData.duplicate_of_id.isnot(None))
-                )
-            )
-            .order_by(RawData.id)
-            .all()
-        )
-        votes = _vote_stats_for(db, [r.id for r in originals] + [d.id for d in duplicates])
 
         by_original: Dict[int, List[RawData]] = {}
-        for dup in duplicates:
-            by_original.setdefault(dup.duplicate_of_id, []).append(dup)
+        original_ids = [original.id for original in originals]
+        for start in range(0, len(original_ids), _SQL_IN_CHUNK):
+            chunk = original_ids[start:start + _SQL_IN_CHUNK]
+            for dup in (
+                db.query(RawData)
+                .filter(RawData.duplicate_of_id.in_(chunk))
+                .order_by(RawData.duplicate_of_id, RawData.id)
+            ):
+                by_original.setdefault(dup.duplicate_of_id, []).append(dup)
+        votes = _vote_stats_for(
+            db, original_ids + [d.id for dups in by_original.values() for d in dups]
+        )
 
         return [
             {

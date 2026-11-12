@@ -25,12 +25,13 @@ from functools import lru_cache
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sqlalchemy import (
-    create_engine, Column, Integer, BigInteger, String, Text, Boolean, DateTime,
+    create_engine, event, Column, Integer, BigInteger, String, Text, Boolean, DateTime,
     Float, ForeignKey, text, Index, update, select, case, or_,
 )
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker, Session, relationship, declarative_base
+from sqlalchemy.schema import CreateIndex
 from sqlalchemy.sql import func
 from datetime import datetime, timezone
 import logging
@@ -47,26 +48,31 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'university_bot.db')}"
 
 
-def _read_env_database_url() -> Optional[str]:
+def _read_env_value(name: str) -> Optional[str]:
     """
-    Return ``DATABASE_URL`` from ``os.environ``; if it is not set there, fall
-    back to the project's ``.env`` file (read-only, ``os.environ`` is not
-    modified). The fallback makes every process resolve the same database no
+    Return the setting ``name`` from ``os.environ``; if it is not set there,
+    fall back to the project's ``.env`` file (read-only, ``os.environ`` is not
+    modified). The fallback makes every process resolve the same settings no
     matter whether ``config.env_loader`` was imported before this module.
     """
-    value = os.environ.get("DATABASE_URL")
+    value = os.environ.get(name)
     if value is not None and value.strip():
         return value.strip()
     env_path = os.path.join(BASE_DIR, ".env")
     if os.path.isfile(env_path):
         try:
             from dotenv import dotenv_values
-            value = dotenv_values(env_path).get("DATABASE_URL")
+            value = dotenv_values(env_path).get(name)
         except Exception:  # dotenv missing / unreadable file -> use default
             value = None
         if value is not None and value.strip():
             return value.strip()
     return None
+
+
+def _read_env_database_url() -> Optional[str]:
+    """``DATABASE_URL`` from the environment or ``.env`` (see ``_read_env_value``)."""
+    return _read_env_value("DATABASE_URL")
 
 
 def resolve_database_url(url: Optional[str] = None) -> str:
@@ -98,14 +104,132 @@ def resolve_database_url(url: Optional[str] = None) -> str:
     return parsed.set(database=absolute).render_as_string(hide_password=False)
 
 
+# --- SQLite connection settings ------------------------------------------------
+#
+# The bot, the AI worker and the admin API are separate processes sharing one
+# SQLite file. In the default rollback-journal mode a reader blocks writers
+# (and a committing writer blocks readers), so a long read (training export,
+# Excel export, admin statistics) stalls the bot's inserts/updates for its
+# whole duration. WAL lets readers and the (single) writer work concurrently,
+# and synchronous=NORMAL is the recommended setting for WAL: the database
+# cannot be corrupted; a power loss may lose the last transactions.
+#
+# WAL is a property of the database file (persistent); every new connection
+# re-applies the settings, so the first process that connects switches the
+# file and the others follow automatically.
+#
+# Backups: with WAL, recent commits may still be in "<db>-wal", so a plain copy
+# of the .db file can miss them. Use the sqlite3 online backup API (as
+# scripts/backup_data.sh does) or VACUUM INTO; when restoring a copy, stop the
+# services and delete "<db>-wal" / "<db>-shm" first (a stale -wal would be
+# replayed onto the restored file).
+
+SQLITE_JOURNAL_MODES = ("wal", "delete", "truncate", "persist")
+SQLITE_SYNCHRONOUS_LEVELS = ("off", "normal", "full", "extra")
+DEFAULT_SQLITE_JOURNAL_MODE = "wal"
+DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 5000
+_KEEP_VALUES = ("keep", "default", "none")
+
+
+def sqlite_connection_settings() -> Dict[str, object]:
+    """
+    SQLite settings from the environment (or ``.env``):
+
+    - ``SQLITE_JOURNAL_MODE``: wal (default) | delete | truncate | persist |
+      keep (leave the file's current mode alone)
+    - ``SQLITE_SYNCHRONOUS``: off | normal | full | extra; default ``normal``
+      in WAL mode, otherwise SQLite's default (full) is kept
+    - ``SQLITE_BUSY_TIMEOUT_MS``: how long a connection waits for a lock
+      before failing with "database is locked" (default 5000)
+
+    Invalid values are logged and replaced by the defaults.
+    """
+    journal = (_read_env_value("SQLITE_JOURNAL_MODE") or DEFAULT_SQLITE_JOURNAL_MODE).lower()
+    if journal in _KEEP_VALUES:
+        journal = None
+    elif journal not in SQLITE_JOURNAL_MODES:
+        logger.warning("Invalid SQLITE_JOURNAL_MODE %r (expected one of %s or keep); using %s",
+                       journal, ", ".join(SQLITE_JOURNAL_MODES), DEFAULT_SQLITE_JOURNAL_MODE)
+        journal = DEFAULT_SQLITE_JOURNAL_MODE
+
+    synchronous = (_read_env_value("SQLITE_SYNCHRONOUS") or "").lower() or None
+    if synchronous is not None and synchronous not in SQLITE_SYNCHRONOUS_LEVELS:
+        logger.warning("Invalid SQLITE_SYNCHRONOUS %r (expected one of %s); using the default",
+                       synchronous, ", ".join(SQLITE_SYNCHRONOUS_LEVELS))
+        synchronous = None
+    if synchronous is None and journal == "wal":
+        synchronous = "normal"
+
+    raw_timeout = _read_env_value("SQLITE_BUSY_TIMEOUT_MS")
+    busy_timeout = DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+    if raw_timeout is not None:
+        try:
+            busy_timeout = int(raw_timeout)
+            if busy_timeout < 0:
+                raise ValueError
+        except ValueError:
+            logger.warning("Invalid SQLITE_BUSY_TIMEOUT_MS %r; using %d",
+                           raw_timeout, DEFAULT_SQLITE_BUSY_TIMEOUT_MS)
+            busy_timeout = DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+    return {"journal_mode": journal, "synchronous": synchronous, "busy_timeout_ms": busy_timeout}
+
+
+def _is_file_sqlite(url) -> bool:
+    """True for an on-disk SQLite database (not ``:memory:`` / ``mode=memory``)."""
+    database = url.database or ""
+    if not database or ":memory:" in database:
+        return False
+    return url.query.get("mode") != "memory"
+
+
+def _sqlite_connect_listener(settings: Dict[str, object]):
+    """``connect`` event handler applying ``settings`` to every new DBAPI connection."""
+    journal_mode = settings["journal_mode"]
+    synchronous = settings["synchronous"]
+
+    def on_connect(dbapi_connection, _connection_record):
+        # Never fail the connection because of a setting: the database may be
+        # locked by another process (switching to WAL needs a moment of
+        # exclusive access) or read-only; the next connection tries again.
+        cursor = dbapi_connection.cursor()
+        try:
+            if journal_mode:
+                try:
+                    row = cursor.execute(f"PRAGMA journal_mode = {journal_mode}").fetchone()
+                    actual = str(row[0]).lower() if row else ""
+                    if actual != journal_mode:
+                        logger.warning("SQLite journal_mode is %r, %r was requested", actual, journal_mode)
+                except Exception as e:
+                    logger.warning("Could not set SQLite journal_mode=%s: %s", journal_mode, e)
+            if synchronous:
+                try:
+                    cursor.execute(f"PRAGMA synchronous = {synchronous}")
+                except Exception as e:
+                    logger.warning("Could not set SQLite synchronous=%s: %s", synchronous, e)
+        finally:
+            cursor.close()
+
+    return on_connect
+
+
 def _create_engine_for(url: str):
     """Create the SQLAlchemy engine (SQLite-only connect args only for SQLite)."""
     kwargs = {"echo": False}
-    if make_url(url).get_backend_name() == "sqlite":
+    parsed = make_url(url)
+    settings = None
+    if parsed.get_backend_name() == "sqlite":
+        settings = sqlite_connection_settings()
         # Sessions are used from the bot's asyncio loop and from pika/worker
         # threads, so a pooled connection may be used by another thread.
-        kwargs["connect_args"] = {"check_same_thread": False}
-    return create_engine(url, **kwargs)
+        # ``timeout`` is the busy timeout (pysqlite), in seconds.
+        kwargs["connect_args"] = {
+            "check_same_thread": False,
+            "timeout": settings["busy_timeout_ms"] / 1000.0,
+        }
+    new_engine = create_engine(url, **kwargs)
+    if settings is not None and _is_file_sqlite(parsed):
+        event.listen(new_engine, "connect", _sqlite_connect_listener(settings))
+    return new_engine
 
 
 DATABASE_URL = resolve_database_url(_read_env_database_url())
@@ -139,9 +263,9 @@ class RawData(Base):
     """
     __tablename__ = "raw_data"
     
-    # Primary identification
-    id = Column(Integer, primary_key=True, index=True)
-    telegram_id = Column(BigInteger, nullable=False, index=True)
+    # Primary identification (INTEGER PRIMARY KEY = SQLite rowid: no extra index)
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(BigInteger, nullable=False)  # indexed by idx_raw_data_composite
     telegram_message_id = Column(BigInteger)
     username = Column(String(100))
     
@@ -196,8 +320,8 @@ class TrainingData(Base):
     __tablename__ = "training_data"
     
     # Primary identification
-    id = Column(Integer, primary_key=True, index=True)
-    source_id = Column(Integer, ForeignKey('raw_data.id'), unique=True)
+    id = Column(Integer, primary_key=True)
+    source_id = Column(Integer, ForeignKey('raw_data.id'), unique=True)  # UNIQUE = indexed
     
     # Core content
     question = Column(Text, nullable=False)
@@ -242,20 +366,27 @@ class TrainingData(Base):
     # Relationships
     source = relationship("RawData", back_populates="training_data")
 
-# Database indexes for performance optimization
-Index('idx_raw_data_telegram_id', RawData.telegram_id)
-Index('idx_raw_data_created_at', RawData.created_at)
+# Database indexes for performance optimization. These model indexes are the
+# complete set: init_db() creates any that an existing database lacks, and
+# src/db_migrations.py also drops the redundant indexes older versions created
+# (duplicates of the primary key, of a UNIQUE constraint or of a prefix of
+# another index), so fresh and migrated databases end up with the same schema.
+Index('idx_raw_data_created_at', RawData.created_at)  # admin list order (+ rowid)
 Index('idx_raw_data_admin_approved', RawData.admin_approved)
 Index('idx_raw_data_like', RawData.like)
 Index('idx_raw_data_language', RawData.language)
 Index('idx_raw_data_is_duplicate', RawData.is_duplicate)
 Index('idx_raw_data_composite', RawData.telegram_id, RawData.created_at)
+# duplicate groups (/duplicates) and clearing links when an original is deleted
+Index('idx_raw_data_duplicate_of_id', RawData.duplicate_of_id)
 
 Index('idx_training_data_created_at', TrainingData.created_at)
-Index('idx_training_data_source_id', TrainingData.source_id)
 Index('idx_training_data_language', TrainingData.language)
 Index('idx_training_data_review_status', TrainingData.review_status)
 Index('idx_training_data_is_active', TrainingData.is_active)
+Index('idx_training_data_is_answer_duplicate', TrainingData.is_answer_duplicate)
+# clearing answer-duplicate links when a training answer is edited or deleted
+Index('idx_training_data_duplicate_answer_of_id', TrainingData.duplicate_answer_of_id)
 
 class UserVotes(Base):
     """
@@ -263,7 +394,7 @@ class UserVotes(Base):
     """
     __tablename__ = "user_votes"
     
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     raw_data_id = Column(Integer, ForeignKey('raw_data.id'), nullable=False)
     telegram_user_id = Column(BigInteger, nullable=False, index=True)
     current_vote = Column(Integer)  # 1 (like), -1 (dislike), NULL (no vote)
@@ -276,9 +407,9 @@ class UserVotes(Base):
     
     # One vote row per (question, user). The UNIQUE index is what makes
     # concurrent double clicks safe; it has the same name as the one init_db()
-    # has always created on existing databases, so nothing changes there.
+    # has always created on existing databases, so nothing changes there. It
+    # also serves every lookup by raw_data_id (leading column).
     __table_args__ = (
-        Index('idx_user_votes_composite', 'raw_data_id', 'telegram_user_id'),
         Index('idx_user_votes_unique', 'raw_data_id', 'telegram_user_id', unique=True),
     )
 
@@ -288,7 +419,7 @@ class UserAnalytics(Base):
     """
     __tablename__ = "user_analytics"
     
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     telegram_id = Column(BigInteger, nullable=False, unique=True, index=True)
     
     # Usage statistics
@@ -319,7 +450,7 @@ class SystemMetrics(Base):
     """
     __tablename__ = "system_metrics"
     
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     metric_name = Column(String(100), nullable=False, index=True)
     metric_value = Column(Float, nullable=False)
     metric_type = Column(String(50))  # 'counter', 'gauge', 'histogram'
@@ -334,6 +465,10 @@ class SystemMetrics(Base):
     
     # Additional details
     details = Column(Text)  # Additional metric details (JSON format)
+
+    __table_args__ = (
+        Index('idx_system_metrics_timestamp', 'timestamp'),
+    )
 
 def clean_text(text: str) -> str:
     """
@@ -1011,60 +1146,45 @@ def get_database_statistics(db: Session) -> dict:
         return {}
 
 
-# Indexes that existing databases may predate (CREATE TABLE IF NOT EXISTS via
-# create_all() does not add indexes to tables that already exist).
-_INIT_INDEX_STATEMENTS = (
-    # Raw data indexes
-    "CREATE INDEX IF NOT EXISTS idx_raw_data_telegram_id ON raw_data(telegram_id);",
-    "CREATE INDEX IF NOT EXISTS idx_raw_data_language ON raw_data(language);",
-    "CREATE INDEX IF NOT EXISTS idx_raw_data_created_at ON raw_data(created_at);",
-    "CREATE INDEX IF NOT EXISTS idx_raw_data_is_duplicate ON raw_data(is_duplicate);",
-    "CREATE INDEX IF NOT EXISTS idx_raw_data_admin_approved ON raw_data(admin_approved);",
-    # Training data indexes
-    "CREATE INDEX IF NOT EXISTS idx_training_data_source_id ON training_data(source_id);",
-    "CREATE INDEX IF NOT EXISTS idx_training_data_language ON training_data(language);",
-    "CREATE INDEX IF NOT EXISTS idx_training_data_is_active ON training_data(is_active);",
-    "CREATE INDEX IF NOT EXISTS idx_training_data_is_answer_duplicate ON training_data(is_answer_duplicate);",
-    "CREATE INDEX IF NOT EXISTS idx_training_data_review_status ON training_data(review_status);",
-    # User analytics indexes
-    "CREATE INDEX IF NOT EXISTS idx_user_analytics_telegram_id ON user_analytics(telegram_id);",
-    # User votes indexes
-    "CREATE INDEX IF NOT EXISTS idx_user_votes_raw_data_id ON user_votes(raw_data_id);",
-    "CREATE INDEX IF NOT EXISTS idx_user_votes_telegram_user_id ON user_votes(telegram_user_id);",
-    # System metrics indexes
-    "CREATE INDEX IF NOT EXISTS idx_system_metrics_name ON system_metrics(metric_name);",
-    "CREATE INDEX IF NOT EXISTS idx_system_metrics_timestamp ON system_metrics(timestamp);",
-)
-_UNIQUE_VOTE_INDEX_STATEMENT = (
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_user_votes_unique "
-    "ON user_votes(raw_data_id, telegram_user_id);"
-)
+def ensure_model_indexes(bind=None) -> List[str]:
+    """
+    Create every index declared on the models that the database lacks
+    (``CREATE INDEX IF NOT EXISTS``; ``create_all()`` does not add indexes to
+    tables that already exist). Never drops anything - removing the redundant
+    indexes of older schemas is done by ``src/db_migrations.py``.
+
+    A UNIQUE index cannot be created while the table holds duplicate rows
+    (e.g. legacy double votes); that is logged and the remaining indexes are
+    still created, so the system keeps running.
+
+    Returns the names of the indexes that could not be created.
+    """
+    bind = engine if bind is None else bind
+    failed = []
+    for table in Base.metadata.sorted_tables:
+        for index in sorted(table.indexes, key=lambda i: i.name):
+            try:
+                with bind.begin() as conn:
+                    conn.execute(CreateIndex(index, if_not_exists=True))
+            except IntegrityError as e:
+                failed.append(index.name)
+                columns = ", ".join(c.name for c in index.columns)
+                logger.error(
+                    f"Could not create UNIQUE index {index.name}: {table.name} contains "
+                    f"duplicate ({columns}) rows. Remove the duplicates and restart. ({e})"
+                )
+    return failed
 
 
 def init_db():
     """
-    Initialize database and create all tables.
+    Initialize database and create all tables and indexes.
     """
     try:
         # Create all tables (uses the module-level engine at call time)
         Base.metadata.create_all(bind=engine)
-
-        # Create indexes for performance
-        with engine.begin() as conn:
-            for statement in _INIT_INDEX_STATEMENTS:
-                conn.execute(text(statement))
-
-        # One vote per user and question. If an old database already holds
-        # duplicate vote rows this fails; keep the system running and say why.
-        try:
-            with engine.begin() as conn:
-                conn.execute(text(_UNIQUE_VOTE_INDEX_STATEMENT))
-        except IntegrityError as e:
-            logger.error(
-                "Could not create UNIQUE index idx_user_votes_unique: user_votes "
-                f"contains duplicate (raw_data_id, telegram_user_id) rows. "
-                f"Remove the duplicates and restart. ({e})"
-            )
+        # Indexes existing databases may predate (incl. the one-vote-per-user UNIQUE index)
+        ensure_model_indexes(engine)
 
         logger.info("SQLite database initialized successfully with all tables and indexes!")
         print("✅ Database initialized successfully!")
@@ -1095,6 +1215,7 @@ __all__ = [
     'UserAnalytics',
     'SystemMetrics',
     'init_db',
+    'ensure_model_indexes',
     'get_db',
     'process_new_question',
     'process_new_training_data',

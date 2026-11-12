@@ -8,6 +8,7 @@ import threading
 
 import pytest
 from fastapi.testclient import TestClient
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 import admin_rest_api as api
 
@@ -43,6 +44,9 @@ def clock():
 def limiter(monkeypatch, clock):
     lim = api.LoginRateLimiter(max_failures=3, window_seconds=60, lockout_seconds=300, clock=clock)
     monkeypatch.setattr(api, "login_rate_limiter", lim)
+    monkeypatch.setattr(api, "health_credentials_limiter",
+                        api.LoginRateLimiter(max_failures=3, window_seconds=60, lockout_seconds=300,
+                                             clock=clock))
     return lim
 
 
@@ -127,17 +131,67 @@ def test_missing_credentials_do_not_count(limiter):
     assert login(c, GOOD).status_code == 200
 
 
-def test_health_check_shares_the_limit(limiter):
-    """/health with credentials would otherwise be an unlimited password oracle."""
-    c = client_for("203.0.113.9")
-    for _ in range(3):
-        body = c.get("/health", auth=BAD).json()
+def test_health_credentials_have_one_limit_for_all_clients(limiter, clock):
+    """/health with credentials would otherwise be an unlimited password oracle;
+    its failures are counted for all clients together, so changing the address
+    does not help, and they never lock anybody out of the API."""
+    for i in range(3):
+        body = client_for(f"203.0.113.{20 + i}").get("/health", auth=BAD).json()
         assert "system" not in body
-    resp = c.get("/health", auth=GOOD)
-    assert resp.status_code == 200  # the public health check keeps working...
-    assert "system" not in resp.json()  # ...but the admin view is locked
+    for host in ("203.0.113.20", "203.0.113.99"):
+        resp = client_for(host).get("/health", auth=GOOD)
+        assert resp.status_code == 200  # the public health check keeps working...
+        assert "system" not in resp.json()  # ...but the admin view is locked for everyone
+    assert login(client_for("203.0.113.20"), GOOD).status_code == 200  # the API is not
+    assert api.login_rate_limiter.tracked_clients == 0
+    clock.now += 300
+    assert "system" in client_for("203.0.113.20").get("/health", auth=GOOD).json()
+
+
+def test_api_lockout_does_not_hide_health_and_vice_versa(limiter):
+    c = client_for("203.0.113.30")
+    for _ in range(3):
+        login(c, BAD)
     assert login(c, GOOD).status_code == 429
-    assert "system" in client_for("203.0.113.10").get("/health", auth=GOOD).json()
+    assert "system" in c.get("/health", auth=GOOD).json()
+
+
+def proxied_client() -> TestClient:
+    """The app as uvicorn.run() serves it (proxy headers trusted from 127.0.0.1),
+    reached through a local reverse proxy."""
+    app = ProxyHeadersMiddleware(api.app, trusted_hosts="127.0.0.1,::1")
+    return TestClient(app, client=("127.0.0.1", 40000))
+
+
+def test_forged_forwarded_for_on_health_is_harmless(limiter):
+    """Regression: a proxy route that passes the client's own X-Forwarded-For
+    (nginx 'location /health' without proxy_set_header) made the limiter key
+    attacker-chosen: unlimited guessing by rotating the header, and forged
+    failures 'from' the admin's address locked the admin out of the API."""
+    c = proxied_client()
+    for i in range(20):  # rotating addresses do not reset the /health limit
+        c.get("/health", auth=("admin", f"guess{i}"), headers={"X-Forwarded-For": f"10.9.{i}.1"})
+    right = c.get("/health", auth=GOOD, headers={"X-Forwarded-For": "10.9.99.1"})
+    assert "system" not in right.json()  # the oracle is closed
+
+    admin_ip = "198.51.100.7"
+    for _ in range(10):
+        c.get("/health", auth=BAD, headers={"X-Forwarded-For": admin_ip})
+    # the admin's real API request ('X-Forwarded-For: <client>' appended by nginx)
+    assert c.post("/auth/login", auth=GOOD, headers={"X-Forwarded-For": admin_ip}).status_code == 200
+    assert api.login_rate_limiter.tracked_clients == 0
+
+
+def test_non_ip_client_hosts_share_one_key(limiter):
+    """A forged, non-address X-Forwarded-For cannot create keys (bounded memory)."""
+    c = proxied_client()
+    codes = [c.post("/auth/login", auth=BAD, headers={"X-Forwarded-For": f"garbage-{i}"}).status_code
+             for i in range(4)]
+    assert codes == [401, 401, 429, 429]
+    assert api.login_rate_limiter.tracked_clients == 1
+    assert api.login_rate_limiter.retry_after(api.INVALID_CLIENT_KEY) > 0
+    # real addresses behind the same proxy are not affected
+    assert c.post("/auth/login", auth=GOOD, headers={"X-Forwarded-For": "198.51.100.8"}).status_code == 200
 
 
 def test_lockout_is_logged_once(limiter, caplog):
@@ -196,7 +250,9 @@ def test_defaults():
     ("192.0.2.1", "192.0.2.1"),
     ("::ffff:192.0.2.1", "192.0.2.1"),
     ("2001:db8::1", "2001:db8::/64"),
-    ("testclient", "testclient"),
+    ("testclient", "invalid"),
+    ("1.2.3.4, 5.6.7.8", "invalid"),
+    ("<script>", "invalid"),
 ])
 def test_client_key(host, key):
     class Req:

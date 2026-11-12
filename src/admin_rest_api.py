@@ -23,7 +23,10 @@ the right password; ``ADMIN_LOGIN_MAX_FAILURES=0`` disables the limiter. The
 client address is the ASGI peer address: behind a reverse proxy it is the
 proxy's, unless uvicorn's proxy-header support resolves the real client
 (``FORWARDED_ALLOW_IPS``, uvicorn's default trusts only 127.0.0.1/::1 - set it
-to the proxy's address; ``X-Forwarded-For`` from anyone else is ignored).
+to the proxy's address; ``X-Forwarded-For`` from anyone else is ignored). The
+proxy must set ``X-Forwarded-For`` itself on every route it forwards.
+Wrong passwords on ``/health`` are limited separately, for all clients
+together, and only ever disable the admin view of ``/health``.
 """
 
 import os
@@ -311,6 +314,11 @@ def _env_number(name: str, default, cast, minimum=0):
 
 
 login_rate_limiter = LoginRateLimiter.from_env()
+# Wrong passwords sent to /health are counted here, for all clients together
+# (see _health_authenticated); they never lock anybody out of the API.
+health_credentials_limiter = LoginRateLimiter.from_env()
+HEALTH_LIMIT_KEY = "/health (all clients)"
+INVALID_CLIENT_KEY = "invalid"
 
 
 def client_key(request: Request) -> str:
@@ -319,6 +327,9 @@ def client_key(request: Request) -> str:
     ``request.client`` is the TCP peer, or - only for peers listed in uvicorn's
     ``FORWARDED_ALLOW_IPS`` - the client named in ``X-Forwarded-For``. The
     header itself is never read here, so other clients cannot spoof it.
+    Anything that is not an IP address (a forged header passed on by a
+    misconfigured proxy) maps to one shared key, so arbitrary strings can
+    neither create new keys nor grow the limiter's memory.
     """
     host = request.client.host if request.client else ""
     if not host:
@@ -326,7 +337,7 @@ def client_key(request: Request) -> str:
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
-        return host
+        return INVALID_CLIENT_KEY
     if address.version == 6:
         if address.ipv4_mapped is not None:
             return str(address.ipv4_mapped)
@@ -830,29 +841,29 @@ def _model_path() -> str:
     return model_path
 
 
-def _health_authenticated(request: Request, credentials: Optional[HTTPBasicCredentials]) -> bool:
-    """Credentials check for /health under the same rate limit as the login.
+def _health_authenticated(credentials: Optional[HTTPBasicCredentials]) -> bool:
+    """Credentials check for the admin view of /health.
 
-    A wrong password counts as a failed login (otherwise /health would be an
-    unlimited password oracle); a locked-out client simply gets the public view.
+    Without a limit /health would be an unlimited password oracle. Its wrong
+    passwords are counted in one bucket for all clients - not per address,
+    because a proxy route that forwards the client's own X-Forwarded-For would
+    make the address attacker-chosen - and never in the API's per-address
+    buckets, so forged /health failures cannot lock the admin out of the API.
+    While the bucket is locked /health ignores credentials (public view only);
+    the API and the public health status are unaffected.
     """
     if credentials is None:
         return False
-    key = client_key(request)
-    if login_rate_limiter.retry_after(key):
+    if health_credentials_limiter.retry_after(HEALTH_LIMIT_KEY):
         return False
     if credentials_are_valid(credentials):
-        login_rate_limiter.record_success(key)
         return True
-    login_rate_limiter.record_failure(key)
+    health_credentials_limiter.record_failure(HEALTH_LIMIT_KEY)
     return False
 
 
 @app.get("/health")
-def health_check(
-    request: Request,
-    credentials: Optional[HTTPBasicCredentials] = Depends(optional_credentials),
-):
+def health_check(credentials: Optional[HTTPBasicCredentials] = Depends(optional_credentials)):
     """System health check.
 
     Public: status, timestamp, database and model availability (HTTP 503 when
@@ -877,7 +888,7 @@ def health_check(
         "model": {"available": os.path.exists(_model_path())},
     }
 
-    if _health_authenticated(request, credentials):
+    if _health_authenticated(credentials):
         try:
             memory = psutil.virtual_memory()
             disk = psutil.disk_usage(PROJECT_ROOT)

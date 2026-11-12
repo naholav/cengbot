@@ -33,6 +33,7 @@ import logging
 import os
 import sqlite3
 import sys
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -175,6 +176,46 @@ def _group(indexes: Dict[str, IndexInfo]) -> Dict[str, List[str]]:
     return {table: sorted(names) for table, names in sorted(grouped.items())}
 
 
+def _header_says_wal(db_path: str) -> bool:
+    """WAL mode is stored in the file header (read/write format versions 2)."""
+    try:
+        with open(db_path, "rb") as f:
+            header = f.read(20)
+    except OSError:
+        return False
+    return len(header) == 20 and header[18] == 2 and header[19] == 2
+
+
+def _connect_for_dry_run(db_path: str, busy_timeout: float) -> sqlite3.Connection:
+    """A connection that cannot change the database and leaves no file behind.
+
+    A plain ``mode=ro`` connection to a WAL database that nobody else has open
+    creates "<db>-wal" and "<db>-shm" (owned by whoever runs the dry-run) and
+    cannot remove them on close; left by another user they make the services
+    fail with "attempt to write a readonly database". Hence:
+
+    - side files present (the services are running, or crashed): ``mode=ro``
+      uses them as they are and creates nothing;
+    - no side files and the file is writable: a read-write connection with
+      ``PRAGMA query_only`` - no statement can write, and as the last
+      connection it removes the side files it created when it closes;
+    - no side files, not writable: nobody is connected and no commit is in a
+      -wal file, so the main file is complete; it is read ``immutable``
+      (no locks, no side files).
+    """
+    uri = "file:" + urllib.parse.quote(db_path)
+    side_files = [os.path.exists(db_path + suffix) for suffix in ("-wal", "-shm")]
+    writable = os.access(db_path, os.W_OK) and os.access(os.path.dirname(db_path), os.W_OK)
+    if all(side_files) or (any(side_files) and not writable):
+        return sqlite3.connect(uri + "?mode=ro", uri=True, timeout=busy_timeout, isolation_level=None)
+    if writable:
+        conn = sqlite3.connect(db_path, timeout=busy_timeout, isolation_level=None)
+        conn.execute("PRAGMA query_only = ON")
+        return conn
+    return sqlite3.connect(uri + "?mode=ro&immutable=1", uri=True, timeout=busy_timeout,
+                           isolation_level=None)
+
+
 def migrate(db_path: str, dry_run: bool = False, busy_timeout: float = 30.0) -> MigrationResult:
     """Migrate the SQLite file ``db_path`` (see the module docstring)."""
     db_path = os.path.abspath(db_path)
@@ -182,9 +223,8 @@ def migrate(db_path: str, dry_run: bool = False, busy_timeout: float = 30.0) -> 
         raise MigrationError(f"database file not found: {db_path}")
     result = MigrationResult(database=db_path, dry_run=dry_run)
 
-    if dry_run:  # read-only: guaranteed to change nothing
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=busy_timeout,
-                               isolation_level=None)
+    if dry_run:  # cannot write, leaves no -wal/-shm behind
+        conn = _connect_for_dry_run(db_path, busy_timeout)
     else:
         conn = sqlite3.connect(db_path, timeout=busy_timeout, isolation_level=None)
     try:
@@ -195,6 +235,8 @@ def migrate(db_path: str, dry_run: bool = False, busy_timeout: float = 30.0) -> 
         if check != "ok":
             raise MigrationError(f"PRAGMA quick_check failed: {check} - restore a backup first")
         result.journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        if _header_says_wal(db_path):  # an immutable connection reports "delete"
+            result.journal_mode = "wal"
 
         if not dry_run:
             # Write lock for the whole plan + DDL: nobody changes the schema meanwhile.

@@ -101,7 +101,7 @@ def build_legacy_db(path: Path, indexes=LEGACY_INDEXES, seed=True) -> Path:
 
 def index_signature(path: Path):
     """{index name: (table, unique, columns)} incl. constraint autoindexes."""
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn = sqlite3.connect(path)  # (not mode=ro: that would leave -wal/-shm behind on WAL files)
     try:
         result = {}
         tables = [r[0] for r in conn.execute(
@@ -116,7 +116,7 @@ def index_signature(path: Path):
 
 
 def table_dump(path: Path):
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn = sqlite3.connect(path)  # (not mode=ro: that would leave -wal/-shm behind on WAL files)
     try:
         return {t: conn.execute(f'SELECT * FROM "{t}" ORDER BY rowid').fetchall()
                 for t in ("raw_data", "training_data", "user_votes", "user_analytics", "system_metrics")}
@@ -287,13 +287,78 @@ def test_cli_defaults_to_database_url(legacy_db, monkeypatch, capsys):
     assert "use --db" in err and "secret" not in err
 
 
+def _to_wal(path: Path) -> None:
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+    conn.close()  # last connection: the -wal/-shm files are removed
+
+
+def side_files(path: Path):
+    return sorted(p.name for p in path.parent.iterdir() if p.name.startswith(path.name + "-"))
+
+
 def test_wal_database_migrates(legacy_db, fresh_signature):
-    conn = sqlite3.connect(legacy_db)
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.close()
+    _to_wal(legacy_db)
     result = mig.migrate(str(legacy_db))
     assert result.journal_mode == "wal" and result.changed
+    assert side_files(legacy_db) == []
     assert index_signature(legacy_db) == fresh_signature
+
+
+def test_dry_run_on_a_wal_database_leaves_no_side_files(legacy_db):
+    """Regression: the dry-run used mode=ro, which creates -wal/-shm on a WAL
+    database nobody has open and cannot remove them (left by another user they
+    break the services: "attempt to write a readonly database")."""
+    _to_wal(legacy_db)
+    assert side_files(legacy_db) == []
+    digest = sha256(legacy_db)
+    result = mig.migrate(str(legacy_db), dry_run=True)
+    assert result.journal_mode == "wal" and result.changed  # the plan is still made
+    assert side_files(legacy_db) == []
+    assert sha256(legacy_db) == digest
+
+
+def test_dry_run_on_a_read_only_wal_file_leaves_no_side_files(legacy_db):
+    """Run by a user who cannot write the database file: read it as it is."""
+    _to_wal(legacy_db)
+    digest = sha256(legacy_db)
+    legacy_db.chmod(0o444)
+    try:
+        result = mig.migrate(str(legacy_db), dry_run=True)
+    finally:
+        legacy_db.chmod(0o644)
+    assert result.created and result.dropped and result.journal_mode == "wal"
+    assert side_files(legacy_db) == []
+    assert sha256(legacy_db) == digest
+
+
+def test_dry_run_while_the_services_have_the_database_open(legacy_db):
+    """The services' -wal/-shm are used (newest commits included) and left alone."""
+    _to_wal(legacy_db)
+    service = sqlite3.connect(legacy_db)
+    try:
+        service.execute("PRAGMA wal_autocheckpoint = 0")  # keep the commit in the -wal file
+        service.execute("CREATE INDEX idx_raw_data_duplicate_of_id ON raw_data (duplicate_of_id)")
+        service.commit()
+        digest = sha256(legacy_db)
+        result = mig.migrate(str(legacy_db), dry_run=True)
+        assert result.created == ["idx_training_data_duplicate_answer_of_id"]  # sees the -wal commit
+        assert side_files(legacy_db) == [legacy_db.name + "-shm", legacy_db.name + "-wal"]
+        assert sha256(legacy_db) == digest
+        service.execute("INSERT INTO raw_data (telegram_id, question) VALUES (1, 'still writable')")
+        service.commit()
+    finally:
+        service.close()
+    assert side_files(legacy_db) == []
+
+
+def test_dry_run_connection_cannot_write(legacy_db):
+    conn = mig._connect_for_dry_run(str(legacy_db), 1.0)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("CREATE INDEX x ON raw_data (username)")
+    finally:
+        conn.close()
 
 
 def test_migrated_indexes_are_used_by_the_queries(legacy_db):

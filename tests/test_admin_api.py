@@ -64,6 +64,7 @@ def _isolate(monkeypatch):
     monkeypatch.setattr(api, "_gpu_info", lambda: {"available": False})
     # Fresh failed-login limiter per test (many tests send wrong credentials).
     monkeypatch.setattr(api, "login_rate_limiter", api.LoginRateLimiter())
+    monkeypatch.setattr(api, "health_credentials_limiter", api.LoginRateLimiter())
     return calls
 
 

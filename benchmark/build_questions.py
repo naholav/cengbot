@@ -482,6 +482,7 @@ def cmd_verify(args) -> int:
             "question": item["question"],
             "reference_answer": item["reference_answer"],
             "key_facts": item["key_facts"],
+            **({"extra_facts": item["extra_facts"]} if item.get("extra_facts") else {}),  # unscored context
             "required_links": item["required_links"],
             "acceptable_link_prefixes": item.get("acceptable_link_prefixes")
             or sorted({p for link in item["required_links"] for p in _link_prefixes(link)}),

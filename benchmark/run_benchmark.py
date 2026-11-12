@@ -12,6 +12,8 @@ Examples (GPU jobs must hold the shared GPU lock):
   flock <scratch>/gpu.lock .venv/bin/python benchmark/run_benchmark.py                # models/active-model
   flock <scratch>/gpu.lock .venv/bin/python benchmark/run_benchmark.py --model-path models/my-new-model --label qwen2.5-3b-v2
   .venv/bin/python benchmark/run_benchmark.py --regrade benchmark/results/<run>      # re-grade, no GPU
+  .venv/bin/python benchmark/run_benchmark.py --regrade benchmark/results/<run> --no-llm \
+      --output-dir benchmark/results/<run>_det-v3                                  # keep the old scores
   .venv/bin/python benchmark/run_benchmark.py --no-llm ...                           # deterministic scoring only
 
 Outputs ``benchmark/results/<label-or-model>_<timestamp>/``: answers.jsonl,
@@ -27,6 +29,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -322,9 +325,11 @@ def write_report(run_dir: Path, summary: Dict[str, Any], items: List[Dict[str, A
         f"- Questions: {s['n']} of {summary['questions']['n_total']} (`{summary['questions']['file']}`, sha256 {summary['questions']['sha256'][:12]})",
         f"- Scoring: **{mode}**" + (f" (judge `{summary['judge']['model']}`, rubric {summary['judge']['rubric_version']})"
                                      if summary["judge"]["enabled"] else
-                                     f" (LLM judge off: {summary['judge'].get('reason')})"),
+                                     f" (LLM judge off: {summary['judge'].get('reason')})")
+        + f"; deterministic rubric `{summary['judge'].get('deterministic_version', '?')}`",
         f"- Git: `{(summary['git'].get('commit') or '?')[:12]}`" + (" (working tree dirty)" if summary["git"].get("dirty") else ""),
-        f"- Generated: {summary.get('created_at')}, graded: {summary.get('graded_at')}",
+        f"- Generated: {summary.get('created_at')}, graded: {summary.get('graded_at')}"
+        + (f" (re-graded from `{summary['regraded_from']}`, same answers)" if summary.get("regraded_from") else ""),
         "",
         "## Scores",
         "",
@@ -390,8 +395,20 @@ def write_report(run_dir: Path, summary: Dict[str, Any], items: List[Dict[str, A
     (run_dir / "report.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
+def _rubric(summary: Dict[str, Any]) -> str:
+    """How a run was scored, e.g. "deterministic det-v3" or "claude-sonnet-5-5 (v1) + det-v3"."""
+    judge = summary.get("judge") or {}
+    det = judge.get("deterministic_version", "?")
+    mode = (summary.get("scores") or {}).get("scoring_mode")
+    if mode == "llm":
+        return f"{judge.get('model')} ({judge.get('rubric_version')}) + {det}"
+    return f"mixed {judge.get('model')} ({judge.get('rubric_version')}) + {det}" if mode == "mixed" \
+        else f"deterministic {det}"
+
+
 def update_leaderboard(results_dir: Path, path: Path, n_total: Optional[int] = None) -> None:
-    """Rebuild LEADERBOARD.md from every run's summary.json (full runs only)."""
+    """Rebuild LEADERBOARD.md from every run's summary.json (full runs only). Deterministic runs scored with
+    an older ``grader.DETERMINISTIC_VERSION`` are listed separately, as history."""
     rows, partial = [], 0
     for summary_path in sorted(Path(results_dir).glob("*/summary.json")):
         try:
@@ -406,35 +423,44 @@ def update_leaderboard(results_dir: Path, path: Path, n_total: Optional[int] = N
         rows.append(s)
 
     def table(subset: List[Dict[str, Any]]) -> List[str]:
-        out = ["| date | model | overall | TR | EN | link accuracy | hallucination rate | judge | run dir |",
-               "|---|---|---|---|---|---|---|---|---|"]
+        out = ["| date | model | overall | TR | EN | key-fact coverage | link accuracy | hallucination rate | "
+               "scoring | run dir |",
+               "|---|---|---|---|---|---|---|---|---|---|"]
         for s in sorted(subset, key=lambda x: -(x["scores"].get("overall") or 0)):
             sc = s["scores"]
-            det_version = s["judge"].get("deterministic_version", "?")
-            judge = (f"{s['judge']['model']} ({s['judge']['rubric_version']})" if sc.get("scoring_mode") == "llm"
-                     else ("mixed" if sc.get("scoring_mode") == "mixed"
-                           else f"none (deterministic {det_version})"))
             dirty = " *" if s.get("git", {}).get("dirty") else ""
+            regraded = f" (re-graded from `{s['regraded_from']}`)" if s.get("regraded_from") else ""
             out.append(
                 f"| {(s.get('created_at') or '')[:10]} | {s.get('model_name')} | {_fmt(sc.get('overall'))} | "
                 f"{_fmt(sc.get('by_lang', {}).get('tr'))} | {_fmt(sc.get('by_lang', {}).get('en'))} | "
-                f"{_fmt(sc.get('link_accuracy'), True)} | {_fmt(sc.get('hallucination_rate'), True)} | {judge} | "
-                f"[{s['run']}](results/{s['run']}/report.md){dirty} |")
+                f"{_fmt(sc.get('key_fact_coverage'), True)} | {_fmt(sc.get('link_accuracy'), True)} | "
+                f"{_fmt(sc.get('hallucination_rate'), True)} | {_rubric(s)} | "
+                f"[{s['run']}](results/{s['run']}/report.md){dirty}{regraded} |")
         return out
 
+    current = grader.DETERMINISTIC_VERSION
     llm = [s for s in rows if s["scores"].get("scoring_mode") == "llm"]
-    det = [s for s in rows if s["scores"].get("scoring_mode") != "llm"]
+    det = [s for s in rows if s["scores"].get("scoring_mode") != "llm"
+           and s.get("judge", {}).get("deterministic_version") == current]
+    history = [s for s in rows if s not in llm and s not in det]
     lines = ["# CengBot benchmark leaderboard", "",
              "Generated by `benchmark/run_benchmark.py` from `benchmark/results/*/summary.json`. "
-             "Scores are 0-100 (see `benchmark/README.md`). Only compare runs scored the same way: "
-             "LLM-judged scores and deterministic (`--no-llm`) scores use different formulas, and LLM-judged "
-             "runs are only comparable with the same judge model and rubric version.", "",
+             "Scores are 0-100 (see `benchmark/README.md`). Only compare runs scored the same way (the "
+             "*scoring* column): LLM-judged scores and deterministic (`--no-llm`) scores use different formulas, "
+             "LLM-judged runs are only comparable with the same judge model and rubric version, and "
+             "deterministic runs only with the same rubric (`det-vN`).", "",
              "## LLM-judged", ""]
     lines += table(llm) if llm else ["_No LLM-judged runs yet._"]
-    lines += ["", "## Deterministic only (`--no-llm` or no API key)", ""]
-    lines += table(det) if det else ["_No deterministic runs yet._"]
+    lines += ["", f"## Deterministic only (`--no-llm` or no API key), rubric `{current}`", ""]
+    lines += table(det) if det else ["_No deterministic runs with the current rubric yet._"]
+    if history:
+        lines += ["", "## Earlier deterministic rubrics (history)", "",
+                  "Kept for the record; not comparable with the tables above (older grader rules and/or an older "
+                  "`questions.jsonl`). Re-grade a run with "
+                  "`run_benchmark.py --regrade <run> --no-llm --output-dir <new run dir>` to compare it.", ""]
+        lines += table(history)
     lines += ["", "`*` = the run was made from a working tree with uncommitted changes."]
-    question_sets = sorted({(s.get("questions") or {}).get("sha256", "?")[:12] for s in rows})
+    question_sets = sorted({(s.get("questions") or {}).get("sha256", "?")[:12] for s in llm + det})
     if len(question_sets) > 1:
         lines += ["Warning: these runs used different versions of questions.jsonl (sha256 "
                   + ", ".join(question_sets) + "); only compare runs with the same question set "
@@ -457,6 +483,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ids", help="comma-separated item ids (partial run)")
     p.add_argument("--no-llm", action="store_true", help="deterministic scoring only (no API calls)")
     p.add_argument("--regrade", metavar="RUN_DIR", help="re-grade an existing run's answers (no generation)")
+    p.add_argument("--output-dir", metavar="DIR",
+                   help="with --regrade: write the re-graded run to DIR (answers and cached judgments are copied) "
+                        "instead of overwriting RUN_DIR's scores, e.g. after a rubric change")
     p.add_argument("--label", help="run name prefix (default: model directory name)")
     p.add_argument("--seed", type=int, default=1234, help="per-item seed = seed + index (sampling is on)")
     p.add_argument("--results-dir", default=str(DEFAULT_RESULTS))
@@ -476,11 +505,27 @@ def main(argv: Optional[Sequence[str]] = None, *, model=None, guard=None,
     results_dir = Path(args.results_dir)
     q_meta = {"file": _rel(questions_path), "sha256": file_sha256(questions_path), "n_total": len(all_items)}
 
+    regraded_from = None
+    if args.output_dir and not args.regrade:
+        raise SystemExit("--output-dir needs --regrade")
     if args.regrade:
         run_dir = Path(args.regrade)
         old = json.loads((run_dir / "summary.json").read_text(encoding="utf-8")) \
             if (run_dir / "summary.json").exists() else {}
         answers = read_jsonl(run_dir / "answers.jsonl")
+        if args.output_dir:
+            out_dir = Path(args.output_dir)
+            if out_dir.resolve() == run_dir.resolve():
+                raise SystemExit("--output-dir must differ from the run being re-graded")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(run_dir / "answers.jsonl", out_dir / "answers.jsonl")
+            if (run_dir / "judgments.jsonl").exists() and not (out_dir / "judgments.jsonl").exists():
+                shutil.copyfile(run_dir / "judgments.jsonl", out_dir / "judgments.jsonl")
+            regraded_from = old.get("regraded_from") or run_dir.name
+            run_dir = out_dir
+            log(f"re-grading into {_rel(run_dir)}; {regraded_from} is left as it is")
+        else:
+            regraded_from = old.get("regraded_from")
         answered = {a["id"] for a in answers}
         items = [it for it in items if it["id"] in answered]
         model_info = old.get("model", {})
@@ -551,6 +596,8 @@ def main(argv: Optional[Sequence[str]] = None, *, model=None, guard=None,
         "generation": generation,
         "scores": scores,
     }
+    if regraded_from:
+        summary["regraded_from"] = regraded_from
     write_json(run_dir / "summary.json", summary)
     write_report(run_dir, summary, items, answers, results)
     update_leaderboard(results_dir, Path(args.leaderboard))

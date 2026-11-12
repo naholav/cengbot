@@ -19,7 +19,7 @@ official page.
 | `build_questions.py` | builder: `fetch` / `extract` / `generate` / `verify` |
 | `textutil.py` | HTML-to-text and text normalisation helpers |
 | `sources.md`, `source_urls*.txt` | the official pages used, and when they were fetched |
-| `provenance/` | all 151 candidates, the review decisions and the build report (why each one was kept or dropped) |
+| `provenance/` | all 151 candidates, the review decisions, the build report (why each one was kept or dropped) and `keyfact_changes.md` (every key-fact edit since the first build) |
 | `results/<run>/` | one directory per run (committed: small text files) |
 | `LEADERBOARD.md` | generated table of all full runs |
 
@@ -32,11 +32,17 @@ Each line of `questions.jsonl` is one item:
 ```json
 {"id": "tr-001", "lang": "tr", "category": "academic_calendar", "difficulty": "easy",
  "question": "...", "reference_answer": "... https://...", "key_facts": ["...", "..."],
+ "extra_facts": ["..."],
  "required_links": ["https://..."], "acceptable_link_prefixes": ["https://...", "..."],
  "source_url": "https://...", "evidence": "verbatim quote from the page",
  "verified_at": "2026-11-11", "checks": {"quote_found": true, "link_ok": true, "manual_ok": true},
  "origin": "manual"}
 ```
+
+`key_facts` (2-4 per item; one for `tr-047`, which asks a single yes/no thing) are what an answer is scored
+on. A yes/no question's answering fact starts with the reference answer's yes/no ("Hayır, ...", "Yes, ...").
+`extra_facts` (optional) are true and on the source page but not asked by the question; they are not scored.
+[`provenance/keyfact_changes.md`](provenance/keyfact_changes.md) logs every key-fact change.
 
 Categories: academic calendar, registration, internship, Erasmus/exchange, graduation (incl. graduation
 project), staff and contacts, courses and credits, labs and research, double major/minor, exams and grading,
@@ -88,6 +94,10 @@ flock /path/to/gpu.lock .venv/bin/python benchmark/run_benchmark.py --model-path
 # re-grade an existing run (no GPU; cached judgments are free), e.g. after adding an API key
 .venv/bin/python benchmark/run_benchmark.py --regrade benchmark/results/<run>
 
+# re-grade into a new run directory and keep the old scores (e.g. after a rubric change)
+.venv/bin/python benchmark/run_benchmark.py --regrade benchmark/results/<run> --no-llm \
+    --output-dir benchmark/results/<run>_det-v3
+
 # options
 --no-llm            deterministic scoring only (no API calls)
 --limit N / --ids   partial run (smoke tests; partial runs are not put on the leaderboard)
@@ -124,12 +134,33 @@ Deterministic checks (always run):
 * **Hallucinated URL**: a URL on a non-official domain that is not on the item's list.
 * **Language**: Turkish question → Turkish answer (URLs, e-mails, names and short answers are not judged).
 * **Length sanity**: non-empty, not the guard/fallback text, ≤ 150 words.
-* **Key-fact coverage (proxy, `det-v2`)**: normalised token overlap per key fact (ASCII folding, stems for
-  Turkish suffixes, number words). Only the fact's tokens that are *not already in the question* count, so
-  echoing the question earns nothing; every number of the fact must appear, next to the same unit word when
-  the fact has one (`2. hafta` is not matched by `2. ve 4. haftalarda`); e-mail addresses must match
-  exactly. A fact counts as covered at ≥ 50 % of those tokens. (`det-v1`, a plain overlap, was replaced after
-  a hand check showed it gave full credit to wrong answers that reused the question's words.)
+* **Key-fact coverage (proxy, rubric `det-v3`)**: normalised token overlap per key fact (ASCII folding, stems
+  for Turkish suffixes, number words). Only the fact's tokens that are *not already in the question* count, so
+  echoing the question earns nothing. A fact counts as covered at ≥ 50 %. On top of that:
+  * **Numbers** must all appear, compared by value: `2.5` = `2.50`, `3` = `3,00`, `09.00` = `9:00`; dates are
+    one token each, whatever the format (`02.11.2026` = `2 Kasım 2026` = `November 2, 2026`; `25-29 January`
+    gives two dates; a year that is in the question is not required). A number followed by a unit word must
+    be followed by the same unit (`2. hafta` is not matched by `2. ve 4. haftalarda`). Grading scales
+    (`/4.00`, `/100`, `100 üzerinden`, `out of 100`) and numbers in parentheses next to other numbers
+    (`2.72 (100 üzerinden 70)`) are optional.
+  * **E-mail addresses and URLs** in a fact must be in the answer (`url_matches`; a `t.me/<name>` link is also
+    matched by `@<name>`).
+  * **Polarity.** Negation is not a stop word. Markers: EN *no, not, n't, cannot, never, none, nor*; TR
+    *hayır, değil, yok* and negated verbs (`-maz/-mez`, `-mıyor`, `-mamak` incl. `-mamaktadır`, `-mamış`,
+    `-mayan`, `-mayacak`, `-madı`, `-mamalı`, `-maması`; never a bare `-ma/-me`, so *uygulama*, *yenileme*,
+    *sınav*, *zorunlu* stay positive; relative forms such as *almadığın* are not negations). A fact with a
+    marker scores 0 when the answer's polarity differs: a yes/no fact is compared with the answer's leading
+    yes/no (an answer that negates the question's own predicate, e.g. "not mandatory" for "is it
+    mandatory?", counts as "no"); otherwise the answer's clauses that mention the fact decide (for a negated
+    fact one of them must be negated). A negation that only repeats the question's ("katılmazsam ne olur?")
+    is ignored, and a negated Turkish verb only matches a negated verb (*açılmaz* ~ *açılmıyor*, not
+    *açılır*). A matched polarity counts as one more token.
+
+  History: `det-v1`, a plain overlap, gave full credit to wrong answers that reused the question's words;
+  `det-v2` added the novel-token rule, units and exact e-mails, but scored "Evet ... açılır" like
+  "Hayır ... açılmaz", missed `2.5` for `2.50` and ignored URLs inside facts; `det-v3` (2026-11-12) fixes
+  those and moved facts the question does not ask for to `extra_facts`. Scores of different rubrics are not
+  comparable: the leaderboard lists older rubrics separately.
 
 LLM judge (`claude-sonnet-5-5`, rubric `v1` in `grader.py`): gets the question, reference answer, key facts,
 required links and the model answer and returns strict JSON `{correctness 0-4, key_facts_covered[],
@@ -159,7 +190,8 @@ hallucination rate, language match, length sanity, key-fact coverage, mean corre
   marked `mixed`; refusals are retried on the next `--regrade`.
 * The deterministic proxy cannot tell a correct paraphrase from a wrong answer that reuses the words, and
   it cannot see invented facts: in deterministic mode the *hallucination rate* only counts invented URLs.
-  Use it for quick checks, and the LLM judge for decisions.
+  Its polarity check only sees negation words, not antonyms ("optional" for "not required"), and facts
+  without a marker are not polarity-checked. Use it for quick checks, and the LLM judge for decisions.
 * Facts are as of 2026-11-11. Calendar items name the 2026-2027 year; staff/role items can go stale.
 
 ### Cost per run
@@ -187,6 +219,8 @@ C=benchmark/.cache
 .venv/bin/python -m pytest -q -p no:cacheprovider tests/test_benchmark.py
 ```
 
+* `provenance/candidates.jsonl` must carry the current `key_facts`/`extra_facts` (see
+  `provenance/keyfact_changes.md`), otherwise `verify` restores older facts; `verify` copies `extra_facts`.
 * Re-running `verify` on the current candidates after a refresh shows which evidence quotes or links broke.
   Fix or drop those items; replace them from the reserve (`"select": false` items) or write new ones.
 * For a new academic year, update the calendar items (new calendar PDF) and the EBS links (`.../555/<year>`).

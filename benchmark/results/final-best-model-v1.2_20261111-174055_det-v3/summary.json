@@ -1,0 +1,108 @@
+{
+  "run": "final-best-model-v1.2_20261111-174055_det-v3",
+  "created_at": "2026-11-11T14:40:55+00:00",
+  "graded_at": "2026-11-12T13:26:51+00:00",
+  "model_name": "meta-llama/Llama-3.2-3B + final-best-model-v1.2",
+  "model": {
+    "loaded": true,
+    "configured_path": "models/active-model",
+    "prompt_style": "training",
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "load_time_s": 3.61,
+    "last_error": null,
+    "architecture": "llama",
+    "stop_token_ids": [
+      128001,
+      128009
+    ],
+    "load_in_4bit": false,
+    "trust_remote_code": false,
+    "resolved_path": "models/final-best-model-v1.2",
+    "model_type": "lora",
+    "version": "final-best-model-v1.2",
+    "base_model": "meta-llama/Llama-3.2-3B",
+    "base_model_source": "meta-llama/Llama-3.2-3B",
+    "tokenizer_source": "models/final-best-model-v1.2",
+    "base_cached": true,
+    "generation_settings": {
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "top_k": 50,
+      "max_new_tokens": 200,
+      "repetition_penalty": 1.1,
+      "max_sentences": 4,
+      "max_input_tokens": 512,
+      "prompt_style": "training",
+      "precision": "bfloat16",
+      "merge_lora": true
+    }
+  },
+  "git": {
+    "commit": "b5ddce8c64da38b3c59883823b01c52c847ff609",
+    "dirty": false,
+    "modified": []
+  },
+  "questions": {
+    "file": "benchmark/questions.jsonl",
+    "sha256": "b85645185fe883dd604a2c4ce2f5fb9ee815bb7353b379f859329dca13854e92",
+    "n_total": 100,
+    "answers_generated_with": "41a1a2a59b2f1c1a2e7eab78c5f893d0143d4809db5c6b7e4736ddde8b6ae766"
+  },
+  "judge": {
+    "model": "claude-sonnet-5-5",
+    "rubric_version": "v1",
+    "effort": "medium",
+    "deterministic_version": "det-v3",
+    "enabled": false,
+    "reason": "disabled with --no-llm"
+  },
+  "generation": {
+    "seed": 1234,
+    "total_time_s": 350.2,
+    "mean_latency_s": 3.502,
+    "blocked": 0,
+    "errors": 0,
+    "output_fallbacks": 0,
+    "label": null
+  },
+  "scores": {
+    "n": 100,
+    "overall": 29.07,
+    "by_lang": {
+      "en": 29.2,
+      "tr": 28.93
+    },
+    "by_category": {
+      "academic_calendar": 27.78,
+      "courses_credits": 24.5,
+      "department_general": 42.0,
+      "double_major_minor": 18.75,
+      "erasmus_exchange": 24.29,
+      "exams": 25.91,
+      "graduate_programs": 38.33,
+      "graduation": 26.11,
+      "internship": 40.83,
+      "labs_research": 52.5,
+      "registration": 10.0,
+      "staff_contacts": 52.0,
+      "student_affairs": 15.42
+    },
+    "by_difficulty": {
+      "easy": 37.2,
+      "hard": 22.33,
+      "medium": 28.3
+    },
+    "link_accuracy": 0.32,
+    "mean_link_score": 0.3,
+    "wrong_link_rate": 0.56,
+    "hallucinated_url_rate": 0.0,
+    "hallucination_rate": 0.0,
+    "language_ok_rate": 1.0,
+    "length_ok_rate": 1.0,
+    "key_fact_coverage": 0.1867,
+    "llm_judged": 0,
+    "scoring_mode": "deterministic"
+  },
+  "regraded_from": "final-best-model-v1.2_20261111-174055"
+}

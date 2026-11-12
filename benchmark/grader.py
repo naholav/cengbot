@@ -7,7 +7,9 @@ Deterministic part (always runs, no network):
     *wrong* link and costs 0.5; a URL on a non-official domain is a
     *hallucinated* URL and costs 0.5 too.
   * language match (TR question -> TR answer), length sanity.
-  * key-fact coverage by normalised token overlap (used by ``--no-llm``).
+  * key-fact coverage by normalised token overlap (used by ``--no-llm``; rubric ``DETERMINISTIC_VERSION``):
+    numbers compared by value, URLs in a fact required, and a fact's polarity (negation, yes/no) must
+    match the answer's. Only ``key_facts`` are scored; an item's ``extra_facts`` are unscored context.
 
 LLM judge (``claude-sonnet-5-5``, when an API key is available): returns
 correctness 0-4, key_facts_covered, hallucination, language_ok and a rationale.
@@ -29,8 +31,9 @@ import re
 import sys
 import unicodedata
 from collections import defaultdict
+from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import unquote, urlsplit
 
 _HERE = Path(__file__).resolve().parent
@@ -200,10 +203,15 @@ def length_check(answer: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 # Version of the deterministic proxy below (recorded in summary.json; bump it when the rules change).
-DETERMINISTIC_VERSION = "det-v2"
+#   det-v2: novel-token overlap, numbers with units, verbatim e-mails.
+#   det-v3: + polarity (negation / yes-no), numbers by value (dates, times, optional denominators),
+#           URLs inside a fact must be in the answer.
+DETERMINISTIC_VERSION = "det-v3"
 
+# Polarity words are not content: the polarity check below handles them.
 _EXTRA_STOP = set("do does did have has had any all also into than within such may might shall get gets got "
-                  "need needs needed cu edu tr www http https com org pdf".split())
+                  "need needs needed cu edu tr www http https com org pdf cannot never none nor neither "
+                  "hayir degil yok".split())
 _FACT_STOP = {textutil.fold(w) for w in (_TR_STOP | _EN_STOP | _EXTRA_STOP)}
 # number words -> digits (folded spellings); "bir"/"on" are left out on purpose (article / preposition)
 _NUMBER_WORDS = {
@@ -214,77 +222,432 @@ _NUMBER_WORDS = {
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 _INVISIBLE_RE = re.compile("[\u00ad\u200b\u200c\u200d\u2060\ufeff]")  # soft hyphen, zero-width chars
 
+# --- polarity -------------------------------------------------------------------------------------------
+# English contractions are expanded first ("doesn't" -> "does not", "can't" -> "cannot").
+_EN_CONTRACTIONS = ((re.compile(r"\bcan['’]t\b", re.IGNORECASE), "cannot"),
+                    (re.compile(r"\bwon['’]t\b", re.IGNORECASE), "will not"),
+                    (re.compile(r"(?<=[a-z])n['’]t\b", re.IGNORECASE), " not"))
+_EN_NEG = {"no", "not", "never", "none", "cannot", "nor", "neither", "cant", "dont", "doesnt", "didnt", "isnt",
+           "arent", "wasnt", "werent", "shouldnt", "couldnt", "wouldnt", "mustnt", "neednt", "hasnt", "havent"}
+# words skipped when looking for what an English negation applies to ("is not required" -> "required")
+_EN_SKIP = set("a an the to be is are was were been being do does did have has had will would can could should "
+               "must may might need it they you he she we i this that there any also yet always necessarily "
+               "even still".split())
+_LEAD_WORDS = {"en": {"yes": "pos", "no": "neg"}, "tr": {"evet": "pos", "hayir": "neg"}}
+# Turkish: "hayır", "değil(dir)", "yok(tur)" and negated verb forms (folded to ASCII). Only verb endings are
+# matched, never a bare -ma/-me, so nouns such as "uygulama", "yenileme", "sınav", "zorunlu" stay positive;
+# relative/adverbial forms ("almadığın", "almadan", "almaksızın") are not treated as negation either.
+_TR_NEG_WORD_RE = re.compile(r"^(?:hayir|degil(?:dir|ler|lerdir|se|sen|sin|siniz|im|iz|di|mis)?"
+                             r"|yok(?:tur|sa|ken|tu|mus|lar)?)$")
+_TR_NEG_VERB_RE = re.compile(
+    r"^(?P<stem>[a-z]{2,}?)(?:"
+    r"m[ae]z(?:lar|ler|sa|se|san|sen|sam|sem|sak|sek|saniz|seniz|sin|sun|siniz|sunuz|ken|di|du|dir|mis"
+    r"|lardi|lerdi|larsa|lerse)?"                     # aorist: açılmaz, alınamaz, gerekmezse
+    r"|m[iu]yor(?:um|sun|uz|sunuz|lar|du|dum|sa|se|mus)?"  # present: açılmıyor, gerekmiyor
+    r"|m[ae]m[ae]k[a-z]{0,8}"                         # infinitive: almamak, bulunmamaktadır
+    r"|m[ae]m[iu]s[a-z]{0,6}"                         # perfect: kaybetmemiş
+    r"|m[ae]y[ae]n[a-z]{0,6}"                         # participle: katılmayan
+    r"|m[ae]y[ae]c[ae][kg][a-z]{0,6}"                 # future: verilmeyecek
+    r"|m[ae]d[iu](?:m|n|k|niz|nuz|lar|ler|r|ysa|yse)?"  # past: almadı
+    r"|m[ae]m[ae]l[iu][a-z]{0,6}"                     # necessity: yapmamalı
+    r"|m[ae]m[ae]s[iu][a-z]{0,6}"                     # verbal noun: katılmaması
+    r")$")
+_TR_NEG_EXCEPTIONS = {"yilmaz", "komedi", "emiyor", "gomuyor", "mamak"}
 
-def _content_tokens(text: str) -> List[str]:
-    text = _EMAIL_RE.sub(" ", _URL_RE.sub(" ", text or ""))
-    tokens = [_NUMBER_WORDS.get(t, t) for t in textutil.tokens(text)]
-    return [t for t in tokens if t not in _FACT_STOP and (len(t) > 1 or t.isdigit())]
+
+def _en_expand(text: str) -> str:
+    for pattern, repl in _EN_CONTRACTIONS:
+        text = pattern.sub(repl, text)
+    return text
 
 
-def _token_hit(token: str, answer_tokens: Sequence[str]) -> bool:
-    if token.isdigit():
-        return token in answer_tokens
-    stem = token[:5] if len(token) > 5 else token  # Turkish suffixes: "danisman" ~ "danismanina"
-    return any(a.startswith(stem) or (len(a) >= 4 and token.startswith(a)) for a in answer_tokens)
+def _tr_negated_stem(token: str) -> Optional[str]:
+    """Stem of a negated Turkish verb form ("açılmaz" -> "acil", "alınamaz" -> "alin"), else None."""
+    if token in _TR_NEG_EXCEPTIONS:
+        return None
+    match = _TR_NEG_VERB_RE.match(token)
+    if not match:
+        return None
+    stem = match.group("stem")
+    trimmed = re.sub(r"y?[ae]$", "", stem)  # abilitative -(y)a/-(y)e: "alina-maz" -> "alin"
+    return trimmed if len(trimmed) >= 3 else stem
 
 
+def _plain(text: str) -> str:
+    return _EMAIL_RE.sub(" ", _URL_RE.sub(" ", _INVISIBLE_RE.sub("", text or "")))
+
+
+def _negations(text: str, lang: str) -> List[str]:
+    """One entry per negation marker in ``text``: the stem it applies to ('' if unknown)."""
+    out: List[str] = []
+    if lang == "tr":
+        toks = textutil.tokens(_plain(text))
+        for i, tok in enumerate(toks):
+            if _TR_NEG_WORD_RE.match(tok):
+                out.append(toks[i - 1] if tok != "hayir" and i > 0 else "")
+            else:
+                stem = _tr_negated_stem(tok)
+                if stem is not None:
+                    out.append(stem)
+        return out
+    toks = textutil.tokens(_en_expand(_plain(text)))
+    for i, tok in enumerate(toks):
+        if tok not in _EN_NEG:
+            continue
+        if tok == "no" and i + 1 < len(toks) and toks[i + 1].isdigit():
+            continue  # "No. 5"
+        target = next((t for t in toks[i + 1:i + 4] if t not in _EN_SKIP and t not in _EN_NEG), "")
+        out.append(target)
+    return out
+
+
+def _same_stem(a: str, b: str) -> bool:
+    n = min(len(a), len(b), 5)
+    return n >= 3 and a[:n] == b[:n]
+
+
+def _novel_negations(text: str, lang: str, question_targets: Sequence[str]) -> List[str]:
+    """Negations of ``text`` that do not just repeat a negation of the question ("katılmazsam ...")."""
+    return [t for t in _negations(text, lang) if not (t and any(_same_stem(t, q) for q in question_targets if q))]
+
+
+def _lead(text: str, lang: str) -> Optional[str]:
+    """'pos'/'neg' if ``text`` starts with yes/evet or no/hayır."""
+    toks = textutil.tokens(_plain(text))
+    if not toks:
+        return None
+    if toks[0] == "no" and len(toks) > 1 and toks[1].isdigit():
+        return None
+    return _LEAD_WORDS.get(lang, {}).get(toks[0])
+
+
+_CLAUSE_SPLIT_RE = re.compile(r"(?<=[.!?;:])\s+|\n+|,\s+"
+                              r"|\s+(?:but|however|whereas|although|ama|ancak|fakat|oysa)\s+", re.IGNORECASE)
+
+
+def _clauses(text: str, lang: str) -> List[str]:
+    """Sentences split further at commas and contrastive conjunctions; a leading bare yes/no is kept with the
+    clause that follows it ("No, teams are assigned" is one negated statement)."""
+    parts = [p for p in _CLAUSE_SPLIT_RE.split(text or "") if p and p.strip()]
+    if len(parts) > 1 and len(textutil.tokens(parts[0])) == 1 and _lead(parts[0], lang):
+        parts = [parts[0] + " " + parts[1]] + parts[2:]
+    return parts
+
+
+_LEAD_RE = re.compile(r"^\W*(?:yes|no|evet|hay[ıi]r)\b\W*", re.IGNORECASE)
+
+
+class Polarity(NamedTuple):
+    lead: Optional[str]      # 'pos'/'neg' when the fact starts with yes/evet or no/hayır
+    negated: bool            # the rest of the fact negates something the question does not
+    targets: Tuple[str, ...]  # stems the fact negates ("acil" for "açılmaz", "choose" for "cannot choose")
+
+
+def fact_polarity(fact: str, question: str = "", lang: str = "en") -> Optional[Polarity]:
+    """The polarity of a fact that carries a marker, else None. A negation that only repeats the question's
+    own negation is ignored ("katılmayan" for "katılmazsam ne olur?")."""
+    lead = _lead(fact, lang)
+    body = _LEAD_RE.sub("", fact or "", count=1) if lead else (fact or "")
+    negations = _novel_negations(body, lang, _negations(question, lang))
+    if lead is None and not negations:
+        return None
+    return Polarity(lead, bool(negations), tuple(t for t in negations if t))
+
+
+# --- numbers ----------------------------------------------------------------------------------------------
+_MONTHS = {
+    "ocak": 1, "subat": 2, "mart": 3, "nisan": 4, "mayis": 5, "haziran": 6, "temmuz": 7, "agustos": 8,
+    "eylul": 9, "ekim": 10, "kasim": 11, "aralik": 12,
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12, "jan": 1, "feb": 2, "mar": 3, "apr": 4,
+    "jun": 6, "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+# Turkish month names may carry a suffix ("Kasım'da", "eylülde"); English abbreviations must stand alone.
+_MONTH_ALT = (r"(?:(?:ocak|subat|mart|nisan|mayis|haziran|temmuz|agustos|eylul|ekim|kasim|aralik)[a-z']*"
+              r"|(?:january|february|march|april|may|june|july|august|september|october|november|december"
+              r"|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec)\b\.?)")
+_ORD = r"(?:st|nd|rd|th)?"
+_RANGE = r"\s*(?:-|–|—|to|ile|and|ve)\s*"
+_DATE_NUMERIC_RE = re.compile(r"(?<![\d.,/])(\d{1,2})([./])(\d{1,2})\2(\d{4})(?![\d])")
+_DATE_DAY_MONTH_RE = re.compile(r"(?<![\d.,/])(\d{1,2})" + _ORD + r"(?:" + _RANGE + r"(\d{1,2})" + _ORD + r")?"
+                                r"\s+(?:of\s+)?(" + _MONTH_ALT + r")(?:,?\s+(\d{4})(?!\d))?")
+_DATE_MONTH_DAY_RE = re.compile(r"\b(" + _MONTH_ALT + r")\s+(\d{1,2})" + _ORD + r"(?!\d|[.,]\d)"
+                                r"(?:" + _RANGE + r"(\d{1,2})" + _ORD + r"(?!\d|[.,]\d))?(?:,?\s+(\d{4})(?!\d))?")
+
+
+def _month(name: str) -> int:
+    return next(_MONTHS[k] for k in sorted(_MONTHS, key=len, reverse=True) if name.startswith(k))
+
+
+_TIME_RE = re.compile(r"(?<![\d.,:])(\d{1,2}):(\d{2})(?![\d])")
 _NUM_RE = re.compile(r"\d+(?:[.,]\d+)?")
 _NUM_WORD_RE = re.compile(r"\b(" + "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True)) + r")\b")
 # a number followed by one of these words must be followed by the same word in the answer
 _UNITS = ("yariyil", "semester", "hafta", "week", "gun", "day", "yil", "year", "month", "akts", "ects", "saat",
           "hour", "dakika", "minute", "soru", "question", "puan", "point", "ders", "course")
+# grading scales: "2.20/4.00", "58/100", "100 üzerinden 70", "70 out of 100" (the scale is optional)
+_SCALES = {Decimal(4), Decimal(5), Decimal(10), Decimal(20), Decimal(100)}
 
 
-def _numbers(text: str) -> List[Tuple[str, Optional[str]]]:
-    """(number, unit) pairs; the unit is the first of the next two words if it is in ``_UNITS``."""
-    folded = textutil.fold(_EMAIL_RE.sub(" ", _URL_RE.sub(" ", text or "")))
+class Num(NamedTuple):
+    kind: str            # "num" or "date"
+    value: Any           # Decimal, or (day, month, year|None)
+    unit: Optional[str] = None
+    optional: bool = False  # a grading scale, or a parenthesised alternative
+
+
+def _date(day: str, month: int, year: Optional[str]) -> Optional[Num]:
+    d = int(day)
+    if not (1 <= d <= 31 and 1 <= month <= 12):
+        return None
+    return Num("date", (d, month, int(year) if year else None))
+
+
+def _numbers(text: str) -> List[Num]:
+    """Numbers of ``text`` compared by value: plain numbers (with the unit word that follows, if any), dates
+    ("2.11.2026", "2 Kasım 2026", "25-29 January", "January 25") and times ("9:30" == "09.30")."""
+    folded = textutil.fold(_plain(text))
     folded = _NUM_WORD_RE.sub(lambda m: _NUMBER_WORDS[m.group(1)], folded)
-    out = []
+    out: List[Tuple[int, Num]] = []
+    taken: List[Tuple[int, int]] = []
+
+    def free(match) -> bool:
+        return not any(a < match.end() and match.start() < b for a, b in taken)
+
+    for match in _DATE_NUMERIC_RE.finditer(folded):
+        date = _date(match.group(1), int(match.group(3)), match.group(4))
+        if date:
+            out.append((match.start(), date))
+            taken.append(match.span())
+    for match in _DATE_DAY_MONTH_RE.finditer(folded):
+        if match.group(3).rstrip(".") == "may" and not match.group(4):
+            continue  # "3 may be taken": "May" is a month only with a year
+        month = _month(match.group(3))
+        dates = [_date(match.group(1), month, match.group(4))]
+        if match.group(2):
+            dates.append(_date(match.group(2), month, match.group(4)))
+        if free(match) and all(dates):
+            out.extend((match.start(), d) for d in dates)
+            taken.append(match.span())
+    for match in _DATE_MONTH_DAY_RE.finditer(folded):
+        if match.group(1).rstrip(".") == "may" and not match.group(4):
+            continue
+        month = _month(match.group(1))
+        dates = [_date(match.group(2), month, match.group(4))]
+        if match.group(3):
+            dates.append(_date(match.group(3), month, match.group(4)))
+        if free(match) and all(dates):
+            out.extend((match.start(), d) for d in dates)
+            taken.append(match.span())
+    for match in _TIME_RE.finditer(folded):
+        if free(match) and int(match.group(1)) <= 23 and int(match.group(2)) <= 59:
+            out.append((match.start(), Num("num", Decimal(f"{match.group(1)}.{match.group(2)}"))))
+            taken.append(match.span())
+    parens = [(m.start(), m.end()) for m in re.finditer(r"\([^()]*\)", folded)]
+    plain: List[Tuple[int, Num, bool]] = []
     for match in _NUM_RE.finditer(folded):
-        number = match.group(0).replace(",", ".")
+        if not free(match):
+            continue
+        value = Decimal(match.group(0).replace(",", "."))
+        before, after = folded[max(0, match.start() - 8):match.start()], folded[match.end():match.end() + 12]
+        scale = value in _SCALES and (bool(re.search(r"\d\s*/\s*$", before)) or after.lstrip().startswith("uzerinden")
+                                      or bool(re.search(r"out of\s*$", before)))
         following = re.split(r"\d", folded[match.end():match.end() + 40], maxsplit=1)[0]
         words = re.findall(r"[a-z]+", following)[:2]
         unit = next((u for u in _UNITS if any(w.startswith(u) for w in words)), None)
-        out.append((number, unit))
+        in_parens = any(a < match.start() < b for a, b in parens)
+        plain.append((match.start(), Num("num", value, unit, scale), in_parens))
+    # numbers in parentheses are alternatives ("2.72 (100 üzerinden 70)") when others are outside them
+    outside = any(not p and not n.optional for _, n, p in plain)
+    for pos, num, in_parens in plain:
+        out.append((pos, num._replace(optional=num.optional or (in_parens and outside))))
+    return [num for _, num in sorted(out, key=lambda x: x[0])]
+
+
+def _number_found(num: Num, answer_numbers: Sequence[Num]) -> bool:
+    if num.kind == "date":
+        day, month, year = num.value
+        return any(a.kind == "date" and a.value[:2] == (day, month)
+                   and (year is None or a.value[2] is None or a.value[2] == year) for a in answer_numbers)
+    for a in answer_numbers:
+        if a.kind == "num" and a.value == num.value and (num.unit is None or a.unit == num.unit):
+            return True
+        if a.kind == "date" and num.unit is None and a.value[2] is not None and Decimal(a.value[2]) == num.value:
+            return True  # a year inside a date
+    return False
+
+
+def _required_numbers(fact: str, question: str) -> List[Num]:
+    """The fact's numbers that the answer must contain: not optional, not already in the question (for a
+    date, a year that is in the question is not required)."""
+    q_numbers = _numbers(question)
+    q_values = {n.value for n in q_numbers if n.kind == "num"}
+    q_values |= {Decimal(n.value[2]) for n in q_numbers if n.kind == "date" and n.value[2] is not None}
+    q_dates = {n.value[:2] for n in q_numbers if n.kind == "date"}
+    required = []
+    for num in _numbers(fact):
+        if num.optional:
+            continue
+        if num.kind == "date":
+            if num.value[:2] in q_dates:
+                continue
+            day, month, year = num.value
+            if year is not None and Decimal(year) in q_values:
+                num = num._replace(value=(day, month, None))
+            required.append(num)
+        elif num.value not in q_values:
+            required.append(num)
+    return required
+
+
+# --- URLs inside facts ------------------------------------------------------------------------------------
+
+def _fact_url_found(url: str, answer: str, answer_urls: Sequence[str]) -> bool:
+    if any(url_matches(a, url) for a in answer_urls):
+        return True
+    handle = re.match(r"^(?:https?://)?t\.me/([A-Za-z0-9_]{4,})/?$", url.strip(), re.IGNORECASE)
+    return bool(handle) and bool(re.search(r"(?<![\w@./])@" + re.escape(handle.group(1)) + r"\b", answer,
+                                           re.IGNORECASE))  # Telegram handle "@CUCEng"
+
+
+# --- content tokens ---------------------------------------------------------------------------------------
+
+def _content_tokens(text: str, lang: Optional[str] = None) -> List[str]:
+    """Folded content words without stop words, polarity words and dates. A negated Turkish verb becomes its
+    stem plus "!" ("açılmaz" -> "acil!"), so it only matches a negated form of the same verb ("açılmıyor"),
+    never the positive one ("açılır")."""
+    text = textutil.fold(_en_expand(_plain(text)))
+    for pattern in (_DATE_DAY_MONTH_RE, _DATE_MONTH_DAY_RE):  # a date is checked as a number, month included
+        text = pattern.sub(" ", text)
+    out = []
+    for tok in textutil.tokens(text):
+        tok = _NUMBER_WORDS.get(tok, tok)
+        if lang != "en" and not tok.isdigit():
+            stem = _tr_negated_stem(tok)
+            if stem is not None:
+                if len(stem) >= 3:
+                    out.append(stem + "!")
+                continue
+            if _TR_NEG_WORD_RE.match(tok):
+                continue
+        if tok in _FACT_STOP or tok in _EN_NEG or (len(tok) <= 1 and not tok.isdigit()):
+            continue
+        out.append(tok)
     return out
 
 
-def fact_overlap(fact: str, answer: str, question: str = "") -> float:
-    """Deterministic proxy for "the answer states this fact" (0..1).
+def _token_hit(token: str, answer_tokens: Sequence[str]) -> bool:
+    if token.isdigit():
+        return token in answer_tokens
+    negated = token.endswith("!")
+    token = token.rstrip("!")
+    stem = token[:5] if len(token) > 5 else token  # Turkish suffixes: "danisman" ~ "danismanina"
+    for a in answer_tokens:
+        if a.endswith("!") != negated:
+            continue
+        a = a.rstrip("!")
+        if a.startswith(stem) or (len(a) >= 4 and token.startswith(a)):
+            return True
+    return False
 
-    * e-mail addresses in the fact must appear verbatim, otherwise 0;
-    * every number of the fact that is not already in the question must appear in the answer, followed by
-      the same unit word when the fact has one ("2. hafta" is not matched by "2. ve 4. haftalarda"),
-      otherwise 0;
-    * the result is (matched numbers + new content tokens found in the answer) / (numbers + new content
-      tokens), where *new* means not already in the question (Turkish suffixes are tolerated by stem
-      matching); a fact that only restates the question is checked on all of its words."""
+
+def _guess_lang(*texts: str) -> str:
+    return "tr" if detect_language(" ".join(texts)) == "tr" else "en"
+
+
+def _mentions(stem: str, tokens: Sequence[str]) -> bool:
+    """Does any token start like ``stem`` (polarity ignored)? Stems shorter than 3 letters never match."""
+    stem = stem.rstrip("!")[:5]
+    return len(stem) >= 3 and any(t.rstrip("!").startswith(stem) for t in tokens)
+
+
+def _polarity_matches(polarity: Polarity, words: Sequence[str], numbers: Sequence[Num], urls: Sequence[str],
+                      answer: str, question: str, lang: str) -> bool:
+    """Does the answer state the fact with the same polarity?
+
+    A yes/no fact is compared with the answer's leading yes/no (or with an answer that negates the question's
+    own predicate, which counts as "no") when it has one. Otherwise the answer's clauses
+    that mention the fact (one of its words, numbers or links, or what it negates; a negated verb counts
+    whatever its polarity) decide: for a negated fact one of them must be negated, for a positive one the
+    first of them must not be. Negations that only repeat the question's own negation are ignored."""
+    answer_lead = _lead(answer, lang)
+    question_targets = _negations(question, lang)
+    if polarity.lead and not answer_lead:
+        # no explicit yes/no: negating the question's own predicate ("not mandatory" for "is it mandatory?",
+        # "aranmaz" for "aranır mı?") is a "no"
+        question_tokens = _content_tokens(question, lang)
+        if any(_mentions(t, question_tokens) for t in _novel_negations(answer, lang, question_targets)):
+            answer_lead = "neg"
+    if polarity.lead and answer_lead:
+        return answer_lead == polarity.lead
+    relevant: List[bool] = []
+    for clause in _clauses(answer, lang):
+        tokens = _content_tokens(clause, lang)
+        clause_numbers = _numbers(clause)
+        clause_urls = extract_urls(clause)
+        if (any(_mentions(w, tokens) if len(w.rstrip("!")) >= 3 else _token_hit(w, tokens) for w in words)
+                or any(_mentions(t, tokens) for t in polarity.targets)
+                or any(_number_found(n, clause_numbers) for n in numbers)
+                or any(_fact_url_found(u, clause, clause_urls) for u in urls)):
+            relevant.append(bool(_novel_negations(clause, lang, question_targets)))
+    if not relevant:
+        return False  # the answer never talks about this fact
+    return any(relevant) if polarity.negated else not relevant[0]
+
+
+def fact_overlap(fact: str, answer: str, question: str = "", lang: Optional[str] = None) -> float:
+    """Deterministic proxy for "the answer states this fact" (0..1), rubric ``det-v3``.
+
+    * e-mail addresses in the fact must appear verbatim, URLs must be in the answer (``url_matches``; a
+      t.me link also matches its "@handle"), otherwise 0;
+    * every number of the fact that is not already in the question must appear in the answer with the same
+      value ("2.5" == "2.50", "09.00" == "9:00", "2.11.2026" == "2 Kasım 2026"), followed by the same unit
+      word when the fact has one ("2. hafta" is not matched by "2. ve 4. haftalarda"), otherwise 0. Grading
+      scales ("/4.00", "/100", "100 üzerinden") and parenthesised alternatives are optional;
+    * a fact with a polarity marker (no/not/cannot/never/none/nor, yes; hayır/değil/yok, evet, negated verbs
+      such as "açılmaz", "aranmıyor", "bulunmamaktadır") scores 0 if the answer's polarity differs;
+    * the result is (matched URLs + numbers + polarity + new content tokens found in the answer) / (their
+      count), where *new* means not already in the question (Turkish suffixes are tolerated by stem
+      matching; a negated verb only matches a negated verb); a fact without a polarity marker that only
+      restates the question is checked on all of its words."""
     answer = _INVISIBLE_RE.sub("", answer or "")
+    lang = lang or _guess_lang(fact, answer)
     answer_l = answer.casefold()
     for email in _EMAIL_RE.findall(fact or ""):
         if email.casefold() not in answer_l:
             return 0.0
-    question_numbers = {n for n, _ in _numbers(question)}
-    answer_numbers = _numbers(answer)
-    fact_numbers = [(n, u) for n, u in _numbers(fact) if n not in question_numbers]
-    for number, unit in fact_numbers:
-        if not any(n == number and (unit is None or u == unit) for n, u in answer_numbers):
+    fact_urls = extract_urls(fact or "")
+    answer_urls = extract_urls(answer)
+    for url in fact_urls:
+        if not _fact_url_found(url, answer, answer_urls):
             return 0.0
-    words = [t for t in _content_tokens(fact) if not any(c.isdigit() for c in t)]
-    question_tokens = _content_tokens(question)
+    numbers = _required_numbers(fact or "", question)
+    answer_numbers = _numbers(answer)
+    for num in numbers:
+        if not _number_found(num, answer_numbers):
+            return 0.0
+    words = [t for t in _content_tokens(fact, lang) if not any(c.isdigit() for c in t)]
+    question_tokens = _content_tokens(question, lang)
     novel = [t for t in words if not _token_hit(t, question_tokens)]
-    if not novel and not fact_numbers:
+    gates = len(fact_urls) + len(numbers)
+    polarity = fact_polarity(fact, question, lang)
+    if not novel and not gates and polarity is None:
         novel = words  # the fact only restates the question: check its words anyway
-    if not novel and not fact_numbers:
+    if polarity is not None and not _polarity_matches(polarity, words, numbers, fact_urls, answer, question, lang):
+        return 0.0
+    polar = int(polarity is not None)  # a matched polarity counts like one more token
+    total = gates + polar + len(novel)
+    if not total:
         return 1.0 if _EMAIL_RE.search(fact or "") else 0.0
-    answer_tokens = _content_tokens(answer)
-    hits = len(fact_numbers) + sum(_token_hit(t, answer_tokens) for t in novel)
-    return hits / (len(fact_numbers) + len(novel))
+    answer_tokens = _content_tokens(answer, lang)
+    hits = gates + polar + sum(_token_hit(t, answer_tokens) for t in novel)
+    return hits / total
 
 
-def key_fact_coverage(facts: Sequence[str], answer: str, question: str = "",
-                      threshold: float = 0.5) -> Tuple[float, List[bool]]:
-    covered = [fact_overlap(f, answer, question) >= threshold for f in facts]
+def key_fact_coverage(facts: Sequence[str], answer: str, question: str = "", threshold: float = 0.5,
+                      lang: Optional[str] = None) -> Tuple[float, List[bool]]:
+    lang = lang or _guess_lang(" ".join(facts), answer)
+    covered = [fact_overlap(f, answer, question, lang) >= threshold for f in facts]
     return (sum(covered) / len(covered) if covered else 0.0), covered
 
 
@@ -293,7 +656,8 @@ def deterministic_checks(item: Dict[str, Any], answer: str) -> Dict[str, Any]:
     out.update(link_check(answer, item))
     out.update(language_check(answer, item["lang"]))
     out.update(length_check(answer))
-    coverage, covered = key_fact_coverage(item.get("key_facts") or [], answer, item.get("question", ""))
+    coverage, covered = key_fact_coverage(item.get("key_facts") or [], answer, item.get("question", ""),
+                                          lang=item.get("lang"))
     out["token_fact_coverage"] = round(coverage, 4)
     out["token_facts_covered"] = covered
     return out

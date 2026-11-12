@@ -66,7 +66,13 @@ def test_item_schema(item):
     assert re.fullmatch(r"(tr|en)-\d{3}", item["id"]) and item["id"].startswith(item["lang"] + "-")
     assert item["difficulty"] in ("easy", "medium", "hard")
     assert item["category"] in build_questions.CATEGORIES
-    assert 2 <= len(item["key_facts"]) <= 4 and all(isinstance(f, str) and f for f in item["key_facts"])
+    assert all(isinstance(f, str) and f for f in item["key_facts"])
+    # 2-4 scored facts; a single one only where the question asks exactly one thing and the rest was moved
+    # to the unscored extra_facts (see benchmark/provenance/keyfact_changes.md)
+    assert 2 <= len(item["key_facts"]) <= 4 or (len(item["key_facts"]) == 1 and item.get("extra_facts"))
+    extra = item.get("extra_facts", [])
+    assert isinstance(extra, list) and all(isinstance(f, str) and f for f in extra)
+    assert not set(extra) & set(item["key_facts"])
     for url in item["required_links"] + item["acceptable_link_prefixes"] + [item["source_url"]]:
         assert re.match(r"https?://", url), url
     for link in item["required_links"]:
@@ -219,6 +225,188 @@ def test_token_proxy_numbers_need_their_unit_and_emails_must_match():
     # numbers already in the question (e.g. the academic year) are not required again
     assert grader.key_fact_coverage(["Starts 25 January 2027"], "From 25 January.", "When in 2026-2027?")[0] == 1.0
     assert grader.key_fact_coverage(["Starts 25 January 2027"], "From 26 January.", "When in 2026-2027?")[0] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# det-v3: polarity, numbers by value, URLs inside facts
+# ---------------------------------------------------------------------------
+
+def _fact_covered(item_id, answer, n):
+    """Is scored fact ``n`` (0-based) of a real item covered by ``answer``?"""
+    item = BY_ID[item_id]
+    return grader.fact_overlap(item["key_facts"][n], answer, item["question"], item["lang"]) >= 0.5
+
+
+@pytest.mark.parametrize("word", ["açılmaz", "açılmıyor", "alınamaz", "edilemez", "aranmaz", "gerekmez",
+                                  "bulunmamaktadır", "kaybetmemiş", "katılmayanın", "verilmeyecek", "almadı",
+                                  "yapmamalı", "katılmaması", "kabul edilmez", "değildir", "yoktur", "hayır"])
+def test_turkish_negation_markers_are_detected(word):
+    assert grader._negations(word, "tr"), word
+
+
+@pytest.mark.parametrize("word", ["uygulama", "uygulaması", "yenileme", "sınav", "zorunlu", "mazeret", "Ramazan",
+                                  "yönetmelik", "mezuniyet", "değerlendirme", "danışman", "yoklama", "tamamlamak",
+                                  "bulunmaktadır", "gerekmektedir", "almadığın", "almadan", "almaksızın",
+                                  "Yılmaz", "geçersiz", "evet", "not ortalaması"])
+def test_turkish_nouns_and_affirmatives_are_not_negations(word):
+    assert grader._negations(word, "tr") == [], word
+
+
+def test_english_negations_and_contractions():
+    assert grader._negations("Students can't choose teams; topics cannot be changed.", "en") == ["choose", "changed"]
+    assert grader._negations("It isn't required, and you don't need to attend.", "en") == ["required", "attend"]
+    assert grader._negations("See Law No. 2547.", "en") == []
+    assert grader._negations("Yes, you can.", "en") == []
+
+
+def test_fact_polarity_ignores_the_questions_own_negation():
+    assert grader.fact_polarity("Görüşmeye katılmayanın stajı başarısız sayılır",
+                                "Staj değerlendirme görüşmesine katılmazsam ne olur?", "tr") is None
+    pol = grader.fact_polarity("Hayır, ÇÜ'de yaz öğretimi açılmaz", "Yaz okulu açıyor mu?", "tr")
+    assert pol.lead == "neg" and pol.negated and pol.targets == ("acil",)
+    pol = grader.fact_polarity("Yes, they are counted in the study period",
+                               "Do the semesters in which I did not renew my registration count?", "en")
+    assert pol.lead == "pos" and not pol.negated
+
+
+# (item, scored fact, correct answer, answer with the opposite polarity)
+POLARITY_CASES = [
+    ("tr-013", 0, "Hayır, Çukurova Üniversitesi'nde yaz öğretimi açılmıyor.",
+     "Evet, Çukurova Üniversitesi'nde yaz öğretimi açılır."),
+    ("tr-013", 0, "ÇÜ'de yaz öğretimi açılmaz, ama başka üniversitelerden ders alabilirsin.",
+     "ÇÜ'de yaz öğretimi açılır ve başka üniversitelerden de ders alabilirsin."),
+    ("tr-047", 0, "Devam şartı aranmıyor.", "Evet, devam şartı aranır."),
+    ("tr-018", 1, "Hayır, TOEFL veya IELTS gibi başka dil belgeleri kabul edilmiyor.",
+     "Evet, TOEFL ve IELTS gibi başka dil belgeleri kabul edilir."),
+    ("tr-035", 0, "Zorunlu dersleri kendi yarıyılında alıyorsan her yarıyıl 30 AKTS alma şartı aranmaz.",
+     "Evet, her yarıyılda 30 AKTS alma şartı aranır."),
+    ("tr-032", 0, "Tez danışmanı jüride yer alır ama oy kullanamaz.", "Tez danışmanının oy hakkı vardır."),
+    ("tr-043", 0, "Şart değil ama tercih sebebidir.", "Evet, kurumda bilgisayar mühendisi çalışması şarttır."),
+    ("tr-026", 0, "Evet, alabilirsin.", "FF veya DC aldığın dersleri başka üniversitenin yaz okulundan alamazsın."),
+    ("en-002", 0, "No. Teams are formed before the meeting, so you cannot choose them.",
+     "Yes, you can choose your own team."),
+    ("en-002", 1, "You can't pick your own team, and project topics can't be changed.",
+     "You can choose your own teams and the project topic can be changed."),
+    ("en-019", 1, "DZ means absent, so you cannot take the final exam.",
+     "DZ means absent; students with DZ can still take the final exam."),
+    ("en-021", 0, "Yes, it is compulsory for everyone taking Graduation Thesis.",
+     "It is optional, not mandatory, for Graduation Thesis students."),
+    ("en-035", 0, "Yes. Semesters you did not renew are still counted in your study period.",
+     "No, semesters without renewal are not counted in the study period."),
+    ("en-040", 0, "No. A minor only gives a certificate, not a separate degree.",
+     "Yes, a minor is a separate second degree."),
+    ("en-042", 0, "No, a literature review isn't accepted for the multidisciplinary part.",
+     "Yes, a literature study is accepted for the multidisciplinary part."),
+    ("en-044", 0, "No. Failed summer school grades are not taken into account.",
+     "Yes, failed summer school grades are counted."),
+    ("en-046", 0, "You don't have to attend again, but you must register.", "Yes, attendance is required again."),
+    ("en-043", 0, "Yes: through Erasmus, or at a company abroad that your advisor approves.",
+     "No, the compulsory internship cannot be done abroad."),
+]
+
+
+@pytest.mark.parametrize("item_id, n, correct, reversed_", POLARITY_CASES,
+                         ids=[f"{c[0]}-{c[1] + 1}-{i}" for i, c in enumerate(POLARITY_CASES)])
+def test_reversed_polarity_is_penalised(item_id, n, correct, reversed_):
+    assert _fact_covered(item_id, correct, n)
+    assert not _fact_covered(item_id, reversed_, n)
+
+
+def test_reversed_polarity_regression_tr_013():
+    """det-v2 gave the wrong "Evet ... açılır" 100, the same as the right "Hayır ... açılmaz"."""
+    item, link = BY_ID["tr-013"], BY_ID["tr-013"]["required_links"][0]
+    right = grader.score_item(item, f"Hayır, ÇÜ'de yaz öğretimi açılmaz; başka üniversitelerin yaz öğretiminden "
+                                    f"ders alınabilir. {link}")
+    wrong = grader.score_item(item, f"Evet, ÇÜ'de yaz öğretimi açılır; başka üniversitelerin yaz öğretiminden "
+                                    f"ders alınabilir. {link}")
+    assert right["score"] == 100.0 and wrong["token_facts_covered"] == [False, True] and wrong["score"] == 65.0
+
+
+def test_negated_turkish_verb_only_matches_a_negated_verb():
+    q = "Yaz okulu açıyor mu?"
+    assert grader.fact_overlap("Yaz öğretimi açılmaz", "Yaz öğretimi açılmıyor.", q, "tr") == 1.0
+    assert grader.fact_overlap("Yaz öğretimi açılmaz", "Yaz öğretimi açılamaz.", q, "tr") == 1.0
+    assert grader.fact_overlap("Yaz öğretimi açılmaz", "Yaz öğretimi açılır.", q, "tr") == 0.0
+    # a fact without a marker is not polarity-checked, but its verb is not matched by the negated one
+    assert grader.fact_overlap("Yaz öğretimi açılır", "Yaz öğretimi açılmaz.", q, "tr") == 0.5
+
+
+@pytest.mark.parametrize("fact, answer", [
+    ("GPA at least 2.50", "Your GPA must be at least 2.5."),
+    ("GPA at least 2.50", "GPA at least 2,50"),
+    ("GNO en az 3.00", "GNO'n en az 3 olmalı."),
+    ("Kayıtlar 09.00'da başlar", "Kayıtlar saat 9:00'da başlar."),
+    ("Kayıtlar 09.00'da başlar", "Kayıtlar 9.00'da başlar."),
+    ("Son gün 05.09.2026", "Son gün 5 Eylül 2026."),
+    ("Son gün 5 Eylül 2026", "Son gün 05.09.2026."),
+    ("Ends 29 January 2027", "It ends on January 29, 2027."),
+    ("Ends 29 January 2027", "It ends on 29/01/2027."),
+    ("En az 2.20/4.00", "En az 2.20 olmalı."),
+    ("veya 58/100", "100 üzerinden 58."),
+    ("At least 70 out of 100", "At least 70 out of a hundred."),
+    ("Anadal GNO en az 2.72 (100 üzerinden 70)", "Anadal GNO'n en az 2.72 olmalı."),
+])
+def test_number_variants_score_equally(fact, answer):
+    assert grader.fact_overlap(fact, answer) == 1.0
+
+
+@pytest.mark.parametrize("fact, answer", [
+    ("GPA at least 2.50", "Your GPA must be at least 2.05."),
+    ("Son gün 05.09.2026", "Son gün 09.05.2026."),
+    ("Son gün 05.09.2026", "Son gün 5 Ekim 2026."),
+    ("Ends 29 January 2027", "It ends on 29 January 2028."),
+    ("En az 2.20/4.00", "En az 4.00 olmalı."),
+    ("Anadal GNO en az 2.72 (100 üzerinden 70)", "100 üzerinden 70 olmalı."),
+])
+def test_wrong_numbers_still_fail(fact, answer):
+    assert grader.fact_overlap(fact, answer) == 0.0
+
+
+def test_dates_are_single_tokens():
+    assert grader._numbers("16.04.2024") == [grader.Num("date", (16, 4, 2024))]
+    assert [n.value for n in grader._numbers("25-29 January 2027")] == [(25, 1, 2027), (29, 1, 2027)]
+    assert [n.value for n in grader._numbers("2 Kasım - 8 Kasım 2026")] == [(2, 11, None), (8, 11, 2026)]
+    assert grader._numbers("at least 4 separate courses")[0].value == 4  # "sep" is not September here
+    assert grader._numbers("at most 3 may be taken")[0].value == 3  # "may" is a month only with a year
+    assert grader._numbers("2 May 2027")[0].value == (2, 5, 2027)
+    assert grader._numbers("2 Mayıs'ta")[0].value == (2, 5, None)
+    # the old token proxy matched "2" from "(2. dönem)" for the date "2 Kasım 2026"
+    assert not _fact_covered("tr-001", "Güz döneminin (2. dönem) ara sınavlarının başlangıç tarihlerini bu linkten "
+                                       "öğrenebilirsin.", 0)
+    assert _fact_covered("tr-001", "Ara sınavlar 02.11.2026 - 08.11.2026 arasında.", 0)
+
+
+def test_real_items_with_number_variants():
+    assert _fact_covered("en-017", "You need a GPA of at least 2.5.", 0)
+    assert _fact_covered("tr-005", "En az 2.2/4 olmalı.", 0)
+    assert _fact_covered("tr-005", "Ya da 100'lük sistemde 58.", 1)
+    assert _fact_covered("tr-004", "GNO'n en az 3 olmalı.", 0)
+    assert _fact_covered("tr-044", "0322 338 60 84 numarasını arayabilirsin.", 1)
+    assert _fact_covered("en-041", "High honor is 3.5 or higher.", 1)
+
+
+def test_url_inside_a_fact_must_be_in_the_answer():
+    assert not _fact_covered("en-036", "The undergraduate Telegram announcement channel is @CENG_Odev.", 0)
+    assert _fact_covered("en-036", "The channel is https://t.me/CUCEng", 0)
+    assert _fact_covered("en-036", "Follow @CUCEng on Telegram.", 0)
+    assert not _fact_covered("en-036", "Follow @CUCEngineering on Telegram.", 0)
+    assert grader.fact_overlap("https://bmb.cu.edu.tr/cu/student/erasmus",
+                               "Look at bmb.cu.edu.tr/cu/student/erasmus/ for it.") == 1.0
+    assert grader.fact_overlap("https://bmb.cu.edu.tr/cu/student/erasmus", "Look at bmb.cu.edu.tr/cu/student.") == 0.0
+
+
+def test_link_only_and_parrot_answers_stay_low():
+    link_only = [grader.score_item(it, it["required_links"][0])["score"] for it in ITEMS]
+    assert max(link_only) <= 30.0  # 20 link + 10 language, no fact
+    parrot = [grader.score_item(it, it["question"] + " " + it["required_links"][0])["score"] for it in ITEMS]
+    assert max(parrot) <= 65.0 and sum(parrot) / len(parrot) < 40.0
+
+
+def test_extra_facts_are_not_scored():
+    item = BY_ID["tr-047"]
+    assert item["extra_facts"] and len(item["key_facts"]) == 1
+    answer = "Hayır, devam koşulu aranmaz. " + item["required_links"][0]
+    assert grader.score_item(item, answer)["score"] == 100.0
 
 
 def _judgment(correctness=4, covered=(True, True), hallucination=False, language_ok=True):
@@ -511,7 +699,7 @@ def test_runner_end_to_end_no_llm(bench_env, capsys):
     assert "## 10 worst items" in report and "**Reference:**" in report and "deterministic" in report
     board = (bench_env.tmp / "LEADERBOARD.md").read_text(encoding="utf-8")
     assert "meta-llama/Llama-3.2-3B + fake-v0" in board
-    assert f"none (deterministic {grader.DETERMINISTIC_VERSION})" in board
+    assert f"deterministic {grader.DETERMINISTIC_VERSION}" in board
 
 
 def test_runner_records_generation_errors(bench_env):
@@ -548,6 +736,54 @@ def test_regrade_with_mocked_judge_uses_cache(bench_env):
     assert client2.messages.calls == []
     board = (bench_env.tmp / "LEADERBOARD.md").read_text(encoding="utf-8")
     assert f"{grader.JUDGE_MODEL} ({grader.RUBRIC_VERSION})" in board
+
+
+def test_regrade_into_a_new_directory_keeps_the_old_run(bench_env):
+    run_benchmark.main(bench_env.args + ["--no-llm"], model=bench_env.model, log=lambda m: None)
+    [run_dir] = _run_dirs(bench_env.tmp)
+    old_scores = (run_dir / "scores.jsonl").read_bytes()
+    old_summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    out = bench_env.tmp / "results" / (run_dir.name + "_det-vX")
+    rc = run_benchmark.main(bench_env.args + ["--regrade", str(run_dir), "--no-llm", "--output-dir", str(out)],
+                            log=lambda m: None)
+    assert rc == 0
+    assert (run_dir / "scores.jsonl").read_bytes() == old_scores  # the old run is untouched
+    assert (out / "answers.jsonl").read_bytes() == (run_dir / "answers.jsonl").read_bytes()
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["regraded_from"] == run_dir.name and summary["run"] == out.name
+    assert summary["created_at"] == old_summary["created_at"] and summary["model_name"] == old_summary["model_name"]
+    assert summary["judge"]["deterministic_version"] == grader.DETERMINISTIC_VERSION
+    assert f"re-graded from `{run_dir.name}`" in (out / "report.md").read_text(encoding="utf-8")
+    # a re-grade of the re-graded run still points at the original run
+    again = bench_env.tmp / "results" / "again"
+    run_benchmark.main(bench_env.args + ["--regrade", str(out), "--no-llm", "--output-dir", str(again)],
+                       log=lambda m: None)
+    assert json.loads((again / "summary.json").read_text(encoding="utf-8"))["regraded_from"] == run_dir.name
+    with pytest.raises(SystemExit):
+        run_benchmark.main(bench_env.args + ["--regrade", str(out), "--output-dir", str(out), "--no-llm"],
+                           log=lambda m: None)
+    with pytest.raises(SystemExit):
+        run_benchmark.main(bench_env.args + ["--output-dir", str(out), "--no-llm"], model=bench_env.model,
+                           log=lambda m: None)
+
+
+def test_leaderboard_lists_older_deterministic_rubrics_as_history(bench_env):
+    run_benchmark.main(bench_env.args + ["--no-llm"], model=bench_env.model, log=lambda m: None)
+    [run_dir] = _run_dirs(bench_env.tmp)
+    old = bench_env.tmp / "results" / "old-run"
+    old.mkdir()
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    summary["run"], summary["model_name"] = "old-run", "Old Model"
+    summary["judge"]["deterministic_version"] = "det-v2"
+    summary["questions"]["sha256"] = "0" * 64
+    (old / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    run_benchmark.update_leaderboard(bench_env.tmp / "results", bench_env.tmp / "LEADERBOARD.md")
+    board = (bench_env.tmp / "LEADERBOARD.md").read_text(encoding="utf-8")
+    current, history = board.split("## Earlier deterministic rubrics (history)")
+    assert f"rubric `{grader.DETERMINISTIC_VERSION}`" in current and "Old Model" not in current
+    assert "meta-llama/Llama-3.2-3B + fake-v0" in current
+    assert "Old Model" in history and "deterministic det-v2" in history
+    assert "different versions of questions.jsonl" not in board  # history rows are not compared
 
 
 def test_runner_without_api_key_falls_back_to_deterministic(bench_env):

@@ -1,0 +1,113 @@
+{
+  "run": "v1.2-final-code_20261112-185030",
+  "created_at": "2026-11-12T15:50:30+00:00",
+  "graded_at": "2026-11-12T15:55:47+00:00",
+  "model_name": "meta-llama/Llama-3.2-3B + final-best-model-v1.2",
+  "model": {
+    "loaded": true,
+    "configured_path": "models/active-model",
+    "prompt_style": "training",
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "load_time_s": 3.06,
+    "last_error": null,
+    "architecture": "llama",
+    "stop_token_ids": [
+      128001,
+      128009
+    ],
+    "load_in_4bit": false,
+    "trust_remote_code": false,
+    "resolved_path": "models/final-best-model-v1.2",
+    "model_type": "lora",
+    "version": "final-best-model-v1.2",
+    "base_model": "meta-llama/Llama-3.2-3B",
+    "base_model_source": "meta-llama/Llama-3.2-3B",
+    "tokenizer_source": "models/final-best-model-v1.2",
+    "base_cached": true,
+    "generation_settings": {
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "top_k": 50,
+      "max_new_tokens": 200,
+      "repetition_penalty": 1.1,
+      "max_sentences": 4,
+      "max_input_tokens": 512,
+      "prompt_style": "training",
+      "precision": "bfloat16",
+      "merge_lora": true
+    }
+  },
+  "git": {
+    "commit": "d0fdc307204ae1b20d27cacc3cb2a61b814b557e",
+    "dirty": true,
+    "modified": [
+      "CHANGELOG.md",
+      "config/requirements.txt",
+      "docs/DEPLOYMENT.md",
+      "src/llama_model_handler.py",
+      "src/train_model.py",
+      "tests/test_llama_model_handler.py"
+    ]
+  },
+  "questions": {
+    "file": "benchmark/questions.jsonl",
+    "sha256": "b85645185fe883dd604a2c4ce2f5fb9ee815bb7353b379f859329dca13854e92",
+    "n_total": 100
+  },
+  "judge": {
+    "model": "claude-sonnet-5-5",
+    "rubric_version": "v1",
+    "effort": "medium",
+    "deterministic_version": "det-v3",
+    "enabled": false,
+    "reason": "disabled with --no-llm"
+  },
+  "generation": {
+    "seed": 1234,
+    "total_time_s": 316.8,
+    "mean_latency_s": 3.167,
+    "blocked": 0,
+    "errors": 0,
+    "output_fallbacks": 0,
+    "label": "v1.2-final-code"
+  },
+  "scores": {
+    "n": 100,
+    "overall": 30.71,
+    "by_lang": {
+      "en": 30.18,
+      "tr": 31.23
+    },
+    "by_category": {
+      "academic_calendar": 26.67,
+      "courses_credits": 38.0,
+      "department_general": 42.0,
+      "double_major_minor": 18.75,
+      "erasmus_exchange": 25.71,
+      "exams": 29.09,
+      "graduate_programs": 38.33,
+      "graduation": 30.56,
+      "internship": 39.49,
+      "labs_research": 39.17,
+      "registration": 15.83,
+      "staff_contacts": 52.0,
+      "student_affairs": 12.5
+    },
+    "by_difficulty": {
+      "easy": 46.52,
+      "hard": 20.29,
+      "medium": 28.3
+    },
+    "link_accuracy": 0.34,
+    "mean_link_score": 0.315,
+    "wrong_link_rate": 0.55,
+    "hallucinated_url_rate": 0.0,
+    "hallucination_rate": 0.0,
+    "language_ok_rate": 1.0,
+    "length_ok_rate": 1.0,
+    "key_fact_coverage": 0.2058,
+    "llm_judged": 0,
+    "scoring_mode": "deterministic"
+  }
+}

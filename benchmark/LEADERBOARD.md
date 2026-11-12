@@ -10,6 +10,7 @@ _No LLM-judged runs yet._
 
 | date | model | overall | TR | EN | key-fact coverage | link accuracy | hallucination rate | scoring | run dir |
 |---|---|---|---|---|---|---|---|---|---|
+| 2026-11-12 | meta-llama/Llama-3.2-3B + final-best-model-v1.2 | 30.7 | 31.2 | 30.2 | 20.6% | 34.0% | 0.0% | deterministic det-v3 | [v1.2-final-code_20261112-185030](results/v1.2-final-code_20261112-185030/report.md) * |
 | 2026-11-11 | meta-llama/Llama-3.2-3B + final-best-model-v1.2 | 29.1 | 28.9 | 29.2 | 18.7% | 32.0% | 0.0% | deterministic det-v3 | [final-best-model-v1.2_20261111-174055_det-v3](results/final-best-model-v1.2_20261111-174055_det-v3/report.md) (re-graded from `final-best-model-v1.2_20261111-174055`) |
 
 ## Earlier deterministic rubrics (history)

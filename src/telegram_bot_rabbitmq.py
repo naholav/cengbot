@@ -102,10 +102,12 @@ logger = logging.getLogger(__name__)
 
 def _quiet_noisy_loggers() -> None:
     # httpx logs every request at INFO and the Telegram URL contains the bot
-    # token; pika logs ~5 INFO lines per connection.
+    # token. pika logs ~5 INFO lines per connection and, while the broker is
+    # down, ~10 ERROR lines with two tracebacks per failed connect attempt (the
+    # consumer and the publisher log one concise line per failure themselves).
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("pika").setLevel(logging.WARNING)
+    logging.getLogger("pika").setLevel(logging.CRITICAL)
 
 
 _quiet_noisy_loggers()
@@ -389,9 +391,11 @@ def send_to_rabbitmq(data) -> bool:
     return ok
 
 
-# Consumer reconnect backoff (seconds)
+# Consumer reconnect backoff (seconds). The cap stays well below ANSWER_TIMEOUT:
+# while the consumer waits to reconnect after a broker outage, every answer
+# arrives too late for its asker.
 CONSUMER_RECONNECT_INITIAL_DELAY = 1.0
-CONSUMER_RECONNECT_MAX_DELAY = 60.0
+CONSUMER_RECONNECT_MAX_DELAY = 15.0
 # A connection that lived at least this long resets the backoff.
 CONSUMER_STABLE_CONNECTION_SECONDS = 30.0
 ANSWER_PREFETCH_COUNT = 10

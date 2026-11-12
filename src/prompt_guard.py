@@ -433,7 +433,7 @@ _EN_MODS = (r"(?:(?:me|us|the|your|its|all|full|entire|complete|exact|original|i
             r"|internal|underlying|first|above|previous|verbatim|real|actual|current)\s+)")
 _EN_PROMPT_NOUN = (r"(?:system\s+prompt|system\s+message|system\s+instructions|initial\s+prompt"
                    r"|hidden\s+prompt|original\s+prompt|secret\s+prompt|pre\s?prompt|meta\s+prompt"
-                   r"|initial\s+instructions|hidden\s+instructions|original\s+instructions)")
+                   r"|hidden\s+instructions)")
 _EN_YOUR_NOUN = (r"(?:instructions|prompt|rules|guidelines|directives|configuration|programming"
                  r"|training\s+data|system\s+prompt)")
 _EN_BAD_PERSONA = (r"(?:unrestricted|unfiltered|uncensored|jailbroken|evil|unethical|amoral|unlimited"
@@ -441,15 +441,30 @@ _EN_BAD_PERSONA = (r"(?:unrestricted|unfiltered|uncensored|jailbroken|evil|uneth
                    r"|filters|limits|guidelines|censorship|ethics)|free\s+from|no\s+(?:rules|limits|restrictions|filters))")
 
 # Turkish building blocks (ASCII-folded)
-_TR_VERB = (r"(?:unut(?:un|man|mani|malisin|acaksin)?|yok\s+say(?:in|man|acaksin)?"
-            r"|gormezden\s+gel(?:in)?|goz\s+ardi\s+et(?:in)?|dikkate\s+alma(?:yin|yacaksin)?"
-            r"|umursama(?:yin)?|takma|bosver|bos\s+ver|iptal\s+et|gecersiz\s+(?:say|kil)"
-            r"|sil|devre\s+disi\s+birak|aldirma|uyma(?:yin|yacaksin)?|cigne|ihlal\s+et|es\s+gec)\b")
+# "Disregard" verbs. "uyma" is also the noun "compliance" ("kurallara uyma
+# zorunluluğu var mı?"), so it does not count when a noun follows it.
+_TR_IGNORE_VERB = (r"(?:unut(?:un|man|mani|malisin|acaksin)?|yok\s+say(?:in|man|acaksin)?"
+                   r"|gormezden\s+gel(?:in)?|goz\s+ardi\s+et(?:in)?|dikkate\s+alma(?:yin|yacaksin)?"
+                   r"|umursama(?:yin)?|takma|bosver|bos\s+ver|aldirma|cigne|ihlal\s+et|es\s+gec"
+                   r"|uyma(?:yin|yacaksin)?\b(?!\s+(?:zorunlu|yukumlu|sart|gerek|mecbur|kosul|durum|konu"
+                   r"|sorumlu|oran|hakk|bilinc|kural)\w*))\b")
+# "Cancel/delete" verbs: an override of instructions/rules, but ordinary actions on a
+# (shell/git) command - "önceki commit komutunu iptal et" is a programming question.
+_TR_EDIT_VERB = r"(?:iptal\s+et|gecersiz\s+(?:say|kil)|sil|devre\s+disi\s+birak)\b"
+_TR_VERB = rf"(?:{_TR_IGNORE_VERB}|{_TR_EDIT_VERB})"
 _TR_STRONG_NOUN = r"(?:talimat|yonerge|direktif|prompt|istem|sistem\s+mesaj)\w*"
 _TR_QUAL = (r"(?:onceki|yukaridaki|yukardaki|tum|butun|eski|ilk|verilen|sana\s+verilen|senin|kendi"
             r"|gizli|sistem|mevcut|baslangic)")
 _TR_REVEAL_VERB = (r"(?:goster|yaz|soyle|paylas|tekrarla|listele|yazdir|ifsa|acikla|dok|ver|nedir|ne\b"
                    r"|neler|nelerdir)\w*")
+# Qualifiers that make "talimat/yönerge" the bot's own instructions ...
+_TR_OWN_QUAL = r"(?:sistem|gizli|senin|sana\s+verilen|kendi)"
+# ... and ones that are ordinary with documents ("ilk talimatlar", "staj iç yönergesi"):
+# they only count with a prompt noun or a second-person marker.
+_TR_WEAK_QUAL = r"(?:ilk|baslangic|orijinal|asil|ic)"
+_TR_PROMPT_NOUN = r"(?:prompt|istem)\w*"
+_TR_INSTR_NOUN = r"(?:prompt|istem|talimat|yonerge|direktif)\w*"
+_TR_SECOND_PERSON = r"(?:senin|sana|kendi)"
 _TR_BAD_ADJ = (r"(?:kisitlamasiz|sansursuz|filtresiz|kuralsiz|sinirsiz|limitsiz|etik\s+disi|ahlaksiz"
                r"|kotu\s+niyetli|serbest|ozgur)")
 
@@ -477,7 +492,9 @@ _RULES: List[Tuple[str, int, "re.Pattern[str]"]] = [
     ("en_forget_everything", 2, _r(r"\bforget\s+(?:about\s+)?(?:everything|all)\b")),
     # --- English: prompt extraction
     ("en_reveal_system_prompt", 4, _r(rf"\b{_EN_REVEAL_VERB}\s+{_EN_MODS}{{0,4}}{_EN_PROMPT_NOUN}\b")),
-    ("en_reveal_your_prompt", 4, _r(rf"\b{_EN_REVEAL_VERB}\s+{_EN_MODS}{{0,3}}your\s+{_EN_MODS}{{0,2}}{_EN_YOUR_NOUN}\b")),
+    ("en_reveal_your_prompt", 4, _r(rf"\b{_EN_REVEAL_VERB}\s+{_EN_MODS}{{0,3}}(?:your\s+{_EN_MODS}{{0,2}}{_EN_YOUR_NOUN}\b"
+                                    rf"|{_EN_YOUR_NOUN}\s+(?:that\s+)?you\s+(?:were|have\s+been"
+                                    rf"|ve\s+been|had\s+been)\s+(?:given|told|programmed|trained|configured)\b)")),
     ("en_repeat_above", 3, _r(r"\b(?:repeat|print|output|show|copy|echo)\s+(?:(?:all|the|everything|every|word|words"
                               r"|text|lines?|of)\s+){0,3}(?:above|before\s+this|preceding|verbatim)\b")),
     ("en_system_prompt_mention", 2, _r(r"\b(?:system\s+prompt|initial\s+prompt|hidden\s+prompt|pre\s?prompt)\b")),
@@ -500,9 +517,14 @@ _RULES: List[Tuple[str, int, "re.Pattern[str]"]] = [
     ("en_uncensored", 2, _r(r"\b(?:uncensored|unfiltered|unrestricted|jailbroken)\b")),
     ("en_no_restrictions", 1, _r(r"\b(?:without|no|zero|free\s+of|free\s+from)\s+(?:any\s+)?(?:restrictions|filters"
                                  r"|filtering|censorship|limitations|guardrails|rules|guidelines|ethics|morals)\b")),
-    ("en_disable_safety", 2, _r(r"\b(?:bypass|disable|turn\s+off|remove|deactivate|circumvent|evade|get\s+around|break)"
+    # "remove (all) filters" is an everyday action (Excel, mail, images): with "remove"
+    # only content/safety filters count.
+    ("en_disable_safety", 2, _r(r"\b(?:(?:bypass|disable|turn\s+off|deactivate|circumvent|evade|get\s+around|break)"
                                 r"\s+(?:(?:the|all|any|its|my|these|content|safety)\s+){0,3}(?:filters?|filtering"
-                                r"|guardrails|safeguards|censorship|alignment|safety\s+(?:rules|measures|guidelines))\b")),
+                                r"|guardrails|safeguards|censorship|alignment|safety\s+(?:rules|measures|guidelines))"
+                                r"|remove\s+(?:(?:the|all|any|its|my|these)\s+){0,3}(?:(?:content|safety)\s+"
+                                r"(?:filters?|filtering)|guardrails|safeguards|censorship|alignment"
+                                r"|safety\s+(?:rules|measures|guidelines)))\b")),
     ("en_disable_your_safety", 4, _r(r"\b(?:bypass|disable|turn\s+off|remove|deactivate|circumvent|evade|get\s+around"
                                      r"|break|ignore)\s+your\s+(?:\w+\s+){0,2}(?:filters?|restrictions|guardrails"
                                      r"|safeguards|censorship|policies|guidelines|alignment|safety|programming"
@@ -512,18 +534,22 @@ _RULES: List[Tuple[str, int, "re.Pattern[str]"]] = [
     # --- Turkish: override previous instructions
     ("tr_ignore_instructions", 4, _r(rf"\b(?:{_TR_QUAL}\s+){{0,3}}{_TR_STRONG_NOUN}\s+(?:\w+\s+){{0,2}}{_TR_VERB}")),
     ("tr_ignore_instructions_vo", 4, _r(rf"\b{_TR_VERB}\s+(?:{_TR_QUAL}\s+){{0,2}}{_TR_STRONG_NOUN}")),
-    ("tr_ignore_rules_qualified", 4, _r(rf"\b{_TR_QUAL}\s+(?:\w+\s+)?(?:kural|komut|filtre|kisitlama|sinirlama"
-                                        rf"|etik\s+kural|guvenlik\s+onlem)\w*\s+(?:\w+\s+){{0,2}}{_TR_VERB}")),
-    ("tr_ignore_rules", 2, _r(rf"\b(?:kural|komut)\w*\s+(?:\w+\s+){{0,1}}{_TR_VERB}")),
+    ("tr_ignore_rules_qualified", 4, _r(rf"\b{_TR_QUAL}\s+(?:\w+\s+)?(?:(?:kural|filtre|kisitlama|sinirlama"
+                                        rf"|etik\s+kural|guvenlik\s+onlem)\w*\s+(?:\w+\s+){{0,2}}{_TR_VERB}"
+                                        rf"|komut\w*\s+(?:\w+\s+){{0,2}}{_TR_IGNORE_VERB})")),
+    ("tr_ignore_rules", 2, _r(rf"\b(?:kural\w*\s+(?:\w+\s+){{0,1}}{_TR_VERB}"
+                              rf"|komut\w*\s+(?:\w+\s+){{0,1}}{_TR_IGNORE_VERB})")),
     ("tr_ignore_everything", 2, _r(rf"\b(?:her\s+seyi|hersey|her\s+sey|tum\s+bunlari|bunlari|oncekileri)\s+{_TR_VERB}")),
     ("tr_ignore_above", 3, _r(rf"\b(?:yukaridakileri|yukaridaki\s+her\s+seyi|yukarida\s+yazanlari|onceki\s+mesajlari)"
                               rf"\s+{_TR_VERB}")),
     # --- Turkish: prompt extraction
-    ("tr_reveal_prompt", 4, _r(rf"\b(?:sistem|gizli|ilk|baslangic|orijinal|asil|ic|senin|sana\s+verilen)\s+"
-                               rf"(?:prompt|istem|talimat|yonerge|direktif)\w*\s+(?:\w+\s+){{0,2}}{_TR_REVEAL_VERB}")),
-    ("tr_reveal_prompt_ov", 4, _r(r"\b(?:goster|yaz|soyle|paylas|tekrarla|listele|yazdir|ifsa\s+et)\w*\s+"
-                                  r"(?:bana\s+)?(?:sistem|gizli|ilk|senin|sana\s+verilen)\s+(?:prompt|istem|talimat"
-                                  r"|yonerge)\w*")),
+    ("tr_reveal_prompt", 4, _r(rf"\b(?:{_TR_OWN_QUAL}\s+(?:{_TR_WEAK_QUAL}\s+)?{_TR_INSTR_NOUN}"
+                               rf"|{_TR_WEAK_QUAL}\s+{_TR_PROMPT_NOUN}"
+                               rf"|{_TR_SECOND_PERSON}\s+(?:\w+\s+){{0,2}}{_TR_WEAK_QUAL}\s+{_TR_INSTR_NOUN})"
+                               rf"\s+(?:\w+\s+){{0,2}}{_TR_REVEAL_VERB}")),
+    ("tr_reveal_prompt_ov", 4, _r(rf"\b(?:goster|yaz|soyle|paylas|tekrarla|listele|yazdir|ifsa\s+et)\w*\s+"
+                                  rf"(?:bana\s+)?(?:{_TR_OWN_QUAL}\s+(?:{_TR_WEAK_QUAL}\s+)?(?:prompt|istem|talimat"
+                                  rf"|yonerge)\w*|{_TR_WEAK_QUAL}\s+{_TR_PROMPT_NOUN})")),
     ("tr_reveal_system_message", 2, _r(rf"\bsistem\s+mesaj\w*\s+(?:\w+\s+){{0,2}}{_TR_REVEAL_VERB}")),
     ("tr_given_instructions", 3, _r(r"\b(?:sana|size)\s+(?:verilen|yazilan|tanimlanan|yuklenen|ogretilen)\s+"
                                     r"(?:talimat|komut|prompt|kural|yonerge|istem|direktif)\w*")),

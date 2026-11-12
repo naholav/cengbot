@@ -770,7 +770,10 @@ def test_consumer_backoff_is_exponential_capped_and_concise(monkeypatch, caplog)
     stop = RecordingStopEvent(stop_after=9)
     with caplog.at_level(logging.INFO, logger=bot.logger.name):
         bot.consume_answers(stop_event=stop)
-    assert stop.delays == [1, 2, 4, 8, 16, 32, 60, 60, 60]
+    # capped well below ANSWER_TIMEOUT (30 s): after a broker outage the consumer is back
+    # within 15 s, so answers do not keep missing their askers for a whole minute
+    assert stop.delays == [1, 2, 4, 8, 15, 15, 15, 15, 15]
+    assert bot.CONSUMER_RECONNECT_MAX_DELAY < 30.0
     records = [r for r in caplog.records if "RabbitMQ consumer" in r.getMessage()]
     assert len(records) == 9
     assert records[0].levelno == logging.ERROR
@@ -1023,3 +1026,12 @@ def test_run_polling_backoff_is_capped():
 
 def test_httpx_logger_does_not_leak_token_at_info():
     assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
+
+
+def test_pika_connection_noise_is_silenced():
+    """While the broker is down pika logs ~10 ERROR lines with two tracebacks per
+    connect attempt (36 KB for a 75 s outage in the live run); the bot logs one line."""
+    bot._quiet_noisy_loggers()
+    for name in ("pika.adapters.utils.io_services_utils", "pika.adapters.blocking_connection",
+                 "pika.adapters.utils.connection_workflow", "pika.connection"):
+        assert not logging.getLogger(name).isEnabledFor(logging.ERROR)

@@ -22,11 +22,21 @@ Robustness rules (see the 124 GB log incident):
     ``generate()`` call.
   * Every question goes through ``prompt_guard`` (blocked prompts never reach
     the GPU).
+  * A lost broker connection is not a failure of the question being answered:
+    the error propagates, ``run_forever`` reconnects with backoff and the
+    broker redelivers the unacked message. A delivery whose ``RawData`` row is
+    already answered (e.g. the connection dropped between storing and
+    publishing the answer) re-publishes the stored answer instead of dropping
+    it; the bot ignores answers nobody waits for, so a duplicate is harmless.
+  * SIGTERM while a question is being answered finishes that question first
+    (answer published, message acked, consumer cancelled) and then exits; a
+    second SIGTERM stops at once.
 """
 
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import threading
@@ -41,7 +51,13 @@ for _path in (_SRC_DIR, _ROOT_DIR):
         sys.path.append(_path)
 
 import pika  # noqa: E402
-from pika.exceptions import AMQPConnectionError, ChannelClosedByBroker  # noqa: E402
+from pika.exceptions import (  # noqa: E402
+    AMQPConnectionError,
+    AMQPError,
+    ChannelClosed,
+    ChannelClosedByBroker,
+    ChannelWrongStateError,
+)
 
 from database_models import SessionLocal, RawData  # noqa: E402
 from llama_model_handler import model_instance  # noqa: E402
@@ -51,6 +67,13 @@ from config.env_loader import load_config  # noqa: E402
 logger = logging.getLogger(__name__)
 
 ATTEMPTS_HEADER = "x-cengbot-attempts"
+
+# The connection/channel is gone (broker restart, network): not the question's fault.
+CONNECTION_LOST_ERRORS = (AMQPConnectionError, ChannelClosed, ChannelWrongStateError)
+
+# raw_data.id is an SQLite INTEGER (signed 64 bit).
+MAX_RAW_DATA_ID = 2**63 - 1
+_DIGITS_RE = re.compile(r"[0-9]{1,19}")
 
 FAILED_ANSWER = {
     "tr": "Üzgünüm, sorunu şu anda yanıtlayamadım. Lütfen biraz sonra tekrar dene.",
@@ -88,6 +111,20 @@ class ModelNotLoadedError(RuntimeError):
     """Raised instead of returning silently when the model is not available (no busy loop)."""
 
 
+class _ShutdownState:
+    """SIGTERM bookkeeping (only touched from the main thread: signal handlers and pika callbacks)."""
+
+    def __init__(self):
+        self.requested = False  # a stop was requested while a question was being answered
+        self.busy = False       # the consumer callback is running
+
+    def reset(self) -> None:
+        self.requested = self.busy = False
+
+
+_shutdown = _ShutdownState()
+
+
 class Backoff:
     """Exponential backoff: initial, initial*factor, ... capped at ``maximum``."""
 
@@ -120,6 +157,7 @@ class RabbitMQWorker:
         self.pump_interval = _env_float("WORKER_HEARTBEAT_PUMP_INTERVAL", 1.0, minimum=0.01)
         self.connection = None
         self.channel = None
+        self._consumer_tag = None
         if connect:
             self.connect()
 
@@ -150,7 +188,7 @@ class RabbitMQWorker:
             logger.info("Connected to RabbitMQ (questions=%s, answers=%s)", self.questions_queue,
                         self.answers_queue)
         except Exception as exc:
-            logger.error("RabbitMQ connection error: %s", _short(exc))
+            logger.debug("RabbitMQ connection error: %s", _short(exc))  # run_forever logs it (once)
             self.close()
             raise
 
@@ -214,14 +252,29 @@ class RabbitMQWorker:
         if seconds <= 0:
             return
         connection = self.connection
-        if connection is not None and hasattr(connection, "sleep"):
+        if connection is not None and hasattr(connection, "sleep") and getattr(connection, "is_open", True):
             connection.sleep(seconds)  # keeps the connection serviced
         else:
+            # pika raises ValueError("Timeout closed before call") from sleep() on a dead connection
             time.sleep(seconds)
 
     # -------------------------------------------------------------- messages
     @staticmethod
-    def _parse_message(body) -> Dict[str, Any]:
+    def _parse_raw_data_id(value) -> int:
+        """Strict: an int (or a string of digits) in 1..2**63-1. Floats/bools are rejected,
+        int() would silently turn 391.5 or true into another row's id."""
+        if isinstance(value, bool):
+            raise ValueError("raw_data_id must be an integer, not a boolean")
+        if isinstance(value, str) and _DIGITS_RE.fullmatch(value.strip()):
+            value = int(value.strip())
+        if not isinstance(value, int):
+            raise ValueError(f"raw_data_id must be an integer, not {type(value).__name__}")
+        if not 1 <= value <= MAX_RAW_DATA_ID:
+            raise ValueError("raw_data_id out of range")
+        return value
+
+    @classmethod
+    def _parse_message(cls, body) -> Dict[str, Any]:
         if isinstance(body, (bytes, bytearray)):
             body = body.decode("utf-8")
         data = json.loads(body)
@@ -229,7 +282,7 @@ class RabbitMQWorker:
             raise ValueError("payload is not a JSON object")
         if "raw_data_id" not in data or "question" not in data:
             raise ValueError("payload lacks raw_data_id/question")
-        data["raw_data_id"] = int(data["raw_data_id"])
+        data["raw_data_id"] = cls._parse_raw_data_id(data["raw_data_id"])
         if not isinstance(data["question"], str):
             data["question"] = "" if data["question"] is None else str(data["question"])
         return data
@@ -253,19 +306,50 @@ class RabbitMQWorker:
         return "tr"
 
     def process_question(self, ch, method, properties, body):
-        """Consumer callback: always acks exactly once (no infinite requeue)."""
+        """Consumer callback: always acks exactly once (no infinite requeue).
+
+        A lost connection/channel propagates (the broker redelivers the unacked
+        message, ``run_forever`` reconnects). If a stop was requested while this
+        question was being answered, exit once it is done.
+        """
+        _shutdown.busy = True
+        try:
+            self._process_question(ch, method, properties, body)
+        finally:
+            _shutdown.busy = False
+        if _shutdown.requested:
+            logger.info("Current question finished; stopping")
+            raise SystemExit(0)
+
+    def _ack(self, ch, delivery_tag) -> None:
+        if _shutdown.requested and self._consumer_tag is not None:
+            # Cancel first: with prefetch=1 the broker would otherwise deliver the next
+            # question right after this ack, and it would come back marked as redelivered.
+            consumer_tag, self._consumer_tag = self._consumer_tag, None
+            try:
+                ch.basic_cancel(consumer_tag)
+            except Exception as exc:  # stopping anyway
+                logger.debug("basic_cancel failed: %s", exc)
+        ch.basic_ack(delivery_tag=delivery_tag)
+
+    def _process_question(self, ch, method, properties, body):
         delivery_tag = method.delivery_tag
         try:
             data = self._parse_message(body)
         except (ValueError, TypeError, UnicodeDecodeError) as exc:
             logger.error("Dropping malformed question message (%s): %r", exc, (body or b"")[:200])
-            ch.basic_ack(delivery_tag=delivery_tag)
+            self._ack(ch, delivery_tag)
             return
 
         raw_data_id = data["raw_data_id"]
         attempts = self._get_attempts(properties)
         if getattr(method, "redelivered", False):
             attempts += 1  # the previous delivery was never acked (crash / lost connection)
+            if self._resend_if_answered(data):
+                # The answer was generated and stored, only publishing it failed (connection lost):
+                # send it now instead of making the asker wait behind the whole queue.
+                self._ack(ch, delivery_tag)
+                return
 
         if attempts >= self.max_attempts:
             self._give_up(ch, delivery_tag, data, f"gave up after {attempts} delivery attempts")
@@ -279,6 +363,8 @@ class RabbitMQWorker:
         logger.info("Processing question %s: %r", raw_data_id, data["question"][:50])
         try:
             self._handle(data)
+        except CONNECTION_LOST_ERRORS:
+            raise  # not this question's fault; requeueing on a dead channel would fail anyway
         except Exception as exc:
             attempts += 1
             if attempts >= self.max_attempts:
@@ -290,7 +376,7 @@ class RabbitMQWorker:
                                self.max_attempts, _short(exc))
                 self._requeue(ch, delivery_tag, body, properties, attempts, delay=True)
             return
-        ch.basic_ack(delivery_tag=delivery_tag)
+        self._ack(ch, delivery_tag)
 
     def _requeue(self, ch, delivery_tag, body, properties, attempts: int, delay: bool) -> None:
         if delay:
@@ -307,7 +393,7 @@ class RabbitMQWorker:
                 headers=headers,
             ),
         )
-        ch.basic_ack(delivery_tag=delivery_tag)
+        self._ack(ch, delivery_tag)
 
     def _give_up(self, ch, delivery_tag, data: Dict[str, Any], reason: str) -> None:
         raw_data_id = data["raw_data_id"]
@@ -315,10 +401,14 @@ class RabbitMQWorker:
         try:
             if self._store_answer(raw_data_id, answer, notes=f"[auto] worker: {reason}", only_if_unanswered=True):
                 self._publish_answer(data, answer, status="error")
+            else:
+                self._resend_stored_answer(data)  # answered by an earlier attempt that died before publishing
+        except CONNECTION_LOST_ERRORS:
+            raise
         except Exception as exc:
             logger.error("Could not record failure for question %s: %s", raw_data_id, _short(exc))
         logger.error("Question %s dropped: %s", raw_data_id, reason)
-        ch.basic_ack(delivery_tag=delivery_tag)
+        self._ack(ch, delivery_tag)
 
     # ------------------------------------------------------------- the work
     def _raw_data_state(self, raw_data_id: int) -> Optional[bool]:
@@ -348,7 +438,10 @@ class RabbitMQWorker:
             logger.error("RawData %s not found; dropping question", raw_data_id)
             return
         if state:
-            logger.info("RawData %s already answered; skipping duplicate delivery", raw_data_id)
+            # Duplicate delivery, or the previous attempt stored the answer but lost the
+            # connection before publishing it: re-send the stored answer, never regenerate.
+            logger.info("RawData %s already answered; re-sending the stored answer", raw_data_id)
+            self._resend_stored_answer(data)
             return
 
         started = time.monotonic()
@@ -414,6 +507,32 @@ class RabbitMQWorker:
         finally:
             db.close()
 
+    def _resend_if_answered(self, data: Dict[str, Any]) -> bool:
+        """Re-send the stored answer of an already answered row; False if unanswered/unknown."""
+        try:
+            if not self._raw_data_state(data["raw_data_id"]):
+                return False
+            logger.info("Question %s was redelivered but is already answered; re-sending the stored answer",
+                        data["raw_data_id"])
+            return self._resend_stored_answer(data)
+        except CONNECTION_LOST_ERRORS:
+            raise
+        except Exception as exc:  # e.g. database locked: fall back to the normal redelivery path
+            logger.warning("Could not check question %s: %s", data["raw_data_id"], _short(exc))
+            return False
+
+    def _resend_stored_answer(self, data: Dict[str, Any]) -> bool:
+        db = SessionLocal()
+        try:
+            row = db.get(RawData, data["raw_data_id"])
+            answer = row.answer if row is not None else None
+        finally:
+            db.close()
+        if not answer:
+            return False
+        self._publish_answer(data, answer, status="resent")
+        return True
+
     def _publish_answer(self, data: Dict[str, Any], answer: str, status: str = "ok") -> None:
         # Forward every field of the question payload (chat_id, telegram_id, message ids, ...)
         # so the consumer can deliver late answers; the classic keys always exist.
@@ -436,7 +555,8 @@ class RabbitMQWorker:
             self.close()
             raise ModelNotLoadedError(getattr(model_instance, "last_load_error", None) or "model is not loaded")
         self.channel.basic_qos(prefetch_count=1)
-        self.channel.basic_consume(queue=self.questions_queue, on_message_callback=self.process_question)
+        self._consumer_tag = self.channel.basic_consume(queue=self.questions_queue,
+                                                        on_message_callback=self.process_question)
         logger.info("Waiting for questions on '%s'...", self.questions_queue)
         try:
             self.channel.start_consuming()
@@ -479,12 +599,21 @@ def load_model_with_backoff(model=None, backoff: Optional[Backoff] = None,
 def _setup_logging() -> None:
     level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
     logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=level, force=True)
-    for noisy in ("pika", "urllib3", "httpx"):
+    for noisy in ("urllib3", "httpx"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # pika logs ~10 ERROR lines incl. two tracebacks for every failed (re)connect
+    # attempt; the worker logs one concise line per failure itself.
+    logging.getLogger("pika").setLevel(logging.CRITICAL)
 
 
 def _install_signal_handlers() -> None:
+    _shutdown.reset()
+
     def _terminate(signum, frame):
+        if _shutdown.busy and not _shutdown.requested:
+            _shutdown.requested = True
+            logger.info("Stop requested: finishing the current question first (SIGTERM again to stop now)")
+            return
         raise SystemExit(0)
 
     try:
@@ -540,7 +669,7 @@ def run_forever(max_cycles: Optional[int] = None) -> None:
             summary = _short(exc)
             if summary != last_error:
                 logger.error("Worker error: %s. Reconnecting in %.0fs", summary, delay,
-                             exc_info=not isinstance(exc, (AMQPConnectionError, RuntimeError)))
+                             exc_info=not isinstance(exc, (AMQPError, RuntimeError)))
                 last_error = summary
             else:
                 logger.warning("Worker error repeated (%d in a row). Reconnecting in %.0fs",

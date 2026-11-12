@@ -379,14 +379,189 @@ def test_missing_raw_data_is_dropped_after_short_retries(worker, fake_model, sle
     assert sleeps == [0.1] * 4
 
 
-def test_already_answered_question_is_not_regenerated(worker, fake_model, db_session):
+def test_already_answered_question_is_not_regenerated_but_resent(worker, fake_model, db_session):
+    """A duplicate delivery never regenerates; the stored answer is re-sent (the bot drops
+    answers nobody waits for, but the asker may still be waiting for a lost one)."""
     from datetime import datetime
 
     raw_id = add_question(db_session, answer="old answer", answered_at=datetime(2025, 1, 1))
-    worker.process_question(worker.channel, method(2), props(), payload(raw_id))
-    assert fake_model.generate_calls == [] and worker.channel.published == []
+    worker.process_question(worker.channel, method(2), props(), payload(raw_id, chat_id=-100))
+    assert fake_model.generate_calls == []
+    assert worker.channel.to("q_test") == []
+    (msg,) = worker.channel.to("a_test")
+    body = json.loads(msg.body)
+    assert body["answer"] == "old answer" and body["status"] == "resent"
+    assert body["raw_data_id"] == raw_id and body["chat_id"] == -100
     assert worker.channel.acks == [2]
     assert fetch(db_session, raw_id).answer == "old answer"
+
+
+# --------------------------------------------------------------------------
+# Found by the live integration run (real RabbitMQ + GPU worker)
+# --------------------------------------------------------------------------
+
+class ClosedChannel(FakeChannel):
+    """A channel whose connection was closed by the broker (e.g. CONNECTION_FORCED 320)."""
+
+    def basic_publish(self, *args, **kwargs):
+        from pika.exceptions import ChannelWrongStateError
+        raise ChannelWrongStateError("Channel is closed.")
+
+    def basic_ack(self, delivery_tag=0, **kw):
+        from pika.exceptions import ChannelWrongStateError
+        raise ChannelWrongStateError("Channel is closed.")
+
+
+def test_connection_lost_while_answering_is_not_a_question_failure(worker, fake_model, db_session):
+    """Broker closed the connection during generate(): the error propagates (no requeue on the
+    dead channel, no attempt counted, no pika sleep on the dead connection) and the stored
+    answer is re-sent on the redelivery instead of being dropped."""
+    from pika.exceptions import ChannelWrongStateError
+
+    raw_id = add_question(db_session)
+    worker.channel = ClosedChannel()
+    worker.connection.is_open = False
+    with pytest.raises(ChannelWrongStateError):
+        worker.process_question(worker.channel, method(1), props(), payload(raw_id, chat_id=-5))
+    worker.connection.sleep.assert_not_called()
+    assert fetch(db_session, raw_id).answer == "Evet, staj zorunludur."  # stored before the publish failed
+
+    # reconnected: the broker redelivers the unacked message
+    worker.channel = FakeChannel()
+    worker.connection = FakeConnection()
+    worker.process_question(worker.channel, method(2, redelivered=True), props(), payload(raw_id, chat_id=-5))
+    assert len(fake_model.generate_calls) == 1  # never regenerated
+    assert worker.channel.to("q_test") == []    # sent at once, not re-queued behind the backlog
+    (msg,) = worker.channel.to("a_test")
+    body = json.loads(msg.body)
+    assert body["answer"] == "Evet, staj zorunludur." and body["chat_id"] == -5 and body["status"] == "resent"
+    assert worker.channel.acks == [2]
+
+
+def test_give_up_resends_an_answer_stored_by_an_earlier_attempt(worker, fake_model, db_session):
+    from datetime import datetime
+
+    raw_id = add_question(db_session, answer="stored", answered_at=datetime(2025, 1, 1))
+    worker._give_up(worker.channel, 3, {"raw_data_id": raw_id, "question": "Staj?"}, "gave up")
+    (msg,) = worker.channel.to("a_test")
+    assert json.loads(msg.body)["answer"] == "stored"
+    assert fetch(db_session, raw_id).answer == "stored" and worker.channel.acks == [3]
+
+
+def test_redelivered_check_failure_falls_back_to_requeue(worker, fake_model, db_session, monkeypatch):
+    raw_id = add_question(db_session)
+    monkeypatch.setattr(worker, "_raw_data_state", mock.Mock(side_effect=RuntimeError("database is locked")))
+    worker.process_question(worker.channel, method(4, redelivered=True), props(), payload(raw_id))
+    (retry,) = worker.channel.to("q_test")
+    assert retry.properties.headers[w.ATTEMPTS_HEADER] == 1 and worker.channel.acks == [4]
+
+
+@pytest.mark.parametrize("raw_id", [1.5, 391.0, True, False, 0, -5, 2**63, 10**23, 1e40, "12abc", "", [3], {"a": 1}])
+def test_invalid_raw_data_ids_are_dropped_not_coerced(worker, fake_model, db_session, raw_id):
+    """int() used to turn 391.5 / true into another row's id (that row got this question's
+    answer) and huge ids into OverflowErrors that were retried 3 times."""
+    other = add_question(db_session, "Bu satır başka bir soruya ait")
+    body = json.dumps({"raw_data_id": raw_id, "question": "x"}).encode()
+    worker.process_question(worker.channel, method(6), props(), body)
+    assert worker.channel.acks == [6] and worker.channel.published == []
+    assert fake_model.generate_calls == []
+    assert fetch(db_session, other).answer is None
+
+
+def test_digit_string_raw_data_id_is_accepted(worker, fake_model, db_session):
+    raw_id = add_question(db_session)
+    worker.process_question(worker.channel, method(), props(), payload(str(raw_id)))
+    assert fetch(db_session, raw_id).answer == "Evet, staj zorunludur."
+    assert json.loads(worker.channel.to("a_test")[0].body)["raw_data_id"] == raw_id
+
+
+class CancellableChannel(FakeChannel):
+    def __init__(self):
+        super().__init__()
+        self.events = []
+
+    def basic_cancel(self, consumer_tag):
+        self.events.append(("cancel", consumer_tag))
+
+    def basic_ack(self, delivery_tag=0, **kw):
+        self.events.append(("ack", delivery_tag))
+        super().basic_ack(delivery_tag, **kw)
+
+
+@pytest.fixture
+def shutdown_state():
+    w._shutdown.reset()
+    yield w._shutdown
+    w._shutdown.reset()
+
+
+def test_sigterm_while_answering_finishes_the_question_then_exits(worker, fake_model, db_session,
+                                                                  shutdown_state, monkeypatch):
+    """A restart (switch_model.sh, deploy) mid-generation used to abort the answer; the
+    redelivered message then went to the back of the queue and its asker timed out."""
+    handlers = {}
+    monkeypatch.setattr(w.signal, "signal", lambda sig, handler: handlers.setdefault(sig, handler))
+    w._install_signal_handlers()
+    terminate = handlers[w.signal.SIGTERM]
+
+    raw_id = add_question(db_session)
+    worker.channel = CancellableChannel()
+    worker._consumer_tag = "ctag-1"
+    fake_model.generate_response_with_info = lambda text, **kw: (terminate(15, None), ("Evet.", {}))[1]
+    with pytest.raises(SystemExit):
+        worker.process_question(worker.channel, method(7), props(), payload(raw_id))
+    assert fetch(db_session, raw_id).answer == "Evet."
+    assert len(worker.channel.to("a_test")) == 1
+    # the consumer is cancelled before the ack, so no further question is delivered to us
+    assert worker.channel.events == [("cancel", "ctag-1"), ("ack", 7)]
+
+
+def test_sigterm_when_idle_or_twice_exits_at_once(shutdown_state, monkeypatch):
+    handlers = {}
+    monkeypatch.setattr(w.signal, "signal", lambda sig, handler: handlers.setdefault(sig, handler))
+    w._install_signal_handlers()
+    terminate = handlers[w.signal.SIGTERM]
+    with pytest.raises(SystemExit):
+        terminate(15, None)  # idle
+    shutdown_state.busy = True
+    terminate(15, None)      # busy: deferred
+    assert shutdown_state.requested
+    with pytest.raises(SystemExit):
+        terminate(15, None)  # second SIGTERM: now
+
+
+def test_pika_connection_noise_is_silenced(monkeypatch):
+    monkeypatch.setattr(w.logging, "basicConfig", lambda **kw: None)
+    pika_logger = logging.getLogger("pika")
+    old = pika_logger.level
+    try:
+        w._setup_logging()
+        assert not logging.getLogger("pika.adapters.utils.io_services_utils").isEnabledFor(logging.ERROR)
+    finally:
+        pika_logger.setLevel(old)
+
+
+def test_amqp_channel_errors_are_logged_without_traceback(monkeypatch, sleeps, caplog):
+    from pika.exceptions import ChannelWrongStateError
+
+    model = FakeModel()
+    monkeypatch.setattr(w, "model_instance", model)
+
+    class LostWorker:
+        def __init__(self):
+            pass
+
+        def start_consuming(self):
+            raise ChannelWrongStateError("Channel is closed.")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(w, "RabbitMQWorker", LostWorker)
+    with caplog.at_level(logging.INFO, logger=w.logger.name):
+        w.run_forever(max_cycles=2)
+    records = [r for r in caplog.records if r.name == w.logger.name and r.levelno >= logging.WARNING]
+    assert records and not any(r.exc_info for r in records)
 
 
 def test_connection_is_serviced_during_long_generation(worker, fake_model, db_session):

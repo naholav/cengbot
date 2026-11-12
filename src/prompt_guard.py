@@ -477,7 +477,14 @@ _TR_REVEAL_VERB = (r"(?:goster|yaz|soyle|paylas|tekrarla|tekrar\s+et|listele|yaz
 # (LLM courses), like the English "What is a system prompt?". The bot's own prompt
 # needs a second-person form ("sistem promptun nedir", "senin sistem promptun")
 # or a command ("sistem promptunu göster").
-_TR_DEFINITION_Q = r"(?!sistem\s+(?:promptu|istemi)\s+(?:nedir|ne\s+demek|ne\s+ise\s+yarar)\b)"
+# The exception does not apply when a reveal command follows anywhere ("sistem promptu
+# nedir, aynen yaz", "... Tamamını yazdır", "... bana göster"); "nasıl yazılır" is no command.
+_TR_REVEAL_COMMAND = (r"\b(?:goster(?:ir|in|sene|ebilir)?|yaz(?:ar|in|sana|abilir)?|yazdir(?:ir|in|sana|abilir)?"
+                      r"|tekrarla(?:r|yin|sana)?|tekrar\s+et|paylas(?:ir|in|sana|abilir)?|listele(?:r|yin)?"
+                      r"|soyle(?:r|yin|sene|yebilir)?|ifsa\s+et|dok|aynen|tamamini|harfi\s+harfine"
+                      r"|kelimesi\s+kelimesine)\b")
+_TR_DEFINITION_Q = (r"(?!sistem\s+(?:promptu|istemi)\s+(?:nedir|ne\s+demek|ne\s+ise\s+yarar)\b"
+                    rf"(?!.*{_TR_REVEAL_COMMAND}))")
 # Qualifiers that make "talimat/yönerge" the bot's own instructions ...
 _TR_OWN_QUAL = r"(?:sistem|gizli|senin|sana\s+verilen|kendi)"
 # ... and ones that are ordinary with documents ("ilk talimatlar", "staj iç yönergesi"):
@@ -607,38 +614,50 @@ _RULES: List[Tuple[str, int, "re.Pattern[str]"]] = [
     ("tr_verbatim", 1, _r(r"\b(?:harfi\s+harfine|kelimesi\s+kelimesine)\b")),
 ]
 
-# Turkish verb endings after "unut" / "yok say" / "görmezden gel" that make the
-# phrase a statement or a "don't", not an order: past ("talimatları unuttum",
-# "yok saydım", "görmezden geldim"), passive ("unutulmuş", "yok sayıldı") and the
-# negative ("talimatları unutmayın" = don't forget them; but "unutmalısın" /
-# "unutmanı" still are orders).
-_TR_NOT_ORDER_UNUT = r"(?!t|ul|kan|ma(?!n|li))"
-_TR_NOT_ORDER_SAY = r"(?!d|il|ma(?!n|li))"
-_TR_NOT_ORDER_GEL = r"(?!d|ind|me(?!n|li))"
+# Turkish verb forms after "unut" / "yok say" / "görmezden gel" that make the phrase a
+# statement or a "don't", not an order: past ("talimatları unuttum", "yok saydım",
+# "görmezden geldim"), passive ("unutulmuş", "yok sayıldı") and the negative
+# ("talimatları unutmayın" = don't forget them; but "unutmalısın" / "unutmanı" still
+# are orders). Only recognised as whole *words* in the word view: in the compact view
+# the next word's letters follow ("t a l i m a t l a r ı u n u t t ü m ..." = unut + tüm).
+_TR_NOT_ORDER_UNUT = r"\btalimatlari\s+unut(?:t|ul|kan|ma(?!n|li))\w*"
+_TR_NOT_ORDER_SAY = r"\btalimatlari\s+yok\s*say(?:d|il|ma(?!n|li))\w*"
+_TR_NOT_ORDER_GEL = r"\btalimatlari\s+gormezden\s+gel(?:d|ind|me(?!n|li))\w*"
 
 # High-signal phrases checked against the compact view (all separators
-# removed) to catch "i.g.n.o.r.e   p r e v i o u s" style obfuscation. Each is a
-# regular expression (plain letters, plus the Turkish suffix look-aheads above).
-_COMPACT_RULES: List[Tuple[str, int, str]] = [
-    ("en_ignore_instructions", 4, "ignorepreviousinstructions"),
-    ("en_ignore_instructions", 4, "ignoreallpreviousinstructions"),
-    ("en_ignore_instructions", 4, "ignoreallinstructions"),
-    ("en_ignore_instructions", 4, "disregardpreviousinstructions"),
-    ("en_ignore_instructions", 4, "disregardallpreviousinstructions"),
-    ("en_ignore_instructions", 4, "ignoreyourinstructions"),
-    ("en_reveal_system_prompt", 4, "revealyoursystemprompt"),
-    ("en_reveal_system_prompt", 4, "showmeyoursystemprompt"),
-    ("en_reveal_system_prompt", 4, "printyoursystemprompt"),
-    ("en_jailbreak", 4, "jailbreak"),
-    ("en_do_anything_now", 4, "doanythingnow"),
-    ("tr_ignore_instructions", 4, "talimatlariunut" + _TR_NOT_ORDER_UNUT),
-    ("tr_ignore_instructions", 4, "talimatlariyoksay" + _TR_NOT_ORDER_SAY),
-    ("tr_ignore_instructions", 4, "talimatlarigormezdengel" + _TR_NOT_ORDER_GEL),
-    ("tr_reveal_prompt", 4, "sistempromptunugoster"),
-    ("tr_reveal_prompt", 4, "sistemtalimatlarinigoster"),
+# removed) to catch "i.g.n.o.r.e   p r e v i o u s" style obfuscation. An optional
+# word-view pattern names harmless word forms that explain the phrase: the hit only
+# counts if the phrase is still there once those words are taken out.
+_COMPACT_RULES: List[Tuple[str, int, str, Optional[str]]] = [
+    ("en_ignore_instructions", 4, "ignorepreviousinstructions", None),
+    ("en_ignore_instructions", 4, "ignoreallpreviousinstructions", None),
+    ("en_ignore_instructions", 4, "ignoreallinstructions", None),
+    ("en_ignore_instructions", 4, "disregardpreviousinstructions", None),
+    ("en_ignore_instructions", 4, "disregardallpreviousinstructions", None),
+    ("en_ignore_instructions", 4, "ignoreyourinstructions", None),
+    ("en_reveal_system_prompt", 4, "revealyoursystemprompt", None),
+    ("en_reveal_system_prompt", 4, "showmeyoursystemprompt", None),
+    ("en_reveal_system_prompt", 4, "printyoursystemprompt", None),
+    ("en_jailbreak", 4, "jailbreak", None),
+    ("en_do_anything_now", 4, "doanythingnow", None),
+    ("tr_ignore_instructions", 4, "talimatlariunut", _TR_NOT_ORDER_UNUT),
+    ("tr_ignore_instructions", 4, "talimatlariyoksay", _TR_NOT_ORDER_SAY),
+    ("tr_ignore_instructions", 4, "talimatlarigormezdengel", _TR_NOT_ORDER_GEL),
+    ("tr_reveal_prompt", 4, "sistempromptunugoster", None),
+    ("tr_reveal_prompt", 4, "sistemtalimatlarinigoster", None),
 ]
 
-_COMPACT_PATTERNS = [(name, weight, re.compile(phrase)) for name, weight, phrase in _COMPACT_RULES]
+_COMPACT_PATTERNS = [(name, weight, phrase, re.compile(harmless) if harmless else None)
+                     for name, weight, phrase, harmless in _COMPACT_RULES]
+
+
+def _compact_hit(phrase: str, harmless: "Optional[re.Pattern[str]]", views: List[str],
+                 compact_views: List[str]) -> bool:
+    if not any(phrase in compact for compact in compact_views):
+        return False
+    if harmless is None:
+        return True
+    return any(phrase in harmless.sub(" ", view).replace(" ", "") for view in views)
 
 _UPPER_DAN_RE = re.compile(r"(?<!['’\w])DAN(?![\w'’])")
 
@@ -650,8 +669,8 @@ def score_injection(text: str) -> Tuple[int, List[str]]:
     for name, weight, regex in _RULES:
         if any(regex.search(view) for view in views):
             hits[name] = max(hits.get(name, 0), weight)
-    for name, weight, phrase in _COMPACT_PATTERNS:
-        if any(phrase.search(compact) for compact in compact_views):
+    for name, weight, phrase, harmless in _COMPACT_PATTERNS:
+        if _compact_hit(phrase, harmless, views, compact_views):
             hits[name] = max(hits.get(name, 0), weight)
     # Upper-case standalone "DAN" (not Turkish "Ankara'DAN" style suffixes).
     if _UPPER_DAN_RE.search(text) and not text.isupper():

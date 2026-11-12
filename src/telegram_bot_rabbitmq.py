@@ -22,6 +22,7 @@ import asyncio
 import html
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -82,14 +83,33 @@ BOT_TOPIC_ID = config.telegram_topic_id
 # SECURITY: Only allow this specific group (overridable for staging groups).
 ALLOWED_CHAT_ID = config.get_int("TELEGRAM_ALLOWED_CHAT_ID", -1002630398173)
 
+MAX_LATE_ANSWER_WINDOW = 24 * 3600.0
+
+
+def _seconds_setting(cfg, name: str, default: float, allow_zero: bool = False,
+                     maximum: Optional[float] = None) -> float:
+    """A duration from the environment: a finite number of seconds > 0 (>= 0 with
+    ``allow_zero``), at most ``maximum``. Anything else ("inf", "nan", negative) logs a
+    warning and gives the default: inf/nan would break asyncio timeouts, the JSON payload
+    and the expiry of late answers."""
+    value = cfg.get_float(name, default)
+    if math.isfinite(value) and (value > 0 or (allow_zero and value == 0)):
+        if maximum is not None and value > maximum:
+            logging.getLogger(__name__).warning("%s=%s is too large; using %s", name, value, maximum)
+            return maximum
+        return value
+    logging.getLogger(__name__).warning("Invalid %s=%r (expected a finite number of seconds %s 0); using %s",
+                                        name, value, ">=" if allow_zero else ">", default)
+    return default
+
+
 # Seconds a user waits for the worker's answer before getting the fallback reply.
-ANSWER_TIMEOUT = config.get_float("BOT_ANSWER_TIMEOUT", 30.0)
-if ANSWER_TIMEOUT <= 0:
-    ANSWER_TIMEOUT = 30.0
+ANSWER_TIMEOUT = _seconds_setting(config, "BOT_ANSWER_TIMEOUT", 30.0)
 
 # Seconds after BOT_ANSWER_TIMEOUT during which a late answer is still posted as a
 # reply to the question (0 = never; the asker gets FALLBACK_RESPONSE at the timeout).
-LATE_ANSWER_WINDOW = max(0.0, config.get_float("BOT_LATE_ANSWER_WINDOW", 600.0))
+LATE_ANSWER_WINDOW = _seconds_setting(config, "BOT_LATE_ANSWER_WINDOW", 600.0, allow_zero=True,
+                                      maximum=MAX_LATE_ANSWER_WINDOW)
 
 FALLBACK_RESPONSE = "Sorry, I cannot generate a response at the moment. Please try again later."
 
@@ -621,12 +641,16 @@ def _save_question(telegram_id: int, username: Optional[str], question: str,
         db.close()
 
 
-def _record_bot_message_id(raw_data_id: int, message_id: int) -> None:
+def _record_bot_message_id(raw_data_id: int, message_id: int, only_if_unset: bool = False) -> None:
+    """Store the id of the bot message that carries the answer (votes are checked against it).
+    ``only_if_unset`` is for the fallback/timeout reply: it must never replace the id of a
+    late answer that was already posted."""
     db = SessionLocal()
     try:
-        db.query(RawData).filter(RawData.id == raw_data_id).update(
-            {RawData.telegram_message_id: message_id}, synchronize_session=False
-        )
+        query = db.query(RawData).filter(RawData.id == raw_data_id)
+        if only_if_unset:
+            query = query.filter(RawData.telegram_message_id.is_(None))
+        query.update({RawData.telegram_message_id: message_id}, synchronize_session=False)
         db.commit()
     except Exception:
         db.rollback()
@@ -986,13 +1010,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             answer_router.unregister(raw_data_id, future)
 
         fallback = pending_response() if timed_out and LATE_ANSWER_WINDOW > 0 else FALLBACK_RESPONSE
-        sent_message = await _send_answer(
-            message, user, message_text, raw_data_id, _extract_answer(answer_data), fallback=fallback
-        )
+        answer = _extract_answer(answer_data)
+        sent_message = await _send_answer(message, user, message_text, raw_data_id, answer, fallback=fallback)
 
         # Update telegram_message_id with bot's response message ID
         if sent_message is not None:
-            await loop.run_in_executor(None, _record_bot_message_id, raw_data_id, sent_message.message_id)
+            await loop.run_in_executor(None, _record_bot_message_id, raw_data_id, sent_message.message_id,
+                                       answer is None)
 
     except Exception as e:
         logger.error(f"Error handling message (question ID {raw_data_id}): {type(e).__name__}: {e}")
@@ -1007,10 +1031,9 @@ async def _deliver_late_answer(message, user, question: str, raw_data_id: int, a
     answer = _extract_answer(answer_data)
     if answer is None:
         return  # the timeout reply already asked the user to try again later
-    try:
-        await asyncio.wait_for(timeout_reply_done.wait(), timeout=60)
-    except asyncio.TimeoutError:
-        pass
+    # No time limit: handle_message always sets it (finally), and under Telegram flood control
+    # the timeout reply alone can take MAX_RETRY_AFTER (60 s) plus the request time.
+    await timeout_reply_done.wait()
     try:
         sent_message = await _send_answer(message, user, question, raw_data_id, answer)
         if sent_message is not None:

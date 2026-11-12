@@ -26,8 +26,9 @@ Robustness rules (see the 124 GB log incident):
     ``generate()`` call.
   * Every question goes through ``prompt_guard`` (blocked prompts never reach
     the GPU).
-  * A question whose ``deliver_until`` (epoch seconds, set by the bot) has passed
-    is not generated: nobody would see the answer, and after a backlog (worker
+  * A question whose ``deliver_until`` (epoch seconds, set by the bot) has passed,
+    or would pass during generation (``DEADLINE_MARGIN``), is not generated:
+    nobody would see the answer, and after a backlog (worker
     restart, outage) the GPU goes to questions whose askers still wait. The row
     stays unanswered with an ``[auto]`` note, so admins can answer it. Payloads
     without the field are answered as before (``WORKER_SKIP_EXPIRED=false``
@@ -86,6 +87,10 @@ CONNECTION_LOST_ERRORS = (AMQPConnectionError, ChannelClosed, ChannelWrongStateE
 # raw_data.id is an SQLite INTEGER (signed 64 bit).
 MAX_RAW_DATA_ID = 2**63 - 1
 _DIGITS_RE = re.compile(r"[0-9]{1,19}")
+
+# A question is skipped once its answer could no longer reach the asker in time: this
+# much before deliver_until (seconds; a v1.2 answer takes 2.3 s on average, 3.8 s at most).
+DEADLINE_MARGIN = 4.0
 
 # Broker reconnect delay cap (seconds), see the module docstring.
 RECONNECT_MAX_DELAY = 15.0
@@ -511,13 +516,14 @@ class RabbitMQWorker:
         logger.info("Answer sent for question %s (%s, %.1fs)", raw_data_id, status, time.monotonic() - started)
 
     def _overdue_seconds(self, data: Dict[str, Any]) -> Optional[float]:
-        """Seconds past the payload's ``deliver_until``, or None (no/invalid field, not yet due)."""
+        """Seconds past the payload's ``deliver_until`` minus the generation time
+        (``DEADLINE_MARGIN``), or None (no/invalid field, still worth answering)."""
         if not getattr(self, "skip_expired", True):
             return None
         deadline = data.get("deliver_until")
         if not _is_number(deadline):
             return None
-        overdue = time.time() - deadline
+        overdue = time.time() - (deadline - DEADLINE_MARGIN)
         return overdue if overdue > 0 else None
 
     def _add_note(self, raw_data_id: int, note: str) -> None:

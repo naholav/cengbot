@@ -672,6 +672,15 @@ class SentenceLimitStoppingCriteria(StoppingCriteria):
         self.max_sentences = max_sentences
         self.triggered = False
 
+    def _newest_brings_space(self, generated) -> bool:
+        """Did the newest token add whitespace? Measured as a text delta: SentencePiece
+        tokenizers (Llama 2, Mistral, Phi-3) strip the leading space when a single "▁word"
+        token is decoded on its own, so decode([token]) would never show it."""
+        last_two = self.tokenizer.decode(generated[-2:], skip_special_tokens=True)
+        previous = self.tokenizer.decode(generated[-2:-1], skip_special_tokens=True) if generated.shape[0] > 1 else ""
+        delta = last_two[len(previous):] if last_two.startswith(previous) else last_two
+        return any(ch.isspace() for ch in delta)
+
     def _text(self, generated) -> str:
         # the same cleaning as _postprocess, but the trailing whitespace is kept
         text = prompt_guard.strip_reasoning(self.tokenizer.decode(generated, skip_special_tokens=True))
@@ -682,10 +691,8 @@ class SentenceLimitStoppingCriteria(StoppingCriteria):
         for row in input_ids:
             generated = row[self.prompt_length:]
             hit = False
-            if self.max_sentences and generated.shape[0]:
-                newest = self.tokenizer.decode(generated[-1:], skip_special_tokens=True)
-                if any(ch.isspace() for ch in newest):
-                    hit = answer_is_final(self._text(generated), self.max_sentences)
+            if self.max_sentences and generated.shape[0] and self._newest_brings_space(generated):
+                hit = answer_is_final(self._text(generated), self.max_sentences)
             done.append(hit)
         if any(done):
             self.triggered = True

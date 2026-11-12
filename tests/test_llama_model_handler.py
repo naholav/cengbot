@@ -805,6 +805,38 @@ def test_a_link_is_never_cut_at_a_dot_inside_it(monkeypatch):
     assert answer.endswith("www.ebs.cu.edu.tr/Program/DersPlan/555/2024 adresine bakın.")
 
 
+def _sentencepiece_style_tokenizer(strip_leading_space: bool):
+    """Tiny offline word-level tokenizer with "▁word" pieces. With ``strip_leading_space`` its
+    decoder ends in Strip(left=1) like Llama 2 / Mistral / Phi-3, so decode([▁word]) == "word"."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    vocab = {"<unk>": 0, "<s>": 1, "</s>": 2, ".": 3, "▁": 4}
+    for word in ("Bu", "bir", "cümle", "Son"):
+        vocab["▁" + word] = len(vocab)
+    tok = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<unk>"))
+    tok.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", prepend_scheme="first", split=True)
+    steps = [decoders.Replace("▁", " "), decoders.Fuse()]
+    if strip_leading_space:
+        steps.append(decoders.Strip(content=" ", left=1, right=0))
+    tok.decoder = decoders.Sequence(steps)
+    return PreTrainedTokenizerFast(tokenizer_object=tok, unk_token="<unk>", bos_token="<s>", eos_token="</s>"), vocab
+
+
+@pytest.mark.parametrize("strip_leading_space", [False, True], ids=["byte-level-like", "sentencepiece-strip"])
+def test_sentence_stopper_fires_with_sentencepiece_tokenizers(strip_leading_space):
+    """decode([▁word]) has no space with a Strip(left=1) decoder: a per-token whitespace test
+    only ever opened on newlines, so one-paragraph answers never stopped early."""
+    tokenizer, vocab = _sentencepiece_style_tokenizer(strip_leading_space)
+    assert (tokenizer.decode([vocab["▁Bu"]]) == "Bu") is strip_leading_space
+    sentence = [vocab["▁Bu"], vocab["▁bir"], vocab["▁cümle"], vocab["."]]
+    ids = sentence * 10 + [vocab["▁Son"]]
+    stopper = h.SentenceLimitStoppingCriteria(tokenizer, prompt_length=0, max_sentences=3)
+    fired = next((n for n in range(1, len(ids) + 1) if bool(stopper(torch.tensor([ids[:n]]), None)[0])), None)
+    # 3 kept + 4 patience sentences; the 7th is closed by the space of the next "▁Bu"
+    assert fired == 7 * len(sentence) + 1
+
+
 def _sentence_pool():
     return ["Evet, staj zorunludur.", "Prof. Dr. Ali Hoca dersi verir.", "2. sınıfta alınır.", "Ne zaman?",
             "Başka sorun var mı?", "Detaylar https://ebs.cu.edu.tr/Program/555 adresinde.",
@@ -845,7 +877,7 @@ def test_sentence_stopper_decodes_only_when_a_token_brings_whitespace():
 
         def decode(self, ids, skip_special_tokens=True):
             ids = ids.tolist() if hasattr(ids, "tolist") else list(ids)
-            if len(ids) > 1:
+            if len(ids) > 2:  # 1-2 token decodes are the cheap whitespace check
                 self.full_decodes += 1
             return super().decode(ids, skip_special_tokens)
 

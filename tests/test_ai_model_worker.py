@@ -1010,3 +1010,19 @@ def test_expired_but_already_answered_question_is_still_resent(worker, fake_mode
     worker.process_question(worker.channel, method(6), props(), payload(raw_id, deliver_until=1.0))
     (msg,) = worker.channel.to("a_test")
     assert json.loads(msg.body)["answer"] == "stored"
+
+
+@pytest.mark.parametrize("seconds_left,generated", [(-60, False), (1.0, False), (3.9, False),
+                                                    (4.1 + 5, True), (600, True)])
+def test_question_is_skipped_when_the_answer_would_arrive_too_late(worker, fake_model, db_session,
+                                                                   seconds_left, generated):
+    """deliver_until had no margin: a question picked up 1 s before it was still generated, and
+    the answer arrived after the bot had stopped waiting for it."""
+    import time as real_time
+
+    raw_id = add_question(db_session)
+    body = payload(raw_id, deliver_until=real_time.time() + seconds_left)
+    worker.process_question(worker.channel, method(7), props(), body)
+    assert (len(fake_model.generate_calls) == 1) is generated
+    assert (fetch(db_session, raw_id).answer is not None) is generated
+    assert w.DEADLINE_MARGIN >= 3.8  # the slowest measured v1.2 answer

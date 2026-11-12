@@ -48,6 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from urllib.parse import quote
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -86,6 +87,22 @@ def _pika_params(settings):
 
     return pika.ConnectionParameters(host=settings["host"], port=settings["port"], connection_attempts=1,
                                      credentials=pika.PlainCredentials(settings["user"], settings["password"]))
+
+
+def open_db_read_only(path):
+    """Open the real database without changing it. Read-write with ``query_only``: for a WAL
+    database (the default) the last connection then removes the -wal/-shm files, while a
+    ``mode=ro`` connection would leave them next to the real database. If the file cannot be
+    written: ``immutable=1`` when there are no side files, else plain ``mode=ro`` (immutable
+    would ignore committed WAL frames)."""
+    path = Path(path).resolve()
+    if os.access(path, os.W_OK) and os.access(path.parent, os.W_OK):
+        conn = sqlite3.connect(str(path))
+        conn.execute("PRAGMA query_only = ON")
+        return conn
+    side_files = any(Path(f"{path}{suffix}").exists() for suffix in ("-wal", "-shm"))
+    flags = "mode=ro" if side_files else "mode=ro&immutable=1"
+    return sqlite3.connect(f"file:{quote(str(path))}?{flags}", uri=True)
 
 
 def _free_port():
@@ -179,7 +196,7 @@ def live_db(workdir):
     """A copy of the real database (or a fresh schema if there is none)."""
     target = workdir / "copy.db"
     if REAL_DB.is_file():
-        source = sqlite3.connect(f"file:{REAL_DB}?mode=ro", uri=True)
+        source = open_db_read_only(REAL_DB)
         dest = sqlite3.connect(target)
         try:
             source.backup(dest)

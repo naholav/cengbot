@@ -7,6 +7,7 @@ no model. ``main()`` is never called.
 import asyncio
 import html
 import json
+import math
 import logging
 import re
 import threading
@@ -547,6 +548,56 @@ async def test_late_answer_never_overtakes_the_timeout_reply(monkeypatch, db_ses
     await settle()
     assert len(order) == 2
     assert "taking longer" in order[0] and "Geç gelen cevap." in order[1]
+    assert all_raw()[0].telegram_message_id == 2002  # the answer's message, where the votes are
+
+
+def test_timeout_reply_id_never_replaces_a_late_answer_id(db_session):
+    """Under flood control the timeout reply can be recorded after the late answer; votes on
+    the answer were then rejected because the row pointed at the timeout reply."""
+    raw_id = bot._save_question(42, "student", "Staj ne zaman?", None)
+    bot._record_bot_message_id(raw_id, 2001)                      # late answer, recorded first
+    bot._record_bot_message_id(raw_id, 2000, only_if_unset=True)  # timeout reply, recorded late
+    assert fetch_raw(raw_id).telegram_message_id == 2001
+    other = bot._save_question(43, "student", "Yaz okulu var mı?", None)
+    bot._record_bot_message_id(other, 3000, only_if_unset=True)   # plain fallback: still recorded
+    assert fetch_raw(other).telegram_message_id == 3000
+
+
+async def test_late_answer_waits_for_a_slow_timeout_reply_without_a_time_limit(monkeypatch, db_session):
+    """The timeout reply may take longer than any fixed cap (flood control: up to 60 s + request)."""
+    monkeypatch.setattr(bot, "ANSWER_TIMEOUT", 0.05)
+    monkeypatch.setattr(bot, "send_to_rabbitmq", MagicMock(return_value=True))
+    real_wait_for = asyncio.wait_for
+
+    async def impatient_wait_for(awaitable, timeout=None):  # any capped wait gives up at once
+        if timeout is not None and timeout >= 30:
+            if asyncio.iscoroutine(awaitable):
+                awaitable.close()
+            raise asyncio.TimeoutError
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(bot.asyncio, "wait_for", impatient_wait_for)
+    msg = make_message()
+    order = []
+    release = asyncio.Event()
+
+    async def slow_reply(text, **kwargs):
+        order.append(text)
+        if len(order) == 1:
+            bot._on_answer_message(MagicMock(), SimpleNamespace(delivery_tag=1), None,
+                                   late_answer_body(all_raw()[0].id))
+            await release.wait()
+        return SimpleNamespace(message_id=4000 + len(order))
+
+    msg.reply_text = AsyncMock(side_effect=slow_reply)
+    handler = asyncio.ensure_future(bot.handle_message(make_update(msg), None))
+    await asyncio.sleep(0.2)
+    assert len(order) == 1  # the late answer is still waiting for the timeout reply
+    release.set()
+    await handler
+    await settle()
+    assert len(order) == 2 and "Geç gelen cevap." in order[1]
+    assert all_raw()[0].telegram_message_id == 4002
 
 
 async def test_empty_late_answer_is_not_posted(monkeypatch, db_session):
@@ -1240,3 +1291,28 @@ def test_publisher_failure_line_has_the_reason(monkeypatch, caplog):
     (error,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert "question 5: AMQPConnectionError: AMQPConnectorSocketConnectError: ConnectionRefusedError(111, " \
         "'Connection refused')" in error.getMessage()
+
+
+@pytest.mark.parametrize("raw,allow_zero,expected", [
+    ("45", False, 45.0), ("0.5", False, 0.5),
+    ("inf", False, 30.0), ("-inf", False, 30.0), ("nan", False, 30.0), ("0", False, 30.0), ("-3", False, 30.0),
+    ("abc", False, 30.0),
+    ("0", True, 0.0), ("inf", True, 30.0), ("nan", True, 30.0), ("-1", True, 30.0),
+    ("1e12", True, bot.MAX_LATE_ANSWER_WINDOW),
+])
+def test_duration_settings_reject_non_finite_values(monkeypatch, caplog, raw, allow_zero, expected):
+    """BOT_LATE_ANSWER_WINDOW=inf made pending_response() raise OverflowError (the asker got
+    ERROR_REPLY), put Infinity into the JSON payload and kept late entries forever."""
+    from config.env_loader import load_config
+
+    monkeypatch.setenv("BOT_TEST_SECONDS", raw)
+    value = bot._seconds_setting(load_config(), "BOT_TEST_SECONDS", 30.0, allow_zero=allow_zero,
+                                 maximum=bot.MAX_LATE_ANSWER_WINDOW)
+    assert value == expected and math.isfinite(value)
+
+
+def test_pending_response_with_the_largest_window(monkeypatch):
+    monkeypatch.setattr(bot, "LATE_ANSWER_WINDOW", bot.MAX_LATE_ANSWER_WINDOW)
+    assert "within 1440 minutes" in bot.pending_response()
+    monkeypatch.setattr(bot, "LATE_ANSWER_WINDOW", 30.0)
+    assert "within 1 minute;" in bot.pending_response()

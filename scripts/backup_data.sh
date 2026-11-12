@@ -3,7 +3,8 @@
 # CengBot Data Backup Script
 # ==========================
 # Creates backups/backup_<timestamp>.tar.gz containing:
-#   - a consistent snapshot of the SQLite database (sqlite3 online backup API)
+#   - a consistent snapshot of the SQLite database (sqlite3 ".backup" or the
+#     Python online backup API: includes what is still in the -wal file)
 #   - data/ (training data)
 #   - models/ (adapters; the active-model symlink is kept as a symlink)
 #   - logs/: small logs completely, big logs only their last part (tail -c)
@@ -63,23 +64,19 @@ cleanup_staging() {
 }
 trap cleanup_staging EXIT
 
-# Database: consistent online snapshot even while the bot is writing
+# Database: consistent online snapshot even while the bot is writing (WAL mode:
+# a plain copy of the .db file would miss the commits still in its -wal file)
 echo -e "\n${YELLOW}📦 Backing up database...${NC}"
+DB_NOTE=""
 if [[ -f "$DB_FILE" ]]; then
-    py="$PYTHON"; [[ -x "$py" ]] || py="$(command -v python3 || true)"
-    if [[ -n "$py" ]] && "$py" -I -c '
-import sqlite3, sys
-src = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
-dst = sqlite3.connect(sys.argv[2])
-with dst:
-    src.backup(dst)
-dst.close(); src.close()
-' "$DB_FILE" "$STAGING/university_bot.db"; then
-        echo -e "${GREEN}✓ Database backed up (online snapshot)${NC}"
-    else
-        print_warning "sqlite3 online backup failed - falling back to a plain copy"
-        cp -p -- "$DB_FILE" "$STAGING/"
-    fi
+    rc=0
+    sqlite_snapshot "$DB_FILE" "$STAGING/university_bot.db" || rc=$?
+    case "$rc" in
+        0) echo -e "${GREEN}✓ Database backed up (online snapshot)${NC}" ;;
+        2) DB_NOTE="university_bot.db-wal in this archive belongs to university_bot.db: restore both together."
+           print_warning "Database copied without an online snapshot (.db + -wal)" ;;
+        *) die "Could not back up the database $DB_FILE" ;;
+    esac
 else
     echo -e "${RED}✗ Database not found${NC}"
 fi
@@ -135,8 +132,16 @@ Active model: $(readlink "$PROJECT_ROOT/models/active-model" 2>/dev/null || echo
 Contents: university_bot.db, data/, $( (( INCLUDE_MODELS )) && echo 'models/, ')logs/ (*.tail = last part of a big log), .env.example
 (.env is NOT included - it contains secrets; back it up separately and securely.)
 
-To restore: stop the system (scripts/stop_system.sh), extract the archive,
-copy the files back to the project root, start the system again.
+To restore:
+1. Stop every service (scripts/stop_system.sh, or for systemd:
+   sudo systemctl stop cengbot-worker cengbot-bot cengbot-admin cengbot-monitor).
+2. Delete the WAL files next to the database: $DB_FILE-wal and $DB_FILE-shm.
+   SQLite replays a leftover -wal file into the restored database and would
+   overwrite or empty its tables.
+3. Extract the archive and copy university_bot.db to $DB_FILE, and data/,
+   models/ ... back to the project root.
+4. Start the system again.
+$DB_NOTE
 EOF
 
 echo -e "\n${YELLOW}🗜️ Creating compressed archive...${NC}"

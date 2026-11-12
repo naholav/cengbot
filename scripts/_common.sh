@@ -90,6 +90,27 @@ require_python() {
     fi
 }
 
+# abspath PATH -> PATH made absolute against the CALLER's directory, with a
+# leading "~/" expanded (--opt=~/x is not expanded by the shell). For path
+# options of the wrappers, whose Python step runs in the project root.
+abspath() {
+    local p="$1"
+    # shellcheck disable=SC2088  # a literal "~" prefix is expanded by hand
+    if [[ "$p" == '~' ]]; then
+        p="$HOME"
+    elif [[ "${p:0:2}" == '~/' ]]; then
+        p="$HOME/${p:2}"
+    fi
+    while [[ "$p" == ./* ]]; do p="${p#./}"; done
+    if [[ "$p" == /* ]]; then
+        printf '%s' "$p"
+    elif [[ -z "$p" || "$p" == . ]]; then
+        printf '%s' "$PWD"
+    else
+        printf '%s' "$PWD/$p"
+    fi
+}
+
 # Run a command as root: directly when already root, else via interactive sudo.
 # Never pipes a password into sudo.
 as_root() {
@@ -200,6 +221,72 @@ PY
 ) || out=""
     fi
     echo "${out:-$PROJECT_ROOT/university_bot.db}"
+}
+
+# sqlite_snapshot DB DEST -> consistent copy of the SQLite database DB at DEST,
+# safe while the services write to it. The database runs in WAL mode, so the
+# .db file alone is NOT the database: recent commits live in DB-wal until a
+# checkpoint. Tries (1) the sqlite3 CLI ".backup", (2) the Python sqlite3 backup
+# API ($PYTHON, else python3); both read the WAL too. (3) Last resort: copies DB
+# and DB-wal (as DEST-wal) with a warning - not atomic while the services run.
+# The source is opened read-write with PRAGMA query_only=ON when the file and
+# its directory are writable: a read-only connection to a WAL database whose
+# services are stopped creates DB-wal/DB-shm and cannot remove them, and side
+# files owned by another user (root cron, sudo) then make the database read-only
+# for the services. Not writable: read-only, and "immutable" (creates no side
+# files at all) unless DB-wal/DB-shm exist, i.e. the services are running.
+# Returns 0 on a consistent snapshot, 2 after the fallback copy, 1 on failure.
+sqlite_snapshot() {
+    local db="$1" dest="$2" py rc
+    [[ -f "$db" ]] || return 1
+    rm -f -- "$dest" "$dest-wal" "$dest-shm"
+    rc=0
+    _sqlite_snapshot_try "$db" "$dest" || rc=$?
+    # Run as root (deploy_production.sh), SQLite may have created DB-wal / DB-shm:
+    # they must stay owned by the database owner, or the services cannot open it.
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        local f
+        for f in "$db-wal" "$db-shm"; do
+            if [[ -e "$f" ]]; then chown --reference="$db" -- "$f" 2>/dev/null || true; fi
+        done
+    fi
+    return "$rc"
+}
+
+_sqlite_snapshot_try() {
+    local db="$1" dest="$2" py
+    if command -v sqlite3 >/dev/null 2>&1 && [[ "$dest" != *"'"* && -w "$db" && -w "$(dirname -- "$db")" ]] \
+        && sqlite3 -cmd ".timeout 10000" -cmd "PRAGMA query_only=ON" "$db" ".backup '$dest'" >/dev/null 2>&1 \
+        && [[ -s "$dest" ]]; then
+        return 0
+    fi
+    rm -f -- "$dest"
+    py="$PYTHON"
+    [[ -x "$py" ]] || py="$(command -v python3 || true)"
+    if [[ -n "$py" ]] && "$py" -I -c '
+import os, sqlite3, sys, urllib.parse
+db, dest = os.path.abspath(sys.argv[1]), sys.argv[2]
+if os.access(db, os.W_OK) and os.access(os.path.dirname(db), os.W_OK):
+    src = sqlite3.connect(db, timeout=10)
+    src.execute("PRAGMA query_only=ON")
+else:  # sqlite3 would silently open read-only and could leave side files behind
+    uri = "file:" + urllib.parse.quote(db)
+    running = os.path.exists(db + "-wal") or os.path.exists(db + "-shm")
+    src = sqlite3.connect(uri + ("?mode=ro" if running else "?mode=ro&immutable=1"), uri=True, timeout=10)
+dst = sqlite3.connect(dest)
+with dst:
+    src.backup(dst)
+dst.close(); src.close()
+' "$db" "$dest" >/dev/null 2>&1 && [[ -s "$dest" ]]; then
+        return 0
+    fi
+    rm -f -- "$dest"
+    print_warning "No sqlite3 CLI or Python sqlite3 module for an online backup - copying $(basename "$db") and its -wal file instead (not atomic: stop the services for a reliable copy)"
+    cp -p -- "$db" "$dest" || return 1
+    if [[ -f "$db-wal" ]]; then
+        cp -p -- "$db-wal" "$dest-wal" || return 1
+    fi
+    return 2
 }
 
 # ---- services / processes ---------------------------------------------------

@@ -157,15 +157,22 @@ try:
         data1 = json.load(f)
     with open(f2, encoding="utf-8") as f:
         data2 = json.load(f)
+    def val_loss(data):
+        loss = (data.get("metrics") or {}).get("best_eval_loss")
+        return loss if isinstance(loss, (int, float)) else None
     print("                    %-12s %s" % (v1, v2))
-    for label, key in (("Final Loss", "final_loss"), ("Total Steps", "total_steps"),
+    print("%-19s %-12s %s" % ("Best Val Loss:", *("N/A" if v is None else v for v in (val_loss(data1), val_loss(data2)))))
+    for label, key in (("Final Train Loss", "final_loss"), ("Total Steps", "total_steps"),
                        ("Dataset Size", "dataset_size"), ("Learning Rate", "learning_rate"),
                        ("Batch Size", "batch_size"), ("Epochs", "num_epochs")):
         print("%-19s %-12s %s" % (label + ":", data1.get(key, "N/A"), data2.get(key, "N/A")))
-    loss1, loss2 = data1.get("final_loss"), data2.get("final_loss")
+    # The validation loss decides (as for the best checkpoint); a lower train loss alone can be overfitting.
+    loss1, loss2, what = val_loss(data1), val_loss(data2), "validation loss"
+    if loss1 is None or loss2 is None:
+        loss1, loss2, what = data1.get("final_loss"), data2.get("final_loss"), "train loss"
     if isinstance(loss1, (int, float)) and isinstance(loss2, (int, float)) and loss1:
         improvement = (loss1 - loss2) / loss1 * 100
-        print("\nImprovement: %.2f%% (%s)" % (improvement, "better" if improvement > 0 else "worse"))
+        print("\nImprovement (%s): %.2f%% (%s)" % (what, improvement, "better" if improvement > 0 else "worse"))
 except Exception as e:
     print("Error comparing sessions: %s" % e)
 ' "$info_file1" "$info_file2" "$version1" "$version2" 2>/dev/null
@@ -188,14 +195,23 @@ for name in sorted(os.listdir(history_dir)):
             data = json.load(f)
     except Exception:
         continue
-    loss = data.get("final_loss")
-    sessions.append((data.get("version", name[:-10]), loss if isinstance(loss, (int, float)) else None))
-ranked = sorted(sessions, key=lambda x: (x[1] is None, x[1] if x[1] is not None else 0))
-if ranked and ranked[0][1] is not None:
-    print("Best performing model: %s with loss %s" % ranked[0])
-    print("\nAll sessions ranked by performance:")
-    for i, (version, loss) in enumerate(ranked, 1):
-        print("%d. %s: %s" % (i, version, loss if loss is not None else "N/A"))
+    val = (data.get("metrics") or {}).get("best_eval_loss")
+    train = data.get("final_loss")
+    sessions.append((data.get("version", name[:-10]), data.get("model_dir_name") or "N/A",
+                     val if isinstance(val, (int, float)) else None,
+                     train if isinstance(train, (int, float)) else None))
+# Ranked by the best validation loss (what picks the best checkpoint); the final train
+# loss only for sessions without validation, after them (a low train loss can be overfitting).
+ranked = sorted(sessions, key=lambda s: (s[2] is None, s[2] if s[2] is not None else 0,
+                                         s[3] is None, s[3] if s[3] is not None else 0))
+if ranked and (ranked[0][2] is not None or ranked[0][3] is not None):
+    best = ranked[0]
+    what = "best validation loss %s" % best[2] if best[2] is not None else "final train loss %s (no validation)" % best[3]
+    print("Best performing model: %s (%s) with %s" % (best[0], best[1], what))
+    print("\nAll sessions ranked by validation loss:")
+    for i, (version, model, val, train) in enumerate(ranked, 1):
+        print("%d. %s (%s): val %s, train %s" % (i, version, model, val if val is not None else "N/A",
+                                                train if train is not None else "N/A"))
 else:
     print("No training sessions with loss data found.")
 ' "$TRAINING_HISTORY_DIR" 2>/dev/null
@@ -211,7 +227,7 @@ show_help() {
     echo "  list                    List all training sessions"
     echo "  view <version>          View specific training session (e.g., v1, v2)"
     echo "  compare <v1> <v2>       Compare two training sessions"
-    echo "  best                    Find best performing model"
+    echo "  best                    Rank the sessions by best validation loss (train loss if none)"
     echo "  help                    Show this help message"
     echo
     echo "Options:"
@@ -230,11 +246,11 @@ ARGS=()
 while (( $# > 0 )); do
     case "$1" in
         --log-dir)      [[ $# -ge 2 ]] || { print_error "--log-dir needs a directory"; exit 1; }
-                        TRAINING_HISTORY_DIR="$2/training_history"; shift 2 ;;
-        --log-dir=*)    TRAINING_HISTORY_DIR="${1#--log-dir=}/training_history"; shift ;;
+                        TRAINING_HISTORY_DIR="$(abspath "$2")/training_history"; shift 2 ;;
+        --log-dir=*)    TRAINING_HISTORY_DIR="$(abspath "${1#--log-dir=}")/training_history"; shift ;;
         --history-dir)  [[ $# -ge 2 ]] || { print_error "--history-dir needs a directory"; exit 1; }
-                        TRAINING_HISTORY_DIR="$2"; shift 2 ;;
-        --history-dir=*) TRAINING_HISTORY_DIR="${1#--history-dir=}"; shift ;;
+                        TRAINING_HISTORY_DIR="$(abspath "$2")"; shift 2 ;;
+        --history-dir=*) TRAINING_HISTORY_DIR="$(abspath "${1#--history-dir=}")"; shift ;;
         *)              ARGS+=("$1"); shift ;;
     esac
 done

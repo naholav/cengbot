@@ -4,8 +4,9 @@
 #
 # Usage: scripts/deploy_production.sh [--dry-run] [--yes] [--with-firewall] [--tune-system]
 #
-#   1. backup      project archive (code, .env, data, DB, models; NOT logs/.venv/
-#                  node_modules/model_cache) -> <parent>/cengbot_deploy_backups/  (mode 600)
+#   1. backup      project archive (code, .env, data, models, an online snapshot of
+#                  the DB; NOT logs/.venv/node_modules/model_cache)
+#                  -> <parent>/cengbot_deploy_backups/  (mode 600)
 #   2. stop        systemd units cengbot-* and processes started by start_system.sh
 #   3. packages    apt: nginx rabbitmq-server logrotate curl
 #   4. app         pip install -r config/requirements.txt into .venv, init DB (missing
@@ -94,21 +95,48 @@ write_root_file() {   # write_root_file PATH MODE  (content on stdin)
 
 create_backup() {
     info "Backing up the current deployment to $BACKUP_ROOT"
-    local archive
+    local archive base db snapdir rc
     archive="$BACKUP_ROOT/cengbot_$(date +%Y%m%d_%H%M%S).tar.gz"
+    base="$(basename "$PROJECT_DIR")"
+    db="$(resolve_db_file)"
     run mkdir -p "$BACKUP_ROOT"
     run chmod 700 "$BACKUP_ROOT"
     # Contains .env (secrets) -> archive is readable by root only.
-    run tar -C "$(dirname "$PROJECT_DIR")" -czf "$archive" \
-        --exclude="$(basename "$PROJECT_DIR")/logs" \
-        --exclude="$(basename "$PROJECT_DIR")/.venv" \
-        --exclude="$(basename "$PROJECT_DIR")/model_cache" \
-        --exclude="$(basename "$PROJECT_DIR")/backups" \
-        --exclude="$(basename "$PROJECT_DIR")/checkpoints" \
-        --exclude="$(basename "$PROJECT_DIR")/admin_frontend/node_modules" \
-        --exclude="$(basename "$PROJECT_DIR")/admin_frontend/build" \
+    # The live database (WAL mode: .db, -wal and -shm change independently while the
+    # services run) is left out of the tar and added as one consistent online
+    # snapshot instead, without stopping anything yet.
+    run tar -C "$(dirname "$PROJECT_DIR")" -cf "${archive%.gz}" \
+        --exclude="$base/logs" \
+        --exclude="$base/.venv" \
+        --exclude="$base/model_cache" \
+        --exclude="$base/backups" \
+        --exclude="$base/checkpoints" \
+        --exclude="$base/admin_frontend/node_modules" \
+        --exclude="$base/admin_frontend/build" \
+        --exclude="$base/university_bot.db*" \
+        --exclude="$base/$(basename "$db")*" \
         --exclude='__pycache__' \
-        "$(basename "$PROJECT_DIR")"
+        "$base"
+    if [[ -f "$db" ]]; then
+        if (( DRY_RUN == 1 )); then
+            echo "  [dry-run] would add an online snapshot of $db as $base/$(basename "$db")"
+        else
+            snapdir="$(mktemp -d "$BACKUP_ROOT/.db-snapshot.XXXXXX")"
+            mkdir -p "$snapdir/$base"
+            rc=0
+            sqlite_snapshot "$db" "$snapdir/$base/$(basename "$db")" || rc=$?
+            if (( rc == 1 )); then
+                rm -rf -- "$snapdir" "${archive%.gz}"
+                error "Could not snapshot the database $db - nothing was stopped or changed"
+            fi
+            if (( rc == 2 )); then
+                warning "Database copied without an online snapshot (.db + -wal): restore both files together"
+            fi
+            tar -C "$snapdir" -rf "${archive%.gz}" "$base"
+            rm -rf -- "$snapdir"
+        fi
+    fi
+    run gzip "${archive%.gz}"
     run chmod 600 "$archive"
     for unit in "${UNITS[@]}"; do
         if [[ -f "/etc/systemd/system/$unit.service" ]]; then
@@ -190,17 +218,42 @@ server {
         try_files \$uri /index.html;
     }
 
-    # Admin API (CORS is handled by the API itself - no wildcard here)
+    # Content-hashed bundles: cache for a year. A missing chunk is a 404, never
+    # index.html (that would be cached as JavaScript). add_header in a location
+    # drops the server-level headers, so they are repeated here.
+    location /assets/ {
+        try_files \$uri =404;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    }
+
+    # The entry page names the current bundles: always revalidate it
+    # (SPA routes reach it through the try_files fallback above).
+    location = /index.html {
+        add_header Cache-Control "no-cache" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    }
+
+    # Admin API (CORS is handled by the API itself - no wildcard here).
+    # X-Forwarded-For is SET to the peer address, never appended to: uvicorn trusts
+    # it from 127.0.0.1 and the login rate limit is keyed on it, so a client must
+    # not be able to choose its own key (bypass, or locking out the admin).
     location /api/ {
         proxy_pass http://127.0.0.1:8001/;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 
     location /health {
         proxy_pass http://127.0.0.1:8001/health;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
         access_log off;
     }
 
@@ -209,6 +262,7 @@ server {
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
     gzip on;
+    gzip_comp_level 5;
     gzip_types text/plain text/css application/json application/javascript text/xml application/xml text/javascript;
 }
 EOF
@@ -311,7 +365,7 @@ preflight_build_tools() {
 
 main() {
     print_header "CengBot production deployment"
-    sed -n '6,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '6,21p' "$0" | sed 's/^# \{0,1\}//'
     echo "Project: $PROJECT_DIR   service user: $SERVICE_USER   firewall: $( (( WITH_FIREWALL )) && echo yes || echo no )   full tuning: $( (( TUNE_SYSTEM )) && echo yes || echo no )"
     echo
     if (( DRY_RUN == 1 )); then

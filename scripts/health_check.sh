@@ -84,7 +84,16 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     ok "GPU: $(nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader 2>/dev/null | head -n 1)"
 fi
 DB_FILE="$(resolve_db_file)"
-if [[ -f "$DB_FILE" ]]; then ok "Database: $DB_FILE ($(du -h "$DB_FILE" | cut -f1))"; else bad "Database: not found ($DB_FILE)"; fi
+if [[ -f "$DB_FILE" ]]; then
+    # WAL mode: recent commits live in DB-wal until a checkpoint - count it too
+    db_parts=("$DB_FILE")
+    for f in "$DB_FILE-wal" "$DB_FILE-shm"; do
+        if [[ -f "$f" ]]; then db_parts+=("$f"); fi
+    done
+    ok "Database: $DB_FILE ($(du -ch -- "${db_parts[@]}" | tail -n 1 | cut -f1) incl. -wal/-shm)"
+else
+    bad "Database: not found ($DB_FILE)"
+fi
 
 echo -e "\n${BLUE}🔍 Log files${NC}"
 for logfile in logs/*.log; do

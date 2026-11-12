@@ -37,10 +37,7 @@ for i, line in enumerate(sys.stdin, 1):
     print(f"     A: {str(d.get('answer', ''))[:50]}...")
 PY
 
-# Relative --output paths are relative to the caller's directory (the export runs in the project root)
-abspath() {
-    if [[ "$1" == /* ]]; then printf '%s' "$1"; else printf '%s' "$PWD/$1"; fi
-}
+# --output is relative to the caller's directory (abspath from _common.sh; the export runs in the project root)
 ARGS=()
 OUTPUT_FILE="$DATA_DIR/cengbot_qa_augmented.jsonl"
 while (( $# > 0 )); do
@@ -49,7 +46,9 @@ while (( $# > 0 )); do
         --output)
             [[ $# -ge 2 && -n "$2" ]] || die "--output needs a file"
             OUTPUT_FILE="$(abspath "$2")"; ARGS+=(--output "$OUTPUT_FILE"); shift ;;
-        --output=*) OUTPUT_FILE="$(abspath "${1#--output=}")"; ARGS+=(--output "$OUTPUT_FILE") ;;
+        --output=*)
+            [[ -n "${1#--output=}" ]] || die "--output needs a file"
+            OUTPUT_FILE="$(abspath "${1#--output=}")"; ARGS+=(--output "$OUTPUT_FILE") ;;
         *) ARGS+=("$1") ;;
     esac
     shift

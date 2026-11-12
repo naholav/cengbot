@@ -18,7 +18,7 @@ scripts show what they will do and ask first (`--yes` skips the question,
 | `health_check.sh` | Services, `/health`, active model, database file (`DATABASE_URL`), disk/memory/GPU, log sizes, ports | read-only |
 | `switch_model.sh` | List / validate / switch / roll back the active model, restart only the AI worker | `models/active-model` symlink |
 | `train_model.sh` | Checks + `src/train_model.py` (any base model family) + validation of the new model directory | GPU training, `models/`, `checkpoints/` |
-| `view_training_history.sh` | `list` / `view vN` / `compare vA vB` / `best` for `logs/training_history/` | read-only |
+| `view_training_history.sh` | `list` / `view vN` / `compare vA vB` / `best` (by validation loss) for `logs/training_history/` (`--log-dir DIR`, `--history-dir DIR`) | read-only |
 | `export_training_data.sh` | DB -> `data/cengbot_qa_augmented.jsonl` via `src/database_to_training.py` | `data/` |
 | `augment_training_data.sh` | Claude API augmentation of the approved training data (costs money, asks first) | `data/` |
 | `export_database.sh` | DB -> Excel (`excel/`) via `src/export_to_excel.py` | `excel/` |
@@ -73,8 +73,9 @@ See **[docs/MODEL_SWAP.md](../docs/MODEL_SWAP.md)** for the full runbook. Short 
 
 `switch` validates the model directory, repoints `models/active-model`
 atomically, remembers the previous model (`models/.previous-model`) and
-restarts **only the AI worker** (asks first; `--yes` to skip, `--no-restart`
-to only print the command). The worker loads the model at start-up, so a
+restarts **only the AI worker** (manual mode: asks first, `--yes` to skip;
+systemd mode: `sudo systemctl restart cengbot-worker`; `--no-restart` to only
+print the command). The worker loads the model at start-up, so a
 switch is not effective until the worker restarts. `--dry-run` shows the plan
 without changing anything. Models are never deleted. Options: `-n/--dry-run`,
 `-y/--yes`, `--no-restart`, `--name NAME`, `--move`.
@@ -83,30 +84,45 @@ without changing anything. Models are never deleted. Options: `-n/--dry-run`,
 
 ```bash
 ./scripts/export_training_data.sh [--approved-only] [--exclude-disliked] [--replace] [--include-inactive] [--no-backup] [--output FILE]
-./scripts/augment_training_data.sh [--dry-run] [--max-items N] [--model ID] [--reset] [--yes]
+./scripts/augment_training_data.sh [--dry-run] [--max-items N] [--model ID] [--reset] [--output FILE] [--yes]
 ./scripts/train_model.sh --dry-run        # data + tokenization checks, nothing is written
 ./scripts/train_model.sh                  # several hours on the GPU (asks; --yes to skip)
 ./scripts/train_model.sh --dataset data/merged_qa_data.jsonl --epochs 3   # other options go to train_model.py
 ./scripts/view_training_history.sh list | view v1 | compare v1 v2 | best
+./scripts/view_training_history.sh --log-dir /tmp/exp/logs list    # a run trained with --log-dir /tmp/exp/logs
 ```
 
 - `export_training_data.sh` passes every option to `src/database_to_training.py`.
-  By default it merges into the existing file and keeps a backup in `data/backups/`.
+  By default it merges into the existing file and keeps a backup in `backups/`
+  next to it (`data/backups/` for the default file).
 - `augment_training_data.sh` checks the database, shows a cost warning and asks
   you to type `YES`, runs `src/data_augmentation.py` and then exports the
   training data. The API key is read from `ANTHROPIC_API_KEY` / `CLAUDE_API_KEY`
   or asked for (hidden); it is never stored. A lock file prevents two runs at once.
+  `--output FILE` writes the augmented data (and its resume checkpoint) to FILE
+  instead of `data/cengbot_qa_augmented.jsonl`; the export afterwards merges into the same file.
 - `train_model.sh` options: `-n/--dry-run`, `-y/--yes`; `--dataset FILE...`,
-  `--models-dir DIR`, `--output-name NAME` and `--base-model ID|DIR` are checked
-  by the wrapper; every other option is passed to `src/train_model.py`
-  (`.venv/bin/python src/train_model.py --help`), for example `--load-in-4bit`
-  (QLoRA for 7-12B bases) and `--lora-target-modules auto|all-linear|a,b,c`.
+  `--models-dir DIR`, `--output-name NAME`, `--base-model ID|DIR`,
+  `--checkpoint-dir DIR`, `--log-dir DIR`, `--cache-dir DIR` and
+  `--resume-from-checkpoint latest|DIR` are checked by the wrapper (paths are
+  relative to your current directory); every other option is passed to
+  `src/train_model.py` (`.venv/bin/python src/train_model.py --help`), for
+  example `--load-in-4bit` (QLoRA for 7-12B bases),
+  `--lora-target-modules auto|all-linear|a,b,c`, `--max-steps N` (stop after N
+  optimizer steps: smoke runs) and `--logging-steps N` (train loss every N steps, default 10),
+  `--no-gradient-checkpointing` (faster, but 18 GiB or more: only with the worker stopped)
+  and `--no-sort-by-length`.
+  `--log-dir DIR` moves every log (wrapper log in `DIR/training/`, history in
+  `DIR/training_history/`, error log); `--checkpoint-dir DIR` the checkpoints;
+  `--cache-dir DIR` the base-model cache (default `MODEL_CACHE_DIR`, `model_cache/`).
   The wrapper warns when the base model (any Hugging Face org/name, default
   `BASE_MODEL_NAME`) is not in `model_cache/` yet, and when a gated base would
   need `HUGGING_FACE_TOKEN`. Other base families: [docs/MODEL_SWAP.md](../docs/MODEL_SWAP.md#retrain-on-a-different-base-model).
   Output: `models/final-best-model-v<N>/` (adapter + tokenizer +
   `training_info.json`), checkpoints in `checkpoints/<name>/`, wrapper log in
-  `logs/training/auto_training_<ts>.log`. The script validates the new
+  `logs/training/auto_training_<ts>.log`. `--resume-from-checkpoint latest`
+  continues an interrupted run (same `--output-name`/`--checkpoint-dir`) without
+  re-exporting the database, and stops if the data changed. The script validates the new
   directory and prints the `switch_model.sh switch ...` command; it never
   activates a model by itself. A lock (`.training.lock`) prevents two runs at once.
 

@@ -961,6 +961,64 @@ def test_deploy_checks_node_before_stopping_anything(fake_project):
     assert main.index("preflight_build_tools") < main.index("create_backup") < main.index("stop_services")
 
 
+def _rendered_nginx_site() -> str:
+    """The nginx site deploy_production.sh writes (setup_nginx run with write_root_file -> stdout)."""
+    render = ('source <(sed -n "/^setup_nginx() {/,/^setup_monitoring() {/p" "$1" | sed "\\$d"); '
+              'write_root_file() { cat; }; run() { :; }; info() { :; }; success() { :; }; '
+              'WEB_ROOT=/var/www/cengbot; setup_nginx')
+    proc = subprocess.run(["bash", "-c", render, "_", str(SCRIPTS / "deploy_production.sh")],
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0 and "server {" in proc.stdout, proc.stderr
+    return proc.stdout
+
+
+def _nginx_locations(conf: str) -> dict:
+    """{location pattern: body} of the (flat) server block, plus "server" for the rest."""
+    conf = re.sub(r"#[^\n]*", "", conf)  # comments
+    blocks, rest = {}, conf
+    for m in re.finditer(r"location\s+([^{]+?)\s*\{([^{}]*)\}", conf):
+        blocks[m.group(1).strip()] = m.group(2)
+        rest = rest.replace(m.group(0), "")
+    blocks["server"] = rest
+    return blocks
+
+
+def test_nginx_caches_hashed_assets_but_never_the_entry_page():
+    conf = _rendered_nginx_site()
+    loc = _nginx_locations(conf)
+    # hashed bundles: one year, immutable; a missing chunk is a 404 (never index.html served as JS)
+    assert re.search(r"try_files \$uri =404;", loc["/assets/"])
+    assert 'Cache-Control "public, max-age=31536000, immutable" always' in loc["/assets/"]
+    # the entry page (also reached by every SPA route via the fallback) is always revalidated
+    assert 'Cache-Control "no-cache" always' in loc["= /index.html"]
+    assert re.search(r"try_files \$uri /index.html;", loc["/"])
+    # API proxy and health check unchanged
+    assert "proxy_pass http://127.0.0.1:8001/;" in loc["/api/"]
+    assert "proxy_pass http://127.0.0.1:8001/health;" in loc["/health"]
+    # add_header inside a location drops the server-level ones: every location that sets
+    # headers repeats all server-level security headers
+    server_headers = re.findall(r"add_header (\S+) .*? always;", loc["server"])
+    assert set(server_headers) >= {"X-Frame-Options", "X-Content-Type-Options", "Referrer-Policy"}
+    for pattern, body in loc.items():
+        if pattern != "server" and "add_header" in body:
+            missing = [h for h in server_headers if f"add_header {h} " not in body]
+            assert not missing, f"location {pattern} drops {missing}"
+    assert re.search(r"gzip on;\s*gzip_comp_level 5;", loc["server"])
+
+
+def test_nginx_proxied_locations_set_x_forwarded_for_to_the_peer_address():
+    """uvicorn trusts X-Forwarded-For from 127.0.0.1 and the admin login rate limit is
+    keyed on the resulting client IP: nginx must overwrite the header with $remote_addr
+    (appending, or passing a client-sent value through, lets a client pick its key)."""
+    loc = _nginx_locations(_rendered_nginx_site())
+    proxied = {pattern: body for pattern, body in loc.items() if "proxy_pass" in body}
+    assert set(proxied) == {"/api/", "/health"}
+    for pattern, body in proxied.items():
+        assert re.search(r"proxy_set_header X-Forwarded-For \$remote_addr;", body), pattern
+        assert re.search(r"proxy_set_header X-Real-IP \$remote_addr;", body), pattern
+        assert "$proxy_add_x_forwarded_for" not in body and "$http_x_forwarded_for" not in body, pattern
+
+
 @pytest.mark.parametrize("script", ["optimize_linux.sh", "deploy_production.sh", "cleanup_system.sh",
                                     "setup_system.sh", "train_model.sh", "switch_model.sh"])
 def test_dangerous_scripts_require_confirmation(script):
@@ -975,3 +1033,169 @@ def test_health_check_on_fake_project_is_read_only(fake_project):
     assert "Active model" in proc.stdout
     assert "models/active-model -> final-best-model-v1.2 (valid)" in proc.stdout
     assert snapshot(fake_project) == before
+
+
+# --------------------------------------------------------------------------
+# SQLite in WAL mode: backups must include what is still in the -wal file
+# --------------------------------------------------------------------------
+def _wal_db_with_uncheckpointed_rows(path, rows=100):
+    """A WAL database whose rows are only in DB-wal (the connection stays open)."""
+    import sqlite3
+    conn = sqlite3.connect(path)
+    assert conn.execute("pragma journal_mode=wal").fetchone()[0] == "wal"
+    conn.execute("pragma wal_autocheckpoint=0")
+    conn.execute("create table votes(id integer primary key, v int)")
+    conn.executemany("insert into votes(v) values (?)", [(i,) for i in range(rows)])
+    conn.commit()
+    return conn
+
+
+def _rows(db_path):
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute("select count(*) from votes").fetchone()[0]
+    except sqlite3.OperationalError:  # no such table: the rows were only in the -wal file
+        return 0
+    finally:
+        conn.close()
+
+
+def _failing_tools(tmp_path, *names):
+    bindir = tmp_path / "failing-bin"
+    bindir.mkdir(exist_ok=True)
+    for name in names:
+        (bindir / name).write_text("#!/bin/sh\nexit 1\n")
+        (bindir / name).chmod(0o755)
+    return bindir
+
+
+@pytest.mark.parametrize("method", ["sqlite3-cli", "python", "copy-fallback"])
+def test_backup_snapshots_a_wal_database_completely(fake_project, tmp_path, method):
+    db = fake_project / "university_bot.db"
+    conn = _wal_db_with_uncheckpointed_rows(db)
+    try:
+        plain = tmp_path / "plain.db"
+        shutil.copy(db, plain)
+        assert _rows(plain) == 0  # what the old plain `cp` of the .db file saved
+        env = {}
+        if method == "sqlite3-cli":
+            if not shutil.which("sqlite3"):
+                pytest.skip("no sqlite3 CLI")
+        elif method == "python":
+            env["PATH"] = f"{_failing_tools(tmp_path, 'sqlite3')}:{os.environ['PATH']}"
+        else:
+            bindir = _failing_tools(tmp_path, "sqlite3", "python3", "python")
+            env.update(PATH=f"{bindir}:{os.environ['PATH']}", CENGBOT_PYTHON=str(bindir / "python"))
+        proc = run(SCRIPTS / "backup_data.sh", "--no-models", root=fake_project, **env)
+        assert proc.returncode == 0, out(proc)
+    finally:
+        conn.close()
+    archive = next((fake_project / "backups").glob("backup_*.tar.gz"))
+    dest = tmp_path / "restored"
+    with tarfile.open(archive) as tar:
+        names = tar.getnames()
+        tar.extractall(dest)
+    info = (dest / "backup_info.txt").read_text()
+    assert f"{db}-wal and {db}-shm" in info and "Stop every service" in info
+    if method == "copy-fallback":
+        assert "./university_bot.db-wal" in names and "restore both together" in info
+        assert "copying university_bot.db and its -wal file" in proc.stdout
+    else:
+        assert "./university_bot.db-wal" not in names and "online snapshot" in proc.stdout
+    assert _rows(dest / "university_bot.db") == 100  # opened with its -wal (fallback) or alone (snapshot)
+
+
+def test_deploy_backup_excludes_the_live_db_and_adds_a_snapshot(fake_project, tmp_path):
+    """create_backup runs before the services stop: the tar must not catch .db, -wal and
+    -shm at different moments; a consistent online snapshot is added instead."""
+    db = fake_project / "university_bot.db"
+    conn = _wal_db_with_uncheckpointed_rows(db)
+    (fake_project / "data").mkdir()
+    (fake_project / "data" / "a.jsonl").write_text("{}\n")
+    backup_root = tmp_path / "bk"
+    func = ('source "$1"; source <(sed -n "/^create_backup() {/,/^stop_services() {/p" "$2" | sed "\\$d"); '
+            'run() { "$@"; }; info() { :; }; success() { :; }; warning() { echo "WARN $*"; }; '
+            'error() { echo "ERROR $*"; exit 1; }; DRY_RUN=0; PROJECT_DIR="$PROJECT_ROOT"; '
+            'BACKUP_ROOT="$3"; UNITS=(); create_backup')
+    try:
+        proc = subprocess.run(["bash", "-c", func, "_", str(SCRIPTS / "_common.sh"), str(SCRIPTS / "deploy_production.sh"),
+                               str(backup_root)], env=script_env(fake_project), capture_output=True, text=True,
+                              timeout=60)
+        assert proc.returncode == 0, out(proc)
+    finally:
+        conn.close()
+    archive = next(backup_root.glob("cengbot_*.tar.gz"))
+    assert not list(backup_root.glob(".db-snapshot.*")) and not list(backup_root.glob("*.tar"))
+    with tarfile.open(archive) as tar:
+        names = tar.getnames()
+        assert names.count("proj/university_bot.db") == 1
+        assert not [n for n in names if n.startswith("proj/university_bot.db-")]  # no -wal / -shm
+        assert "proj/data/a.jsonl" in names
+        tar.extractall(tmp_path / "x", members=[tar.getmember("proj/university_bot.db")])
+    assert _rows(tmp_path / "x" / "proj" / "university_bot.db") == 100
+
+
+def test_health_check_counts_the_wal_file_in_the_database_size(fake_project):
+    (fake_project / "university_bot.db").write_bytes(b"\0" * 4096)
+    (fake_project / "university_bot.db-wal").write_bytes(b"\0" * 3 * 1024 * 1024)
+    proc = run(SCRIPTS / "health_check.sh", root=fake_project, timeout=60)
+    line = next(ln for ln in proc.stdout.splitlines() if "Database:" in ln)
+    assert "incl. -wal/-shm" in line and re.search(r"\b3[.,]1M\b", line), line  # not 4.0K (.db alone)
+
+
+@pytest.mark.parametrize("method", ["sqlite3-cli", "python"])
+def test_backup_of_a_stopped_wal_database_leaves_no_side_files(fake_project, tmp_path, method):
+    """With the services stopped, a read-only connection to a WAL database creates
+    DB-wal/DB-shm and cannot delete them; owned by another user (root cron, sudo)
+    they make the database read-only for the services. The snapshot opens the
+    database read-write with PRAGMA query_only=ON, which cleans up after itself."""
+    import sqlite3
+    db = fake_project / "university_bot.db"
+    conn = _wal_db_with_uncheckpointed_rows(db, rows=10)
+    conn.close()  # services stopped: the last connection checkpointed and removed the side files
+    assert sorted(p.name for p in fake_project.glob("university_bot.db*")) == ["university_bot.db"]
+    env = {}
+    if method == "sqlite3-cli":
+        if not shutil.which("sqlite3"):
+            pytest.skip("no sqlite3 CLI")
+    else:
+        env["PATH"] = f"{_failing_tools(tmp_path, 'sqlite3')}:{os.environ['PATH']}"
+    proc = run(SCRIPTS / "backup_data.sh", "--no-models", root=fake_project, **env)
+    assert proc.returncode == 0 and "online snapshot" in proc.stdout, out(proc)
+    assert sorted(p.name for p in fake_project.glob("university_bot.db*")) == ["university_bot.db"]
+    check = sqlite3.connect(db)
+    try:
+        assert check.execute("pragma journal_mode").fetchone()[0] == "wal"  # untouched
+        assert check.execute("select count(*) from votes").fetchone()[0] == 10
+    finally:
+        check.close()
+    script = (SCRIPTS / "_common.sh").read_text(encoding="utf-8")
+    assert script.count("query_only=ON") >= 2 and "sqlite3 -readonly" not in script
+
+
+@pytest.mark.parametrize("services_running", [False, True])
+def test_backup_of_a_read_only_wal_database_creates_no_side_files(fake_project, tmp_path, services_running):
+    """Not writable for the backup user: sqlite would silently open the database read-only
+    and could leave -wal/-shm files (owned by the backup user) behind. The snapshot then
+    uses an immutable read (services stopped) or reads the existing WAL (running)."""
+    if os.geteuid() == 0:
+        pytest.skip("root can write a 0444 file")
+    db = fake_project / "university_bot.db"
+    conn = _wal_db_with_uncheckpointed_rows(db, rows=25)
+    if not services_running:
+        conn.close()
+    before = sorted(p.name for p in fake_project.glob("university_bot.db*"))
+    db.chmod(0o444)
+    try:
+        proc = run(SCRIPTS / "backup_data.sh", "--no-models", root=fake_project)  # sqlite3 CLI skipped: not writable
+        assert proc.returncode == 0 and "online snapshot" in proc.stdout, out(proc)
+        assert sorted(p.name for p in fake_project.glob("university_bot.db*")) == before
+    finally:
+        db.chmod(0o644)
+        if services_running:
+            conn.close()
+    archive = next((fake_project / "backups").glob("backup_*.tar.gz"))
+    with tarfile.open(archive) as tar:
+        tar.extractall(tmp_path / "x", members=[tar.getmember("./university_bot.db")])
+    assert _rows(tmp_path / "x" / "university_bot.db") == 25

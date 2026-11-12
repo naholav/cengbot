@@ -275,9 +275,10 @@ while [[ $# -gt 0 ]]; do
             AUG_ARGS+=("$1"); shift ;;
         --output)
             [[ $# -ge 2 && -n "$2" ]] || { print_error "$1 needs a file"; exit 1; }
-            OUTPUT_FILE="$2"; shift 2 ;;
+            OUTPUT_FILE="$(abspath "$2")"; shift 2 ;;
         --output=*)
-            OUTPUT_FILE="${1#--output=}"; shift ;;
+            [[ -n "${1#--output=}" ]] || { print_error "--output needs a file"; exit 1; }
+            OUTPUT_FILE="$(abspath "${1#--output=}")"; shift ;;
         *)
             print_error "Unknown option: $1"
             show_help
@@ -286,8 +287,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Relative --output paths are relative to the caller's directory (the steps below run in the project root)
-[[ "$OUTPUT_FILE" == /* ]] || OUTPUT_FILE="$PWD/$OUTPUT_FILE"
+# --output is relative to the caller's directory (abspath; the steps below run in the project root)
 AUG_ARGS+=(--output "$OUTPUT_FILE")
 
 # Main execution

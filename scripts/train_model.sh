@@ -51,14 +51,19 @@ Common train_model.py options (passed through):
   --checkpoint-dir DIR Trainer checkpoints (default: checkpoints/)
   --log-dir DIR        Training logs + history; this wrapper's log goes to DIR/training/
                        (default: logs/)
+  --cache-dir DIR      Base-model cache (default: MODEL_CACHE_DIR or model_cache/)
   --max-steps N        Stop after N optimizer steps (smoke test), default: --epochs
+  --logging-steps N    Log the train loss every N optimizer steps (default 10)
   --resume-from-checkpoint latest|DIR
-                       Continue an interrupted run (same --output-name/--checkpoint-dir)
+                       Continue an interrupted run (same --output-name/--checkpoint-dir;
+                       no database export; stops if the training data changed)
   --output-name NAME   Model directory name (default: final-best-model-v<next>)
   --base-model ID|DIR  Base model, any Hugging Face org/name or a local directory
                        (default: BASE_MODEL_NAME from env/.env, else $DEFAULT_BASE_MODEL)
   --load-in-4bit       QLoRA: needed for 7-12B base models on a 24 GB GPU
   --lora-target-modules auto|all-linear|a,b,c   (default auto)
+
+Path options are relative to the current directory ("~/" is expanded).
 
 Output: models/final-best-model-v<N>/ (adapter_config.json + adapter_model.safetensors
 + tokenizer + training_info.json). Activate it with
@@ -66,11 +71,18 @@ Output: models/final-best-model-v<N>/ (adapter_config.json + adapter_model.safet
 EOF
 }
 
-# abspath P -> P made absolute against the CALLER's directory (train_model.py runs in the project root)
-abspath() {
-    if [[ "$1" == /* ]]; then printf '%s' "$1"; else printf '%s' "$PWD/$1"; fi
+# model_arg ID|DIR -> a local directory made absolute against the caller's directory
+# (abspath, from _common.sh); a Hugging Face id (org/name) is returned unchanged
+model_arg() {
+    # shellcheck disable=SC2088  # a literal "~" prefix (expanded by abspath)
+    if [[ "$1" == /* || "$1" == ./* || "$1" == ../* || "$1" == '~' || "$1" == '~/'* || -d "$1" ]]; then
+        abspath "$1"
+    else
+        printf '%s' "$1"
+    fi
 }
 
+# Path options are relative to the CALLER's directory (train_model.py runs in the project root).
 while (( $# > 0 )); do
     case "$1" in
         -n|--dry-run) DRY_RUN=1 ;;
@@ -92,12 +104,17 @@ while (( $# > 0 )); do
         --output-name=*) OUTPUT_NAME="${1#--output-name=}"; FORWARD+=("$1") ;;
         --base-model)
             shift; [[ $# -gt 0 ]] || die "--base-model needs a model id or directory"
-            BASE_MODEL="$1"; FORWARD+=(--base-model "$1") ;;
-        --base-model=*) BASE_MODEL="${1#--base-model=}"; FORWARD+=("$1") ;;
+            BASE_MODEL="$(model_arg "$1")"; FORWARD+=(--base-model "$BASE_MODEL") ;;
+        --base-model=*) BASE_MODEL="$(model_arg "${1#--base-model=}")"; FORWARD+=(--base-model "$BASE_MODEL") ;;
         --cache-dir)
             shift; [[ $# -gt 0 ]] || die "--cache-dir needs a directory"
-            CACHE_DIR="$1"; FORWARD+=(--cache-dir "$1") ;;
-        --cache-dir=*) CACHE_DIR="${1#--cache-dir=}"; FORWARD+=("$1") ;;
+            CACHE_DIR="$(abspath "$1")"; FORWARD+=(--cache-dir "$CACHE_DIR") ;;
+        --cache-dir=*) CACHE_DIR="$(abspath "${1#--cache-dir=}")"; FORWARD+=(--cache-dir "$CACHE_DIR") ;;
+        --resume-from-checkpoint|--resume-from-checkpoint=*)
+            if [[ "$1" == *=* ]]; then v="${1#*=}"; else shift; v="${1:-}"; fi
+            [[ -n "$v" ]] || die "--resume-from-checkpoint needs 'latest' or a checkpoint directory"
+            [[ "$v" == latest ]] || v="$(abspath "$v")"
+            FORWARD+=(--resume-from-checkpoint "$v") ;;
         --checkpoint-dir)
             shift; [[ $# -gt 0 ]] || die "--checkpoint-dir needs a directory"
             FORWARD+=(--checkpoint-dir "$(abspath "$1")") ;;

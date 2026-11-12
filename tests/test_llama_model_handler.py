@@ -765,12 +765,97 @@ def test_sentence_cut_by_token_limit_is_dropped(monkeypatch):
 
 
 def test_generation_stops_early_once_enough_sentences(monkeypatch):
-    sentences = "".join(f" Cümle numarası {i} burada." for i in range(1, 40))
+    """Without a link the model gets max_sentences + 4 closed sentences to produce one."""
+    monkeypatch.setenv("MODEL_MAX_NEW_TOKENS", "400")
+    sentences = "".join(f" Cümle numarası {i} burada." for i in range(1, 10))  # 25 chars each
     model = loaded_model(sentences)
     answer, info = model.generate_response_with_info("Staj zorunlu mu?")
     assert info["stopped_by"] == "sentence_limit"
-    assert model.model.steps < len(sentences) // 2
+    assert model.model.steps == 8 * 25 + 1  # the 8th sentence is closed by the next space
     assert answer == "Cümle numarası 1 burada. Cümle numarası 2 burada. Cümle numarası 3 burada. Cümle numarası 4 burada."
+
+
+def test_generation_stops_as_soon_as_a_kept_sentence_has_a_link(monkeypatch):
+    """A link among the kept sentences makes the answer final: generation used to run on
+    for max_sentences + 2 sentences that were all dropped."""
+    monkeypatch.setenv("MODEL_MAX_NEW_TOKENS", "400")
+    head = " Bilgi https://ebs.cu.edu.tr/Program/555 adresinde. İkinci cümle. Üçüncü cümle. Dördüncü cümle."
+    model = loaded_model(head + " Beşinci cümle. Altıncı cümle. Yedinci cümle.")
+    answer, info = model.generate_response_with_info("Ders planı nerede?")
+    assert info["stopped_by"] == "sentence_limit" and model.model.steps == len(head) + 1
+    assert answer == head.strip()
+
+
+def test_generation_stops_once_the_rescued_link_is_complete(monkeypatch):
+    monkeypatch.setenv("MODEL_MAX_NEW_TOKENS", "400")
+    head = (" Evet, iki staj gerekir. Her staj 20 iş günüdür. Ayrı dönemlerde yapılır. Mezuniyet şartıdır."
+            " Detaylar https://bmb.cu.edu.tr/staj adresinde.")
+    model = loaded_model(head + " Altıncı cümle. Yedinci cümle. Sekizinci cümle.")
+    answer, info = model.generate_response_with_info("Staj zorunlu mu?")
+    assert info["stopped_by"] == "sentence_limit" and model.model.steps == len(head) + 1
+    assert answer == head.strip()
+
+
+def test_a_link_is_never_cut_at_a_dot_inside_it(monkeypatch):
+    """"...ebs.cu." at the end of the text looked like a complete sentence to the old stopper."""
+    monkeypatch.setenv("MODEL_MAX_NEW_TOKENS", "400")
+    text = (" Bir. İki. Üç. Dört. Bilgi için www.ebs.cu.edu.tr/Program/DersPlan/555/2024 adresine bakın."
+            " Altı. Yedi.")
+    answer = loaded_model(text).generate_response("Ders planı?")
+    assert answer.endswith("www.ebs.cu.edu.tr/Program/DersPlan/555/2024 adresine bakın.")
+
+
+def _sentence_pool():
+    return ["Evet, staj zorunludur.", "Prof. Dr. Ali Hoca dersi verir.", "2. sınıfta alınır.", "Ne zaman?",
+            "Başka sorun var mı?", "Detaylar https://ebs.cu.edu.tr/Program/555 adresinde.",
+            "Bkz. www.cu.edu.tr sayfası.", "Kayıtlar Eylül'de başlar!", "Ders 3 AKTS'dir…",
+            "Yönetmelik (madde 5) geçerlidir.", "Link: https://bmb.cu.edu.tr/staj?", "Başvuru OBS üzerinden yapılır."]
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_early_stop_never_changes_the_answer(monkeypatch, seed):
+    """Property: stopping as soon as answer_is_final() holds gives exactly the answer of the
+    whole generation (links only in the first max_sentences + 2 sentences, so the "patience"
+    cut never decides)."""
+    import random
+
+    monkeypatch.setenv("MODEL_MAX_NEW_TOKENS", "2000")
+    rng = random.Random(seed)
+    pool = _sentence_pool()
+    count = rng.randint(1, 12)
+    chosen = []
+    for i in range(count):
+        sentence = rng.choice(pool)
+        while i >= 6 and h._URL_RE.search(sentence):
+            sentence = rng.choice(pool)
+        chosen.append(sentence)
+    continuation = "".join(rng.choice([" ", " ", "\n"]) + sentence for sentence in chosen)
+    early, info = loaded_model(continuation).generate_response_with_info("Staj zorunlu mu?")
+    monkeypatch.setattr(h, "answer_is_final", lambda text, limit: False)
+    full, full_info = loaded_model(continuation).generate_response_with_info("Staj zorunlu mu?")
+    assert full_info["stopped_by"] == "eos"
+    assert early == full, (continuation, info["stopped_by"])
+
+
+def test_sentence_stopper_decodes_only_when_a_token_brings_whitespace():
+    class CountingTokenizer(FakeTokenizer):
+        def __init__(self):
+            super().__init__()
+            self.full_decodes = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            ids = ids.tolist() if hasattr(ids, "tolist") else list(ids)
+            if len(ids) > 1:
+                self.full_decodes += 1
+            return super().decode(ids, skip_special_tokens)
+
+    tokenizer = CountingTokenizer()
+    stopper = h.SentenceLimitStoppingCriteria(tokenizer, prompt_length=0, max_sentences=4)
+    text = "Uzunkelimelerdenoluşanbircümle. İkinci"
+    ids = torch.tensor([[ord(c) for c in text]])
+    for n in range(1, len(text) + 1):
+        stopper(ids[:, :n], None)
+    assert tokenizer.full_decodes == text.count(" ")
 
 
 def test_sentence_stop_disabled_when_unlimited(monkeypatch):

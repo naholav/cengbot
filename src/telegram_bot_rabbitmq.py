@@ -8,6 +8,13 @@ answer that ``ai_model_worker.py`` publishes to ``config.answers_queue``. A
 consumer thread reads the answers queue and hands every answer to the handler
 waiting for that ``raw_data_id`` through :class:`AnswerRouter`.
 
+Late answers: if the worker needs longer than ``BOT_ANSWER_TIMEOUT`` (queue
+backlog, worker restart), the asker is told that the answer is on its way, and
+an answer that arrives within ``BOT_LATE_ANSWER_WINDOW`` seconds is posted as a
+reply to the original question. The question payload carries ``deliver_until``
+(epoch seconds): after that nobody sees an answer, and the worker does not
+generate one.
+
 Author: naholav
 """
 
@@ -80,7 +87,19 @@ ANSWER_TIMEOUT = config.get_float("BOT_ANSWER_TIMEOUT", 30.0)
 if ANSWER_TIMEOUT <= 0:
     ANSWER_TIMEOUT = 30.0
 
+# Seconds after BOT_ANSWER_TIMEOUT during which a late answer is still posted as a
+# reply to the question (0 = never; the asker gets FALLBACK_RESPONSE at the timeout).
+LATE_ANSWER_WINDOW = max(0.0, config.get_float("BOT_LATE_ANSWER_WINDOW", 600.0))
+
 FALLBACK_RESPONSE = "Sorry, I cannot generate a response at the moment. Please try again later."
+
+
+def pending_response() -> str:
+    """Reply at the timeout when the answer may still come as a late reply."""
+    minutes = max(1, round(LATE_ANSWER_WINDOW / 60))
+    return (f"⏳ The answer is taking longer than usual. I'll post it here as a reply if it is ready "
+            f"within {minutes} minute{'s' if minutes != 1 else ''}; otherwise please ask again later.")
+
 RATE_LIMIT_REPLY = "⚠️ You're sending messages too quickly. Please wait a moment before sending another message."
 ERROR_REPLY = "An error occurred. Please try again later."
 
@@ -199,14 +218,27 @@ def _set_future_result(future: "asyncio.Future", data: Any) -> None:
         future.set_result(data)
 
 
+def _start_late_delivery(callback: Callable[[Any], Any], data: Any) -> None:
+    task = asyncio.ensure_future(callback(data))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 class AnswerRouter:
     """Routes answers from the RabbitMQ consumer thread to the coroutine that
-    waits for that ``raw_data_id``. Thread-safe; nothing is kept for questions
-    nobody waits for any more (no unbounded growth)."""
+    waits for that ``raw_data_id``, or - after the asker's timeout - to a
+    late-delivery callback until its window ends. Thread-safe and bounded:
+    expired late entries are dropped, nothing is kept for unknown answers."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._waiters: Dict[int, Tuple[asyncio.AbstractEventLoop, "asyncio.Future"]] = {}
+        # raw_data_id -> (loop, callback, monotonic expiry)
+        self._late: Dict[int, Tuple[asyncio.AbstractEventLoop, Callable[[Any], Any], float]] = {}
+
+    def _sweep_late(self, now: float) -> None:
+        for raw_data_id in [k for k, (_, _, expires) in self._late.items() if expires < now]:
+            del self._late[raw_data_id]
 
     def register(self, raw_data_id: int) -> "asyncio.Future":
         """Create a waiter. Must be called from the event loop *before* publishing."""
@@ -224,34 +256,71 @@ class AnswerRouter:
             if entry is not None and (future is None or entry[1] is future):
                 del self._waiters[raw_data_id]
 
-    def deliver(self, raw_data_id: int, data: Any) -> bool:
-        """Hand an answer to its waiter (callable from any thread).
+    def deliver(self, raw_data_id: int, data: Any) -> Optional[str]:
+        """Hand an answer to its waiter or late-delivery callback (callable from any thread).
 
-        Returns False when nobody waits for it (asker timed out, bot restarted).
+        Returns "waiting" or "late", or None when nobody wants it any more (window
+        over, bot restarted, a duplicate of an answer that was already delivered).
         """
+        now = time.monotonic()
         with self._lock:
             entry = self._waiters.pop(raw_data_id, None)
-        if entry is None:
-            return False
-        loop, future = entry
+            late = None
+            if entry is None:
+                late = self._late.pop(raw_data_id, None)
+                if late is not None and late[2] < now:
+                    late = None
+            self._sweep_late(now)
         try:
-            loop.call_soon_threadsafe(_set_future_result, future, data)
+            if entry is not None:
+                loop, future = entry
+                loop.call_soon_threadsafe(_set_future_result, future, data)
+                return "waiting"
+            if late is not None:
+                loop, callback, _ = late
+                loop.call_soon_threadsafe(_start_late_delivery, callback, data)
+                return "late"
         except RuntimeError:  # event loop already closed
-            return False
-        return True
+            pass
+        return None
 
-    async def wait(self, raw_data_id: int, future: "asyncio.Future", timeout: float) -> Optional[Any]:
-        """Wait for the answer; returns None on timeout. Always cleans up."""
+    async def wait(self, raw_data_id: int, future: "asyncio.Future", timeout: float,
+                   on_late: Optional[Callable[[Any], Any]] = None, late_window: float = 0.0) -> Optional[Any]:
+        """Wait for the answer; returns None on timeout. Always cleans up.
+
+        With ``on_late`` the waiter turns into a late entry at the timeout (atomically:
+        an answer that is being delivered right then is returned, never lost), and an
+        answer arriving within ``late_window`` seconds is passed to ``on_late(data)``.
+        """
         try:
-            return await asyncio.wait_for(future, timeout=max(0.0, timeout))
-        except asyncio.TimeoutError:
-            return None
+            await asyncio.wait({future}, timeout=max(0.0, timeout))
+            if future.done():
+                return future.result()
+            with self._lock:
+                entry = self._waiters.get(raw_data_id)
+                if entry is not None and entry[1] is future:
+                    del self._waiters[raw_data_id]
+                    if on_late is not None and late_window > 0:
+                        self._sweep_late(time.monotonic())
+                        self._late[raw_data_id] = (entry[0], on_late, time.monotonic() + late_window)
+                    return None
+            # deliver() took the waiter just now; its result is already scheduled on this loop
+            try:
+                return await asyncio.wait_for(future, timeout=5.0)
+            except asyncio.TimeoutError:
+                return None
         finally:
             self.unregister(raw_data_id, future)
+            if not future.done():
+                future.cancel()
 
     def pending_count(self) -> int:
         with self._lock:
             return len(self._waiters)
+
+    def late_count(self) -> int:
+        with self._lock:
+            return len(self._late)
 
 
 answer_router = AnswerRouter()
@@ -295,6 +364,14 @@ def _open_channel_with_queue(connection, queue_name: str):
     channel = connection.channel()  # the broker closed the previous one
     channel.queue_declare(queue=queue_name, durable=True)
     return channel
+
+
+def _describe_error(exc: BaseException) -> str:
+    """``Type: message`` for logs. pika's AMQPConnectionError for a refused or
+    unreachable broker has an empty str(); its reason is only in the repr() of its
+    argument ("AMQPConnectorSocketConnectError: ConnectionRefusedError(111, ...)")."""
+    detail = str(exc) or "; ".join(str(arg) or repr(arg) for arg in getattr(exc, "args", ()))
+    return f"{type(exc).__name__}: {detail}"
 
 
 def _close_quietly(connection) -> None:
@@ -366,10 +443,10 @@ class RabbitMQPublisher:
                     last_error = e
                     self._reset()
                     if attempt < self.MAX_ATTEMPTS:
-                        logger.info(f"RabbitMQ publish failed ({type(e).__name__}: {e}); reconnecting")
+                        logger.info(f"RabbitMQ publish failed ({_describe_error(e)}); reconnecting")
         logger.error(
             f"RabbitMQ send error for question {data.get('raw_data_id')}: "
-            f"{type(last_error).__name__}: {last_error}"
+            f"{_describe_error(last_error)}"
         )
         return False
 
@@ -398,6 +475,9 @@ CONSUMER_RECONNECT_INITIAL_DELAY = 1.0
 CONSUMER_RECONNECT_MAX_DELAY = 15.0
 # A connection that lived at least this long resets the backoff.
 CONSUMER_STABLE_CONNECTION_SECONDS = 30.0
+# While the broker is down the consumer retries every <= 15 s; it logs the first
+# failure, then at most one line per this many seconds, and one when it is back.
+CONSUMER_FAILURE_LOG_INTERVAL = 300.0
 ANSWER_PREFETCH_COUNT = 10
 
 _consumer_stop_event = threading.Event()
@@ -417,8 +497,10 @@ def _on_answer_message(ch, method, properties, body) -> None:
 
     delivered = answer_router.deliver(raw_data_id, data)
     ch.basic_ack(delivery_tag=method.delivery_tag)
-    if delivered:
+    if delivered == "waiting":
         logger.info(f"Received answer for question ID: {raw_data_id}")
+    elif delivered == "late":
+        logger.info(f"Received late answer for question ID: {raw_data_id}; replying to the question")
     else:
         logger.info(
             f"No pending request for answer {raw_data_id} (asker timed out or bot restarted); "
@@ -429,12 +511,14 @@ def _on_answer_message(ch, method, properties, body) -> None:
 def consume_answers(stop_event: Optional[threading.Event] = None) -> None:
     """Consume answers from RabbitMQ (run in a separate thread).
 
-    Reconnects with capped exponential backoff and one concise log line per
-    failed attempt.
+    Reconnects with capped exponential backoff. Logs one concise line when the
+    connection fails, then at most one per ``CONSUMER_FAILURE_LOG_INTERVAL`` while
+    it keeps failing, and one when it is back.
     """
     stop_event = stop_event if stop_event is not None else _consumer_stop_event
     delay = CONSUMER_RECONNECT_INITIAL_DELAY
     failures = 0
+    last_logged = 0.0
 
     while not stop_event.is_set():
         connection = None
@@ -460,11 +544,16 @@ def consume_answers(stop_event: Optional[threading.Event] = None) -> None:
                 failures = 0
                 delay = CONSUMER_RECONNECT_INITIAL_DELAY
             failures += 1
-            message = f"RabbitMQ consumer error: {type(e).__name__}: {e}; reconnecting in {delay:.0f}s"
+            message = f"RabbitMQ consumer error: {_describe_error(e)}; reconnecting in {delay:.0f}s"
+            now = time.monotonic()
             if failures == 1:
                 logger.error(message)
-            else:
+                last_logged = now
+            elif now - last_logged >= CONSUMER_FAILURE_LOG_INTERVAL:
                 logger.warning(f"{message} (attempt {failures})")
+                last_logged = now
+            else:
+                logger.debug(f"{message} (attempt {failures})")
             stop_event.wait(delay)
             delay = min(delay * 2, CONSUMER_RECONNECT_MAX_DELAY)
         finally:
@@ -757,10 +846,11 @@ async def _send_typing(message) -> None:
         logger.debug(f"Could not send typing action: {e}")
 
 
-async def _send_answer(message, user, question: str, raw_data_id: int, answer: Optional[str]):
+async def _send_answer(message, user, question: str, raw_data_id: int, answer: Optional[str],
+                       fallback: str = FALLBACK_RESPONSE):
     asker_plain, asker_html = _format_asker(user)
     if answer is None:
-        chunks = build_response_chunks(asker_plain, asker_html, question, FALLBACK_RESPONSE)
+        chunks = build_response_chunks(asker_plain, asker_html, question, fallback)
         markup = None  # nothing to vote on; votes would later stick to the real answer
     else:
         chunks = build_response_chunks(asker_plain, asker_html, question, answer)
@@ -841,6 +931,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     loop = asyncio.get_running_loop()
     username = user.username or user.first_name
     raw_data_id = None
+    # Set once the timeout reply is out, so a late answer never overtakes it.
+    timeout_reply_done = asyncio.Event()
     try:
         # Save question to database before publishing so the worker can update it
         raw_data_id = await loop.run_in_executor(
@@ -849,10 +941,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         future = answer_router.register(raw_data_id)
         answer_data = None
+        timed_out = False
         try:
             await _send_typing(message)
 
             started = loop.time()
+            asked_at = time.time()
             published = await _publish_question({
                 'raw_data_id': raw_data_id,
                 'telegram_id': user.id,
@@ -863,6 +957,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 # The worker echoes every question field back in its answer, so a
                 # late answer can still be routed to the right chat.
                 'chat_id': message.chat_id,
+                'asked_at': round(asked_at, 3),
+                # Epoch seconds after which nobody sees an answer (in time or as a late
+                # reply): the worker does not spend GPU time on it any more.
+                'deliver_until': round(asked_at + ANSWER_TIMEOUT + LATE_ANSWER_WINDOW, 3),
             }, ANSWER_TIMEOUT)
 
             # Duplicate marking runs in the background; it does not delay the answer.
@@ -870,14 +968,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             if published:
                 remaining = ANSWER_TIMEOUT - (loop.time() - started)
-                answer_data = await answer_router.wait(raw_data_id, future, remaining)
+
+                async def deliver_late(data) -> None:
+                    await _deliver_late_answer(message, user, message_text, raw_data_id, data,
+                                               timeout_reply_done, asked_at)
+
+                answer_data = await answer_router.wait(
+                    raw_data_id, future, remaining,
+                    on_late=deliver_late if LATE_ANSWER_WINDOW > 0 else None, late_window=LATE_ANSWER_WINDOW,
+                )
                 if answer_data is None:
-                    logger.warning(f"No answer for question {raw_data_id} within {ANSWER_TIMEOUT:.0f}s")
+                    timed_out = True
+                    later = (f"; replying when it arrives (up to {LATE_ANSWER_WINDOW:.0f}s)"
+                             if LATE_ANSWER_WINDOW > 0 else "")
+                    logger.warning(f"No answer for question {raw_data_id} within {ANSWER_TIMEOUT:.0f}s{later}")
         finally:
             answer_router.unregister(raw_data_id, future)
 
+        fallback = pending_response() if timed_out and LATE_ANSWER_WINDOW > 0 else FALLBACK_RESPONSE
         sent_message = await _send_answer(
-            message, user, message_text, raw_data_id, _extract_answer(answer_data)
+            message, user, message_text, raw_data_id, _extract_answer(answer_data), fallback=fallback
         )
 
         # Update telegram_message_id with bot's response message ID
@@ -887,6 +997,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         logger.error(f"Error handling message (question ID {raw_data_id}): {type(e).__name__}: {e}")
         await _reply_plain(message, ERROR_REPLY)
+    finally:
+        timeout_reply_done.set()
+
+
+async def _deliver_late_answer(message, user, question: str, raw_data_id: int, answer_data: Any,
+                               timeout_reply_done: "asyncio.Event", asked_at: float) -> None:
+    """Post an answer that arrived after the timeout as a reply to the original question."""
+    answer = _extract_answer(answer_data)
+    if answer is None:
+        return  # the timeout reply already asked the user to try again later
+    try:
+        await asyncio.wait_for(timeout_reply_done.wait(), timeout=60)
+    except asyncio.TimeoutError:
+        pass
+    try:
+        sent_message = await _send_answer(message, user, question, raw_data_id, answer)
+        if sent_message is not None:
+            # votes belong to this message now, not to the timeout reply
+            await asyncio.get_running_loop().run_in_executor(
+                None, _record_bot_message_id, raw_data_id, sent_message.message_id)
+        logger.info(f"Late answer for question {raw_data_id} posted {time.time() - asked_at:.0f}s after it was asked")
+    except Exception as e:
+        logger.warning(f"Could not post the late answer for question {raw_data_id}: {type(e).__name__}: {e}")
 
 
 CALLBACK_DATA_RE = re.compile(r"^(like|dislike)_(\d{1,18})$")

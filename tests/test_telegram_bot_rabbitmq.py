@@ -153,16 +153,71 @@ async def test_router_timeout_cleans_up_and_late_answer_is_dropped():
     fut = router.register(5)
     assert await router.wait(5, fut, 0.05) is None
     assert router.pending_count() == 0
-    # The late answer is not stored anywhere (no unbounded growth)
-    assert router.deliver(5, {"answer": "late"}) is False
-    assert router.pending_count() == 0
+    # Without a late callback the late answer is not stored anywhere (no unbounded growth)
+    assert router.deliver(5, {"answer": "late"}) is None
+    assert router.pending_count() == 0 and router.late_count() == 0
 
 
 async def test_router_unknown_answer_is_not_kept():
     router = bot.AnswerRouter()
     for i in range(100):
-        assert router.deliver(i, {"answer": "orphan"}) is False
-    assert router.pending_count() == 0
+        assert router.deliver(i, {"answer": "orphan"}) is None
+    assert router.pending_count() == 0 and router.late_count() == 0
+
+
+async def settle():
+    """Let call_soon_threadsafe callbacks run, then wait for the background tasks."""
+    for _ in range(5):
+        await asyncio.sleep(0.01)
+        await drain_background()
+
+
+async def test_router_late_answer_goes_to_the_callback_once():
+    router = bot.AnswerRouter()
+    got = []
+
+    async def on_late(data):
+        got.append(data)
+
+    fut = router.register(8)
+    assert await router.wait(8, fut, 0.01, on_late=on_late, late_window=60) is None
+    assert router.pending_count() == 0 and router.late_count() == 1
+    assert router.deliver(8, {"answer": "late"}) == "late"
+    assert router.deliver(8, {"answer": "late", "status": "resent"}) is None  # duplicate: dropped
+    await settle()
+    assert got == [{"answer": "late"}] and router.late_count() == 0
+
+
+async def test_router_late_window_expires(monkeypatch):
+    router = bot.AnswerRouter()
+    got = []
+
+    async def on_late(data):
+        got.append(data)
+
+    fut = router.register(9)
+    assert await router.wait(9, fut, 0.01, on_late=on_late, late_window=0.05) is None
+    await asyncio.sleep(0.1)
+    assert router.deliver(9, {"answer": "too late"}) is None
+    router.register(10)  # registering sweeps expired late entries too
+    await settle()
+    assert got == [] and router.late_count() == 0
+
+
+async def test_router_answer_delivered_at_the_timeout_is_not_lost():
+    """deliver() pops the waiter just as the wait times out: the answer is returned, not
+    dropped and not sent a second time as a late reply."""
+    router = bot.AnswerRouter()
+    late = []
+
+    async def on_late(data):
+        late.append(data)
+
+    fut = router.register(11)
+    assert router.deliver(11, {"answer": "just in time"}) == "waiting"  # scheduled, not yet run
+    assert await router.wait(11, fut, 0, on_late=on_late, late_window=60) == {"answer": "just in time"}
+    await settle()
+    assert late == [] and router.late_count() == 0 and router.pending_count() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -403,8 +458,11 @@ async def test_concurrent_questions_get_their_own_answers(monkeypatch, db_sessio
 
 
 async def test_timeout_sends_fallback_without_keyboard(monkeypatch, db_session):
+    """BOT_LATE_ANSWER_WINDOW=0: the old behaviour (fallback, late answers dropped)."""
     monkeypatch.setattr(bot, "ANSWER_TIMEOUT", 0.2)
-    monkeypatch.setattr(bot, "send_to_rabbitmq", MagicMock(return_value=True))
+    monkeypatch.setattr(bot, "LATE_ANSWER_WINDOW", 0.0)
+    send = MagicMock(return_value=True)
+    monkeypatch.setattr(bot, "send_to_rabbitmq", send)
     msg = make_message()
 
     started = time.monotonic()
@@ -415,7 +473,10 @@ async def test_timeout_sends_fallback_without_keyboard(monkeypatch, db_session):
     call = msg.reply_text.await_args
     assert bot.FALLBACK_RESPONSE in call.args[0]
     assert call.kwargs["reply_markup"] is None
-    assert bot.answer_router.pending_count() == 0
+    assert bot.answer_router.pending_count() == 0 and bot.answer_router.late_count() == 0
+    payload = send.call_args.args[0]
+    # nobody sees an answer after the timeout: the worker may skip it from then on
+    assert payload["deliver_until"] == pytest.approx(payload["asked_at"] + 0.2, abs=0.01)
 
     row = all_raw()[0]
     assert row.answer is None  # stays unanswered; the worker may fill it later
@@ -425,6 +486,78 @@ async def test_timeout_sends_fallback_without_keyboard(monkeypatch, db_session):
                            json.dumps({"raw_data_id": row.id, "answer": "late"}))
     ch.basic_ack.assert_called_once_with(delivery_tag=9)
     assert bot.answer_router.pending_count() == 0
+
+
+def late_answer_body(raw_id, answer="Geç gelen cevap.", **extra):
+    return json.dumps({"raw_data_id": raw_id, "answer": answer, **extra}).encode()
+
+
+async def test_answer_after_the_timeout_is_posted_as_a_reply(monkeypatch, db_session):
+    """It used to be dropped: the asker only ever saw "Sorry, I cannot generate a response"."""
+    monkeypatch.setattr(bot, "ANSWER_TIMEOUT", 0.2)
+    monkeypatch.setattr(bot, "LATE_ANSWER_WINDOW", 600.0)
+    published = []
+    monkeypatch.setattr(bot, "send_to_rabbitmq", lambda data: published.append(data) or True)
+    msg = make_message("Staj defteri ne zaman teslim edilir?")
+    await bot.handle_message(make_update(msg), None)
+    await drain_background()
+
+    first = msg.reply_text.await_args
+    assert "taking longer than usual" in first.args[0] and "10 minutes" in first.args[0]
+    assert bot.FALLBACK_RESPONSE not in first.args[0] and first.kwargs["reply_markup"] is None
+    row = all_raw()[0]
+    assert row.telegram_message_id == 1000
+    assert bot.answer_router.pending_count() == 0 and bot.answer_router.late_count() == 1
+
+    payload = published[0]
+    assert payload["deliver_until"] == pytest.approx(payload["asked_at"] + 0.2 + 600.0, abs=0.01)
+    assert abs(payload["asked_at"] - time.time()) < 5
+
+    ch = MagicMock()
+    bot._on_answer_message(ch, SimpleNamespace(delivery_tag=3), None, late_answer_body(row.id))
+    bot._on_answer_message(ch, SimpleNamespace(delivery_tag=4), None,
+                           late_answer_body(row.id, status="resent"))  # duplicate from the worker
+    await settle()
+    assert msg.reply_text.await_count == 2  # the duplicate was not posted again
+    late = msg.reply_text.await_args
+    assert "Geç gelen cevap." in late.args[0] and late.args[0].startswith("@student asked:")
+    keyboard = late.kwargs["reply_markup"].inline_keyboard
+    assert [b.callback_data for b in keyboard[0]] == [f"like_{row.id}", f"dislike_{row.id}"]
+    assert fetch_raw(row.id).telegram_message_id == 1001  # votes go to the answer message
+    assert bot.answer_router.late_count() == 0
+
+
+async def test_late_answer_never_overtakes_the_timeout_reply(monkeypatch, db_session):
+    monkeypatch.setattr(bot, "ANSWER_TIMEOUT", 0.1)
+    monkeypatch.setattr(bot, "LATE_ANSWER_WINDOW", 600.0)
+    monkeypatch.setattr(bot, "send_to_rabbitmq", MagicMock(return_value=True))
+    msg = make_message()
+    order = []
+
+    async def slow_reply(text, **kwargs):
+        order.append(text)
+        if len(order) == 1:  # the timeout reply is slow; the answer arrives meanwhile
+            raw_id = all_raw()[0].id
+            bot._on_answer_message(MagicMock(), SimpleNamespace(delivery_tag=1), None, late_answer_body(raw_id))
+            await asyncio.sleep(0.2)
+        return SimpleNamespace(message_id=2000 + len(order))
+
+    msg.reply_text = AsyncMock(side_effect=slow_reply)
+    await bot.handle_message(make_update(msg), None)
+    await settle()
+    assert len(order) == 2
+    assert "taking longer" in order[0] and "Geç gelen cevap." in order[1]
+
+
+async def test_empty_late_answer_is_not_posted(monkeypatch, db_session):
+    monkeypatch.setattr(bot, "ANSWER_TIMEOUT", 0.1)
+    monkeypatch.setattr(bot, "send_to_rabbitmq", MagicMock(return_value=True))
+    msg = make_message()
+    await bot.handle_message(make_update(msg), None)
+    bot._on_answer_message(MagicMock(), SimpleNamespace(delivery_tag=1), None,
+                           late_answer_body(all_raw()[0].id, answer="  "))
+    await settle()
+    assert msg.reply_text.await_count == 1
 
 
 async def test_publish_failure_replies_immediately(monkeypatch, db_session):
@@ -764,10 +897,23 @@ class RecordingStopEvent(threading.Event):
         return self.is_set()
 
 
+class ClockedStopEvent(RecordingStopEvent):
+    """RecordingStopEvent whose waits advance a fake ``time.monotonic``."""
+
+    def __init__(self, stop_after, monkeypatch):
+        super().__init__(stop_after)
+        self.now = 1000.0
+        monkeypatch.setattr(bot.time, "monotonic", lambda: self.now)
+
+    def wait(self, timeout=None):
+        self.now += timeout or 0
+        return super().wait(timeout)
+
+
 def test_consumer_backoff_is_exponential_capped_and_concise(monkeypatch, caplog):
     factory = MagicMock(side_effect=pika.exceptions.AMQPConnectionError("refused"))
     monkeypatch.setattr(bot.pika, "BlockingConnection", factory)
-    stop = RecordingStopEvent(stop_after=9)
+    stop = ClockedStopEvent(stop_after=9, monkeypatch=monkeypatch)
     with caplog.at_level(logging.INFO, logger=bot.logger.name):
         bot.consume_answers(stop_event=stop)
     # capped well below ANSWER_TIMEOUT (30 s): after a broker outage the consumer is back
@@ -775,10 +921,33 @@ def test_consumer_backoff_is_exponential_capped_and_concise(monkeypatch, caplog)
     assert stop.delays == [1, 2, 4, 8, 15, 15, 15, 15, 15]
     assert bot.CONSUMER_RECONNECT_MAX_DELAY < 30.0
     records = [r for r in caplog.records if "RabbitMQ consumer" in r.getMessage()]
-    assert len(records) == 9
-    assert records[0].levelno == logging.ERROR
-    assert all(r.levelno == logging.WARNING for r in records[1:])
-    assert all(r.exc_info is None for r in records)
+    # the outage is visible at once; the retries within the next 5 minutes are not logged
+    assert len(records) == 1 and records[0].levelno == logging.ERROR
+    assert "refused" in records[0].getMessage() and not records[0].exc_info
+
+
+def test_long_consumer_outage_is_logged_sparsely_and_recovery_is_logged(monkeypatch, caplog):
+    """15 s retries used to log one line each (240 lines per hour of outage)."""
+    attempts = {"n": 0}
+    stop = ClockedStopEvent(stop_after=10_000, monkeypatch=monkeypatch)
+
+    def factory(*args, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] <= 242:  # ~1 hour of 15 s retries
+            raise pika.exceptions.AMQPConnectionError("refused")
+        conn, _ = fake_connection()
+        conn.process_data_events.side_effect = lambda **k: stop.set()
+        return conn
+
+    monkeypatch.setattr(bot.pika, "BlockingConnection", factory)
+    with caplog.at_level(logging.INFO, logger=bot.logger.name):
+        bot.consume_answers(stop_event=stop)
+    assert sum(stop.delays) >= 3500
+    failures = [r for r in caplog.records if "RabbitMQ consumer error" in r.getMessage()]
+    assert failures[0].levelno == logging.ERROR
+    assert all(r.levelno == logging.WARNING for r in failures[1:])
+    assert 10 <= len(failures) <= 14  # one per 5 minutes instead of 242
+    assert any("Reconnected to RabbitMQ after 242 failed attempt(s)" in r.getMessage() for r in caplog.records)
 
 
 def test_consumer_flapping_connection_keeps_backing_off(monkeypatch):
@@ -1035,3 +1204,39 @@ def test_pika_connection_noise_is_silenced():
     for name in ("pika.adapters.utils.io_services_utils", "pika.adapters.blocking_connection",
                  "pika.adapters.utils.connection_workflow", "pika.connection"):
         assert not logging.getLogger(name).isEnabledFor(logging.ERROR)
+
+
+def test_real_pika_consumer_failure_is_one_concise_line(monkeypatch, caplog):
+    """With the real pika against a closed local port: one bot line, nothing from pika."""
+    import socket
+
+    with socket.socket() as probe:  # a free port nobody listens on
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    monkeypatch.setenv("RABBITMQ_HOST", "127.0.0.1")
+    monkeypatch.setenv("RABBITMQ_PORT", str(port))
+    bot._quiet_noisy_loggers()
+    stop = ClockedStopEvent(stop_after=3, monkeypatch=monkeypatch)
+    with caplog.at_level(logging.DEBUG):
+        bot.consume_answers(stop_event=stop)
+    visible = [r for r in caplog.records if r.levelno >= logging.INFO]
+    assert [r.name for r in visible] == [bot.logger.name, bot.logger.name]  # the error + "consumer stopped"
+    assert visible[0].levelno == logging.ERROR and "AMQPConnectionError" in visible[0].getMessage()
+    assert "Connection refused" in visible[0].getMessage()  # str() of pika's error is empty
+    assert not visible[0].exc_info
+    assert stop.delays == [1, 2, 4]
+
+
+def test_publisher_failure_line_has_the_reason(monkeypatch, caplog):
+    from pika.adapters.utils.connection_workflow import AMQPConnectorSocketConnectError
+
+    # exactly what pika raises for a refused connection: str() is empty at both levels
+    refused = pika.exceptions.AMQPConnectionError(
+        AMQPConnectorSocketConnectError(ConnectionRefusedError(111, "Connection refused")))
+    assert str(refused) == ""
+    monkeypatch.setattr(bot.pika, "BlockingConnection", MagicMock(side_effect=refused))
+    with caplog.at_level(logging.INFO, logger=bot.logger.name):
+        assert bot.send_to_rabbitmq({"raw_data_id": 5}) is False
+    (error,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert "question 5: AMQPConnectionError: AMQPConnectorSocketConnectError: ConnectionRefusedError(111, " \
+        "'Connection refused')" in error.getMessage()

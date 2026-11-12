@@ -11,6 +11,7 @@ model (the real ``llama_model_handler`` is never imported), and
 import asyncio
 import html
 import json
+import logging
 import re
 import subprocess
 import sys
@@ -939,3 +940,16 @@ def test_sb_main_uses_config_token_and_concurrent_updates(monkeypatch):
     builder.token.assert_called_once_with(sb.config.telegram_bot_token)
     builder.concurrent_updates.assert_called_once_with(True)
     builder.build.return_value.run_polling.assert_called_once()
+
+
+def test_legacy_logging_hides_token_urls_and_pika_noise(monkeypatch):
+    monkeypatch.setattr(tb.logging, "basicConfig", lambda **kw: None)
+    loggers = {name: logging.getLogger(name) for name in ("pika", "httpx", "httpcore")}
+    old_levels = {name: lg.level for name, lg in loggers.items()}
+    try:
+        tb._configure_logging()
+        assert not logging.getLogger("pika.adapters.utils.io_services_utils").isEnabledFor(logging.ERROR)
+        assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
+    finally:
+        for name, lg in loggers.items():
+            lg.setLevel(old_levels[name])

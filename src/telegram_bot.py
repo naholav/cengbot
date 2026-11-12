@@ -924,6 +924,12 @@ def _configure_logging() -> None:
         level=level,
         force=True,
     )
+    # httpx logs every Telegram request URL (it contains the bot token) at INFO;
+    # pika logs ~10 ERROR lines with tracebacks per failed connect attempt (the
+    # answer consumer logs its own sparse lines).
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    logging.getLogger("pika").setLevel(logging.CRITICAL)
 
 
 def main() -> None:

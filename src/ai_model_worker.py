@@ -10,7 +10,11 @@ Robustness rules (see the 124 GB log incident):
   * The model is loaded once, *before* connecting to RabbitMQ, with exponential
     backoff (``WORKER_BACKOFF_INITIAL``..``WORKER_BACKOFF_MAX`` seconds) and one
     concise log line per failed attempt.
-  * RabbitMQ (re)connects also use exponential backoff.
+  * RabbitMQ (re)connects also use exponential backoff, capped at
+    ``WORKER_RECONNECT_MAX`` (15 s): a reconnect is cheap, and while the worker
+    waits every new question times out in the bot (``BOT_ANSWER_TIMEOUT``, 30 s).
+    The first failure is logged at once, the same error repeated at most every
+    5 minutes (pika's own per-attempt error lines and tracebacks are silenced).
   * Poison messages are bounded: a failed message is re-published with an
     ``x-cengbot-attempts`` header (and the original acked); a redelivered
     message (worker crashed/connection dropped mid-processing) counts as an
@@ -22,6 +26,12 @@ Robustness rules (see the 124 GB log incident):
     ``generate()`` call.
   * Every question goes through ``prompt_guard`` (blocked prompts never reach
     the GPU).
+  * A question whose ``deliver_until`` (epoch seconds, set by the bot) has passed
+    is not generated: nobody would see the answer, and after a backlog (worker
+    restart, outage) the GPU goes to questions whose askers still wait. The row
+    stays unanswered with an ``[auto]`` note, so admins can answer it. Payloads
+    without the field are answered as before (``WORKER_SKIP_EXPIRED=false``
+    answers everything).
   * A lost broker connection is not a failure of the question being answered:
     the error propagates, ``run_forever`` reconnects with backoff and the
     broker redelivers the unacked message. A delivery whose ``RawData`` row is
@@ -30,11 +40,13 @@ Robustness rules (see the 124 GB log incident):
     it; the bot ignores answers nobody waits for, so a duplicate is harmless.
   * SIGTERM while a question is being answered finishes that question first
     (answer published, message acked, consumer cancelled) and then exits; a
-    second SIGTERM stops at once.
+    second SIGTERM stops at once. If the connection is lost while finishing, the
+    worker exits instead of reconnecting (the broker redelivers the question).
 """
 
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -75,6 +87,11 @@ CONNECTION_LOST_ERRORS = (AMQPConnectionError, ChannelClosed, ChannelWrongStateE
 MAX_RAW_DATA_ID = 2**63 - 1
 _DIGITS_RE = re.compile(r"[0-9]{1,19}")
 
+# Broker reconnect delay cap (seconds), see the module docstring.
+RECONNECT_MAX_DELAY = 15.0
+# The same error repeated is logged at most this often (seconds); the first one always.
+REPEATED_ERROR_LOG_INTERVAL = 300.0
+
 FAILED_ANSWER = {
     "tr": "Üzgünüm, sorunu şu anda yanıtlayamadım. Lütfen biraz sonra tekrar dene.",
     "en": "Sorry, I couldn't answer your question right now. Please try again later.",
@@ -103,8 +120,16 @@ def _utcnow() -> datetime:
 
 
 def _short(exc: BaseException, limit: int = 300) -> str:
-    text = f"{type(exc).__name__}: {exc}"
+    # pika's AMQPConnectionError for a refused/unreachable broker has an empty str(); the
+    # reason is only in the repr() of its argument ("...: ConnectionRefusedError(111, ...)").
+    detail = str(exc) or "; ".join(str(arg) or repr(arg) for arg in getattr(exc, "args", ()))
+    text = f"{type(exc).__name__}: {detail}"
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _is_number(value) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
 
 
 class ModelNotLoadedError(RuntimeError):
@@ -135,7 +160,11 @@ class Backoff:
         self.attempts = 0
 
     def next_delay(self) -> float:
-        delay = min(self.maximum, self.initial * (self.factor ** self.attempts))
+        try:
+            # the exponent is bounded: factor ** attempts overflows a float after ~1000 attempts
+            delay = min(self.maximum, self.initial * (self.factor ** min(self.attempts, 64)))
+        except OverflowError:
+            delay = self.maximum
         self.attempts += 1
         return delay
 
@@ -155,6 +184,8 @@ class RabbitMQWorker:
         self.max_attempts = _env_int("WORKER_MAX_ATTEMPTS", 3, minimum=1)
         self.retry_delay = _env_float("WORKER_RETRY_DELAY", 2.0)
         self.pump_interval = _env_float("WORKER_HEARTBEAT_PUMP_INTERVAL", 1.0, minimum=0.01)
+        self.skip_expired = os.getenv("WORKER_SKIP_EXPIRED", "true").strip().lower() not in (
+            "0", "false", "no", "off")
         self.connection = None
         self.channel = None
         self._consumer_tag = None
@@ -444,6 +475,15 @@ class RabbitMQWorker:
             self._resend_stored_answer(data)
             return
 
+        overdue = self._overdue_seconds(data)
+        if overdue is not None:
+            asked_at = data.get("asked_at")
+            age = (f"asked {time.time() - asked_at:.0f}s ago" if _is_number(asked_at)
+                   else f"{overdue:.0f}s past its deadline")
+            logger.info("Question %s skipped (%s): nobody waits for the answer any more", raw_data_id, age)
+            self._add_note(raw_data_id, f"[auto] worker: not answered, the asker was no longer waiting ({age})")
+            return
+
         started = time.monotonic()
         question = data["question"]
         language = self._language(question)
@@ -469,6 +509,31 @@ class RabbitMQWorker:
         )
         self._publish_answer(data, answer, status=status)
         logger.info("Answer sent for question %s (%s, %.1fs)", raw_data_id, status, time.monotonic() - started)
+
+    def _overdue_seconds(self, data: Dict[str, Any]) -> Optional[float]:
+        """Seconds past the payload's ``deliver_until``, or None (no/invalid field, not yet due)."""
+        if not getattr(self, "skip_expired", True):
+            return None
+        deadline = data.get("deliver_until")
+        if not _is_number(deadline):
+            return None
+        overdue = time.time() - deadline
+        return overdue if overdue > 0 else None
+
+    def _add_note(self, raw_data_id: int, note: str) -> None:
+        db = SessionLocal()
+        try:
+            row = db.get(RawData, raw_data_id)
+            if row is None:
+                return
+            row.admin_notes = f"{row.admin_notes}\n{note}" if row.admin_notes else note
+            row.last_updated = _utcnow()
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     def _store_answer(self, raw_data_id: int, answer: str, processing_time: Optional[float] = None,
                       info: Optional[Dict[str, Any]] = None, notes: Optional[str] = None,
@@ -639,8 +704,10 @@ def run_forever(max_cycles: Optional[int] = None) -> None:
     """
     load_model_with_backoff()
     backoff = Backoff.from_env()
+    reconnect_max = _env_float("WORKER_RECONNECT_MAX", RECONNECT_MAX_DELAY, minimum=1.0)
     healthy_after = _env_float("WORKER_HEALTHY_AFTER", 60.0)
     last_error = None
+    last_logged = 0.0
     cycles = 0
     while max_cycles is None or cycles < max_cycles:
         cycles += 1
@@ -661,19 +728,31 @@ def run_forever(max_cycles: Optional[int] = None) -> None:
         except Exception as exc:
             if worker is not None:
                 worker.close()
-            if time.monotonic() - started >= healthy_after:
+            if _shutdown.requested:
+                # SIGTERM arrived while a question was being answered and then the connection
+                # was lost: stop as requested (the broker redelivers the unacked question).
+                logger.info("Stop requested; not reconnecting after: %s", _short(exc))
+                raise SystemExit(0) from None
+            now = time.monotonic()
+            if now - started >= healthy_after:
                 # the previous connection was healthy for a while: start the backoff over
                 backoff.reset()
                 last_error = None
             delay = backoff.next_delay()
+            if isinstance(exc, AMQPError):
+                delay = min(delay, reconnect_max)
             summary = _short(exc)
             if summary != last_error:
-                logger.error("Worker error: %s. Reconnecting in %.0fs", summary, delay,
+                logger.error("Worker error: %s - reconnecting in %.0fs", summary, delay,
                              exc_info=not isinstance(exc, (AMQPError, RuntimeError)))
-                last_error = summary
+                last_error, last_logged = summary, now
+            elif now - last_logged >= REPEATED_ERROR_LOG_INTERVAL:
+                logger.warning("Worker error repeated (%d in a row): %s - reconnecting in %.0fs",
+                               backoff.attempts, summary, delay)
+                last_logged = now
             else:
-                logger.warning("Worker error repeated (%d in a row). Reconnecting in %.0fs",
-                               backoff.attempts, delay)
+                logger.debug("Worker error repeated (%d in a row) - reconnecting in %.0fs",
+                             backoff.attempts, delay)
             time.sleep(delay)
             if not model_instance.is_loaded():
                 load_model_with_backoff()

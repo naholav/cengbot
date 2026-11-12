@@ -13,7 +13,9 @@ What runs for real:
   (``cengbot_live_<random>_questions`` / ``_answers``) and deletes them
   afterwards; the production queues are never touched.
 * ``src/ai_model_worker.py`` as a subprocess with the active model on the GPU
-  (needs ``nvidia-smi`` and cached weights; ``HF_HUB_OFFLINE=1``). If
+  (needs ``nvidia-smi`` and cached weights; ``HF_HUB_OFFLINE=1``). It reaches the
+  broker through a transparent TCP proxy in the test process, so a test can cut
+  its connection mid-answer without touching the RabbitMQ service. If
   ``CENGBOT_GPU_LOCK`` is set, the worker runs under ``flock $CENGBOT_GPU_LOCK``
   for its whole life. ``LIVE_WORKER_START_TIMEOUT`` (default 600 s) bounds the
   wait for the lock + model load.
@@ -21,6 +23,9 @@ What runs for real:
   and ``handle_message`` in-process with fake Update objects: Telegram is never
   contacted (non-loopback connections are refused during that test).
 * ``src/admin_rest_api.py`` under uvicorn on ``127.0.0.1:<free port>``.
+
+The worker scenarios run in file order; the graceful-stop scenario stops the
+module's worker, so it comes last among them.
 
 Everything uses a copy of ``university_bot.db`` (sqlite backup API, read-only
 source) in a temp directory; logs go there too. The admin API test needs
@@ -216,7 +221,14 @@ def broker():
 
 
 @pytest.fixture(scope="module")
-def worker(workdir, live_db, broker):
+def broker_proxy(broker):
+    proxy = _TcpProxy((broker.settings["host"], broker.settings["port"]))
+    yield proxy
+    proxy.close()
+
+
+@pytest.fixture(scope="module")
+def worker(workdir, live_db, broker, broker_proxy):
     if not shutil.which("nvidia-smi"):
         pytest.skip("the live worker test needs an NVIDIA GPU")
     cmd = [sys.executable, str(ROOT / "src" / "ai_model_worker.py")]
@@ -224,8 +236,9 @@ def worker(workdir, live_db, broker):
     if lock:
         cmd = ["flock", lock] + cmd
     log_path = workdir / "logs" / "worker.out"
+    env = _child_env(workdir, live_db, broker, RABBITMQ_HOST="127.0.0.1", RABBITMQ_PORT=broker_proxy.port)
     with open(log_path, "wb") as log:
-        proc = subprocess.Popen(cmd, cwd=ROOT, env=_child_env(workdir, live_db, broker), stdout=log,
+        proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=log,
                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
     try:
         deadline = time.monotonic() + float(os.environ.get("LIVE_WORKER_START_TIMEOUT", "600"))
@@ -264,6 +277,79 @@ def api_server(workdir, live_db):
         yield base
     finally:
         _stop_group(proc, timeout=15)
+
+
+class _TcpProxy:
+    """Transparent TCP proxy (127.0.0.1:<port> -> broker) whose connections can be cut."""
+
+    def __init__(self, target):
+        self.target = target
+        self.server = socket.socket()
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(16)
+        self.port = self.server.getsockname()[1]
+        self.lock = threading.Lock()
+        self.sockets = []
+        self.accepted = 0
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self):
+        while True:
+            try:
+                client, _ = self.server.accept()
+            except OSError:
+                return  # closed
+            try:
+                upstream = socket.create_connection(self.target, timeout=10)
+                upstream.settimeout(None)
+            except OSError:
+                client.close()
+                continue
+            with self.lock:
+                self.sockets += [client, upstream]
+                self.accepted += 1
+            for src, dst in ((client, upstream), (upstream, client)):
+                threading.Thread(target=self._pump, args=(src, dst), daemon=True).start()
+
+    @staticmethod
+    def _pump(src, dst):
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+        except OSError:
+            pass
+        for sock in (src, dst):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def cut(self):
+        """Drop every proxied connection at once (like a network failure / broker restart)."""
+        with self.lock:
+            sockets, self.sockets = self.sockets, []
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+
+    def close(self):
+        self.server.close()
+        self.cut()
+
+
+def _wait_for_log(path, needle, timeout, proc=None):
+    deadline = time.monotonic() + timeout
+    while needle not in path.read_text(errors="replace"):
+        if time.monotonic() > deadline or (proc is not None and proc.poll() is not None):
+            pytest.fail(f"{needle!r} not logged:\n" + path.read_text(errors="replace")[-3000:])
+        time.sleep(0.02)
 
 
 def _collect(channel, queue, expected, timeout, settle=3.0):
@@ -377,7 +463,10 @@ def no_internet(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", guarded)
 
 
-def test_bot_routes_concurrent_questions_end_to_end(broker, live_db, worker, monkeypatch, no_internet):
+@pytest.fixture
+def live_bot(broker, live_db, monkeypatch, no_internet):
+    """telegram_bot_rabbitmq in-process against the live broker and the database copy,
+    with its answer consumer thread running (Telegram itself is never contacted)."""
     from sqlalchemy import create_engine
 
     import database_models
@@ -395,35 +484,40 @@ def test_bot_routes_concurrent_questions_end_to_end(broker, live_db, worker, mon
     monkeypatch.setattr(bot, "BOT_TOPIC_ID", None)
     monkeypatch.setattr(bot, "ANSWER_TIMEOUT", 120.0)
     bot.user_message_history.clear()
-
-    questions = ["Staj zorunlu mu?", "Is the internship mandatory?", "Erasmus başvurusu nasıl yapılır?",
-                 "Which programming languages are taught in the first year?", "Bölümün web sitesi nedir?"]
-    updates = []
-    for i, text in enumerate(questions):
-        message = _FakeMessage(text, 880_000 + i)
-        message.chat.id = message.chat_id = bot.ALLOWED_CHAT_ID
-        user = SimpleNamespace(id=8_800_000 + i, username=f"live{i}", first_name="Live", is_bot=False)
-        updates.append(SimpleNamespace(message=message, effective_user=user, effective_message=message))
-
     stop = threading.Event()
     consumer = threading.Thread(target=bot.consume_answers, kwargs={"stop_event": stop}, daemon=True)
     consumer.start()
-
-    async def run_all():
-        await asyncio.gather(*(bot.handle_message(update, None) for update in updates))
-        for task in list(bot._background_tasks):  # background duplicate checks on the copy
-            await task
-
     try:
-        started = time.monotonic()
-        asyncio.run(run_all())
-        elapsed = time.monotonic() - started
+        yield bot
     finally:
         stop.set()
         consumer.join(10)
         bot._publisher_executor.submit(bot._publisher.close).result(timeout=10)
         database_models.SessionLocal.configure(bind=old_bind)
         engine.dispose()
+
+
+def _fake_update(bot, text, message_id, user_id):
+    message = _FakeMessage(text, message_id)
+    message.chat.id = message.chat_id = bot.ALLOWED_CHAT_ID
+    user = SimpleNamespace(id=user_id, username=f"live{user_id}", first_name="Live", is_bot=False)
+    return SimpleNamespace(message=message, effective_user=user, effective_message=message)
+
+
+def test_bot_routes_concurrent_questions_end_to_end(live_db, worker, live_bot):
+    bot = live_bot
+    questions = ["Staj zorunlu mu?", "Is the internship mandatory?", "Erasmus başvurusu nasıl yapılır?",
+                 "Which programming languages are taught in the first year?", "Bölümün web sitesi nedir?"]
+    updates = [_fake_update(bot, text, 880_000 + i, 8_800_000 + i) for i, text in enumerate(questions)]
+
+    async def run_all():
+        await asyncio.gather(*(bot.handle_message(update, None) for update in updates))
+        for task in list(bot._background_tasks):  # background duplicate checks on the copy
+            await task
+
+    started = time.monotonic()
+    asyncio.run(run_all())
+    elapsed = time.monotonic() - started
 
     assert elapsed < 120
     assert bot.answer_router.pending_count() == 0
@@ -441,6 +535,138 @@ def test_bot_routes_concurrent_questions_end_to_end(broker, live_db, worker, mon
         assert keyboard[0].callback_data == f"like_{row['id']}"  # the answer of *this* question
         assert row["answer"][:40] in reply.text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
         assert row["telegram_message_id"] == reply.message_id
+
+
+def test_answer_after_the_timeout_is_posted_as_a_late_reply(live_db, worker, live_bot, monkeypatch):
+    """The bot gives up waiting at its timeout (here 0.3 s; the GPU needs ~3 s), tells the
+    asker the answer is on its way, and posts the worker's answer as a reply when it arrives."""
+    bot = live_bot
+    monkeypatch.setattr(bot, "ANSWER_TIMEOUT", 0.3)
+    monkeypatch.setattr(bot, "LATE_ANSWER_WINDOW", 120.0)
+    update = _fake_update(bot, "Bilgisayar mühendisliğinde staj kaç gün?", 881_000, 8_810_000)
+
+    async def run():
+        await bot.handle_message(update, None)
+        deadline = time.monotonic() + 90
+        while len(update.message.replies) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        for task in list(bot._background_tasks):
+            await task
+
+    asyncio.run(run())
+    pending, late = update.message.replies
+    assert "taking longer than usual" in pending.text and pending.kwargs["reply_markup"] is None
+    conn = sqlite3.connect(live_db)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM raw_data WHERE telegram_id = ? ORDER BY id DESC LIMIT 1",
+                       (8_810_000,)).fetchone()
+    conn.close()
+    assert row["answer"] and row["answer"][:40] in late.text.replace("&amp;", "&")
+    assert late.kwargs["reply_markup"].inline_keyboard[0][0].callback_data == f"like_{row['id']}"
+    assert row["telegram_message_id"] == late.message_id  # votes go to the answer
+    assert bot.answer_router.late_count() == 0
+
+
+def test_question_past_its_deadline_is_not_generated(broker, live_db, worker):
+    """A question nobody waits for any more (backlog after an outage) costs no GPU time; the
+    row stays unanswered with an [auto] note for the admins."""
+    question = "Ders kaydı ne zaman başlıyor?"
+    raw_id = _insert_row(live_db, question, telegram_id=900_000_008)
+    payload = dict(_production_payload(raw_id, question, 900_000_008), asked_at=time.time() - 900,
+                   deliver_until=time.time() - 270)
+    connection, channel = _publish(broker, [payload])
+    try:
+        _wait_for_log(worker.log, f"Question {raw_id} skipped (asked 9", 60, worker.proc)
+        got = _collect(channel, broker.answers, set(), timeout=3, settle=2)
+    finally:
+        connection.close()
+    assert raw_id not in got
+    row = _row(live_db, raw_id)
+    assert row["answer"] is None and row["admin_notes"].startswith("[auto] worker: not answered")
+
+
+# ---------------------------------------------------------------------------
+# Scenario 2: broker connection lost mid-answer, then a graceful stop
+# ---------------------------------------------------------------------------
+
+def _publish(broker, payloads):
+    import pika
+
+    connection = pika.BlockingConnection(_pika_params(broker.settings))
+    channel = connection.channel()
+    channel.confirm_delivery()
+    props = pika.BasicProperties(delivery_mode=2, content_type="application/json")
+    for payload in payloads:
+        channel.basic_publish("", broker.questions, json.dumps(payload), properties=props)
+    return connection, channel
+
+
+def test_connection_lost_mid_answer_resends_the_stored_answer(broker, broker_proxy, live_db, worker):
+    """The connection drops while the model generates: the answer is stored, publishing it
+    fails, the worker reconnects (one log line, no traceback) and the broker's redelivery
+    re-sends the stored answer at once instead of generating again or re-queueing it."""
+    question = "Bitirme projesi için danışman hocamı nasıl seçerim?"
+    raw_id = _insert_row(live_db, question, telegram_id=900_000_005)
+    log_before = worker.log.read_text(errors="replace")
+    errors_before = log_before.count("Worker error:")
+    connection, channel = _publish(broker, [_production_payload(raw_id, question, 900_000_005)])
+    try:
+        _wait_for_log(worker.log, f"Processing question {raw_id}:", 60, worker.proc)
+        accepted = broker_proxy.accepted
+        broker_proxy.cut()
+        got = _collect(channel, broker.answers, {raw_id}, timeout=90)
+    finally:
+        connection.close()
+
+    (_received_at, answer), = got[raw_id]
+    assert answer["status"] == "resent" and answer["chat_id"] == CHAT_ID
+    row = _row(live_db, raw_id)
+    assert row["answer"] == answer["answer"] and row["answer"].strip()
+    log = worker.log.read_text(errors="replace")[len(log_before):]
+    assert log.count(f"Processing question {raw_id}:") == 1  # generated once
+    assert "already answered; re-sending the stored answer" in log
+    assert worker.log.read_text(errors="replace").count("Worker error:") == errors_before + 1
+    assert "Traceback" not in log and broker_proxy.accepted > accepted  # reconnected
+    assert worker.proc.poll() is None
+
+
+def test_sigterm_mid_answer_finishes_it_and_leaves_the_queue_intact(broker, live_db, worker):
+    """A restart (switch_model.sh, deploy, systemd stop) while a question is being answered:
+    that answer is still delivered, the next question stays queued (not redelivered), and
+    the worker exits by itself. Stops the module's worker: keep it the last worker test."""
+    first_q = "Yazılım mühendisliği dersinde hangi konular işleniyor?"
+    second_q = "Yaz okulunda hangi dersleri alabilirim?"
+    first = _insert_row(live_db, first_q, telegram_id=900_000_006)
+    second = _insert_row(live_db, second_q, telegram_id=900_000_007)
+    connection, channel = _publish(broker, [_production_payload(first, first_q, 900_000_006)])
+    try:
+        _wait_for_log(worker.log, f"Processing question {first}:", 60, worker.proc)
+        channel.basic_publish("", broker.questions, json.dumps(_production_payload(second, second_q, 900_000_007)))
+        os.killpg(worker.proc.pid, signal.SIGTERM)
+        got = _collect(channel, broker.answers, {first}, timeout=90)
+        deadline = time.monotonic() + 60
+        while True:
+            worker.proc.poll()  # reap it: a zombie still counts as a member of the group
+            try:
+                os.killpg(worker.proc.pid, 0)
+            except ProcessLookupError:
+                break
+            assert time.monotonic() < deadline, "worker did not exit after SIGTERM"
+            time.sleep(0.2)
+        method, _props, body = channel.basic_get(queue=broker.questions, auto_ack=True)
+    finally:
+        connection.close()
+
+    log = worker.log.read_text(errors="replace")
+    assert "Stop requested: finishing the current question first" in log, log[-2000:]
+    assert "Current question finished; stopping" in log and "Worker stopped" in log
+    assert "Traceback" not in log
+    assert second not in got  # answered by the next worker, not by the stopping one
+    (_received_at, answer), = got[first]
+    assert answer["status"] == "ok" and _row(live_db, first)["answer"] == answer["answer"]
+    assert method is not None and json.loads(body)["raw_data_id"] == second
+    assert not method.redelivered  # never delivered to the stopping worker
+    assert _row(live_db, second)["answer"] is None
 
 
 # ---------------------------------------------------------------------------

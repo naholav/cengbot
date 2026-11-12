@@ -5,6 +5,7 @@ No RabbitMQ, no GPU, no real sleeping (time.sleep is patched).
 
 import json
 import logging
+import socket
 import threading
 from types import SimpleNamespace
 from unittest import mock
@@ -750,3 +751,262 @@ def test_output_guard_fallback_is_marked_auto(monkeypatch):
     worker._handle({"raw_data_id": 1, "question": "Staj zorunlu mu?"})
     assert stored["answer"] == fallback
     assert "[auto] output_guard" in (stored.get("notes") or "")
+
+
+# --------------------------------------------------------------------------
+# Serving review round 2
+# --------------------------------------------------------------------------
+
+def test_backoff_never_overflows():
+    """factor ** attempts overflowed a float after 1024 attempts (~85 h at the 300 s cap,
+    ~4 h at the 15 s reconnect cap): OverflowError inside run_forever's error handler."""
+    backoff = w.Backoff(5, 300)
+    delays = [backoff.next_delay() for _ in range(5000)]
+    assert max(delays) == 300 and delays[-1] == 300
+    huge = w.Backoff(1, 10, factor=1e300)
+    assert [huge.next_delay() for _ in range(3)] == [1, 10, 10]
+
+
+class _FakeClock:
+    """time.monotonic() that advances only when the code under test sleeps."""
+
+    def __init__(self, sleeps):
+        self.now = 1000.0
+        self.sleeps = sleeps
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class _RefusedWorker:
+    error = AMQPConnectionError("connection refused")
+    created = 0
+
+    def __init__(self):
+        type(self).created += 1
+
+    def start_consuming(self):
+        raise self.error
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    sleeps = []
+    fake = _FakeClock(sleeps)
+    monkeypatch.setattr(w.time, "monotonic", fake.monotonic)
+    monkeypatch.setattr(w.time, "sleep", fake.sleep)
+    return fake
+
+
+def test_broker_reconnect_delay_is_capped_below_the_bot_answer_timeout(monkeypatch, clock):
+    """With the 300 s model backoff, questions published after a long broker outage waited up
+    to 5 minutes for the worker to come back, and every asker got the fallback (30 s timeout)."""
+    monkeypatch.setattr(w, "model_instance", FakeModel())
+    monkeypatch.setattr(w, "RabbitMQWorker", _RefusedWorker)
+    for name in ("WORKER_BACKOFF_INITIAL", "WORKER_BACKOFF_MAX", "WORKER_RECONNECT_MAX"):
+        monkeypatch.delenv(name, raising=False)
+    w.run_forever(max_cycles=8)
+    assert clock.sleeps == [5, 10, 15, 15, 15, 15, 15, 15]
+    assert w.RECONNECT_MAX_DELAY < 30  # BOT_ANSWER_TIMEOUT default
+
+    clock.sleeps.clear()
+    monkeypatch.setenv("WORKER_RECONNECT_MAX", "40")
+    w.run_forever(max_cycles=5)
+    assert clock.sleeps == [5, 10, 20, 40, 40]
+
+
+def test_non_broker_errors_keep_the_long_backoff(monkeypatch, clock):
+    monkeypatch.setattr(w, "model_instance", FakeModel())
+
+    class BrokenWorker(_RefusedWorker):
+        error = RuntimeError("unexpected bug")
+
+    monkeypatch.setattr(w, "RabbitMQWorker", BrokenWorker)
+    w.run_forever(max_cycles=7)
+    assert clock.sleeps == [5, 10, 20, 40, 80, 160, 300]
+
+
+def test_long_broker_outage_is_logged_sparsely(monkeypatch, clock, caplog):
+    """One line when the outage starts, then at most one line per 5 minutes (not one per
+    reconnect attempt); a different error is logged at once."""
+    monkeypatch.setattr(w, "model_instance", FakeModel())
+    monkeypatch.setattr(w, "RabbitMQWorker", _RefusedWorker)
+    with caplog.at_level(logging.DEBUG, logger=w.logger.name):
+        w.run_forever(max_cycles=242)  # ~1 hour of 15 s attempts
+    assert sum(clock.sleeps) >= 3600
+    lines = [r for r in caplog.records if r.name == w.logger.name and r.levelno >= logging.INFO]
+    assert lines[0].levelno == logging.ERROR and "connection refused" in lines[0].getMessage()
+    assert not any(r.exc_info for r in lines)
+    assert 10 <= len(lines) <= 14  # first + one per 300 s, instead of 242
+    assert all("connection refused" in r.getMessage() for r in lines)
+
+    caplog.clear()
+    errors = iter([AMQPConnectionError("refused")] * 3 + [AMQPConnectionError("auth failed")])
+
+    class ChangingWorker(_RefusedWorker):
+        def start_consuming(self):
+            raise next(errors)
+
+    monkeypatch.setattr(w, "RabbitMQWorker", ChangingWorker)
+    with caplog.at_level(logging.INFO, logger=w.logger.name):
+        w.run_forever(max_cycles=4)
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(messages) == 2 and "refused" in messages[0] and "auth failed" in messages[1]
+
+
+def test_real_pika_connection_failure_is_one_concise_line(monkeypatch, sleeps, caplog):
+    """Against a closed local port with the real pika: the worker logs one line per failure
+    (no traceback) and pika's own ~10 ERROR lines per attempt are silenced."""
+    monkeypatch.setattr(w, "model_instance", FakeModel())
+    monkeypatch.setattr(w.logging, "basicConfig", lambda **kw: None)
+    pika_logger = logging.getLogger("pika")
+    old_level = pika_logger.level
+    with socket.socket() as probe:  # a free port nobody listens on
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    config = SimpleNamespace(questions_queue="q", answers_queue="a", rabbitmq_host="127.0.0.1",
+                             rabbitmq_port=port)
+    real_worker = w.RabbitMQWorker
+    monkeypatch.setattr(w, "RabbitMQWorker", lambda: real_worker(config=config))
+    try:
+        w._setup_logging()
+        with caplog.at_level(logging.DEBUG):
+            w.run_forever(max_cycles=3)
+    finally:
+        pika_logger.setLevel(old_level)
+    visible = [r for r in caplog.records if r.levelno >= logging.INFO]
+    assert [r.name for r in visible] == [w.logger.name]
+    # the reason is in the line (str() of pika's AMQPConnectionError is empty)
+    assert visible[0].levelno == logging.ERROR and "AMQPConnectionError" in visible[0].getMessage()
+    assert "Connection refused" in visible[0].getMessage()
+    assert not visible[0].exc_info
+    assert sleeps == [5, 10, 15]
+
+
+def test_sigterm_then_lost_connection_exits_instead_of_reconnecting(worker, fake_model, db_session,
+                                                                   shutdown_state, monkeypatch, sleeps):
+    """SIGTERM mid-generation, then the broker connection drops before the answer is published:
+    the worker used to reconnect and consume again until systemd's SIGKILL (TimeoutStopSec)."""
+    from pika.exceptions import ChannelWrongStateError
+
+    handlers = {}
+    monkeypatch.setattr(w.signal, "signal", lambda sig, handler: handlers.setdefault(sig, handler))
+    w._install_signal_handlers()
+    terminate = handlers[w.signal.SIGTERM]
+    raw_id = add_question(db_session)
+    worker.channel = ClosedChannel()
+    fake_model.generate_response_with_info = lambda text, **kw: (terminate(15, None), ("Evet.", {}))[1]
+    with pytest.raises(ChannelWrongStateError):
+        worker.process_question(worker.channel, method(9), props(), payload(raw_id))
+    assert shutdown_state.requested and not shutdown_state.busy
+    assert fetch(db_session, raw_id).answer == "Evet."  # re-sent on the redelivery
+
+    class LostWorker(_RefusedWorker):
+        error = ChannelWrongStateError("Channel is closed.")
+        created = 0
+        closed = 0
+
+        def close(self):
+            LostWorker.closed += 1
+
+    monkeypatch.setattr(w, "RabbitMQWorker", LostWorker)
+    with pytest.raises(SystemExit):
+        w.run_forever(max_cycles=5)
+    assert LostWorker.created == 1 and LostWorker.closed >= 1 and sleeps == []
+
+
+def test_ack_still_happens_when_cancel_fails(worker, shutdown_state):
+    class FailingCancel(FakeChannel):
+        def basic_cancel(self, consumer_tag):
+            raise RuntimeError("channel busy")
+
+    channel = FailingCancel()
+    worker._consumer_tag = "ctag"
+    shutdown_state.requested = True
+    worker._ack(channel, 11)
+    assert channel.acks == [11] and worker._consumer_tag is None
+
+
+def test_give_up_keeps_the_message_unacked_when_the_connection_is_lost(worker, fake_model, db_session):
+    from pika.exceptions import ChannelWrongStateError
+
+    raw_id = add_question(db_session)
+    channel = ClosedChannel()
+    worker.channel = channel
+    with pytest.raises(ChannelWrongStateError):
+        worker._give_up(channel, 5, {"raw_data_id": raw_id, "question": "Staj zorunlu mu?"}, "gave up")
+    # the apology is stored; the redelivery re-sends it instead of generating
+    assert fetch(db_session, raw_id).answer == w.FAILED_ANSWER["tr"]
+
+
+def test_sleep_on_a_dead_connection_uses_time_sleep(worker, sleeps):
+    worker.connection.is_open = False
+    worker._sleep(2.5)
+    worker.connection.sleep.assert_not_called()
+    assert sleeps == [2.5]
+    worker.connection.is_open = True
+    worker._sleep(1.0)
+    worker.connection.sleep.assert_called_once_with(1.0)
+
+
+# --------------------------------------------------------------------------
+# Phase B: questions nobody waits for any more
+# --------------------------------------------------------------------------
+
+def test_expired_question_is_not_generated_and_noted(worker, fake_model, db_session):
+    """After a backlog the GPU went to answers nobody would see; fresh askers waited behind them."""
+    import time as real_time
+
+    raw_id = add_question(db_session)
+    now = real_time.time()
+    body = payload(raw_id, asked_at=now - 900, deliver_until=now - 270)
+    worker.process_question(worker.channel, method(3), props(), body)
+    assert fake_model.generate_calls == [] and worker.channel.published == []
+    assert worker.channel.acks == [3]
+    row = fetch(db_session, raw_id)
+    assert row.answer is None and row.answered_at is None  # admins can still answer it
+    assert row.admin_notes.startswith("[auto] worker: not answered, the asker was no longer waiting (asked 9")
+
+
+@pytest.mark.parametrize("extra", [
+    {},                                              # old bots: no field
+    {"deliver_until": None},
+    {"deliver_until": "2020-01-01"},
+    {"deliver_until": True},
+    {"deliver_until": float("nan")},
+    {"deliver_until": 4102444800.0},                 # in the future (2100)
+])
+def test_question_without_a_past_deadline_is_answered(worker, fake_model, db_session, extra):
+    raw_id = add_question(db_session)
+    worker.process_question(worker.channel, method(4), props(), payload(raw_id, **extra))
+    assert len(fake_model.generate_calls) == 1
+    assert fetch(db_session, raw_id).answer == "Evet, staj zorunludur."
+    (msg,) = worker.channel.to("a_test")
+    assert json.loads(msg.body)["status"] == "ok"
+
+
+def test_skipping_expired_questions_can_be_disabled(monkeypatch, fake_model, db_session, sleeps):
+    monkeypatch.setenv("WORKER_SKIP_EXPIRED", "false")
+    wk = w.RabbitMQWorker(config=CONFIG, connect=False)
+    wk.connection = FakeConnection()
+    wk.channel = wk.connection.channel_obj
+    raw_id = add_question(db_session)
+    wk.process_question(wk.channel, method(5), props(), payload(raw_id, deliver_until=1.0))
+    assert fetch(db_session, raw_id).answer == "Evet, staj zorunludur."
+
+
+def test_expired_but_already_answered_question_is_still_resent(worker, fake_model, db_session):
+    """The stored answer costs nothing to re-send (the bot drops it if nobody waits)."""
+    from datetime import datetime
+
+    raw_id = add_question(db_session, answer="stored", answered_at=datetime(2025, 1, 1))
+    worker.process_question(worker.channel, method(6), props(), payload(raw_id, deliver_until=1.0))
+    (msg,) = worker.channel.to("a_test")
+    assert json.loads(msg.body)["answer"] == "stored"

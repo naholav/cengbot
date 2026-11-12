@@ -572,9 +572,12 @@ _MARKER_PREFIXES = ("student", "öğrenci", "ogrenci", "assistant", "asistan", "
                     "sistem", "human")
 
 
-def split_sentences(text: str) -> List[str]:
-    """Split into sentences (keeping trailing whitespace), not breaking on "Prof. Dr." or "2. sınıf"."""
+def _split_sentences(text: str) -> Tuple[List[str], int]:
+    """Sentences (keeping trailing whitespace) and how many of the leading ones are *closed*:
+    ended by punctuation that is followed by whitespace, so text generated later can no
+    longer change them ("...cu." can still become "...cu.edu.tr", "...cu. " cannot)."""
     sentences: List[str] = []
+    closed = 0
     start = 0
     for match in _BOUNDARY_RE.finditer(text):
         end = match.end()
@@ -584,45 +587,105 @@ def split_sentences(text: str) -> List[str]:
             folded = prompt_guard.fold_text(word).strip(".")
             if folded in _ABBREVIATIONS or (len(folded) == 1 and folded.isalpha()) or folded.isdigit():
                 continue
+        followed_by_space = end < len(text)  # _BOUNDARY_RE: whitespace or the end of the text
         while end < len(text) and text[end].isspace():
             end += 1
-        sentences.append(text[start:end])
+        if text[start:end].strip():
+            sentences.append(text[start:end])
+            if followed_by_space:
+                closed = len(sentences)
         start = end
-    if start < len(text):
+    if text[start:].strip():
         sentences.append(text[start:])
-    return [s for s in sentences if s.strip()]
+    return sentences, closed
+
+
+def split_sentences(text: str) -> List[str]:
+    """Split into sentences (keeping trailing whitespace), not breaking on "Prof. Dr." or "2. sınıf"."""
+    return _split_sentences(text)[0]
+
+
+def _select(sentences: List[str], limit: int) -> Tuple[List[int], Optional[int]]:
+    """Indices of the kept sentences and of the rescued link sentence (see select_sentences)."""
+    kept: List[int] = []
+    dropped: List[int] = []
+    asked_question = False
+    for index, sentence in enumerate(sentences):
+        is_question = sentence.rstrip().endswith("?")
+        if (is_question and asked_question) or (limit and len(kept) >= limit):
+            dropped.append(index)
+            continue
+        asked_question = asked_question or is_question
+        kept.append(index)
+    link = None
+    if dropped and not any(_URL_RE.search(sentences[i]) for i in kept):
+        link = next((i for i in dropped if _URL_RE.search(sentences[i])
+                     and not sentences[i].rstrip().endswith("?")), None)
+    return kept, link
+
+
+def select_sentences(sentences: List[str], limit: int) -> Tuple[List[str], Optional[str]]:
+    """What the post-processor keeps: the first ``limit`` sentences (0 = all) with at most one
+    question, plus - if none of them has a link - the first link sentence among the dropped
+    ones (links are the most useful part of many answers). Returns (kept, rescued_link)."""
+    kept, link = _select(sentences, limit)
+    return [sentences[i] for i in kept], (sentences[link] if link is not None else None)
 
 
 def _ends_complete(sentence: str) -> bool:
     return sentence.rstrip().endswith((".", "!", "?", "…", ")", '"', "'", "»"))
 
 
-class SentenceLimitStoppingCriteria(StoppingCriteria):
-    """Stop once the answer has clearly more sentences than the post-processor keeps.
+def answer_is_final(text: str, max_sentences: int) -> bool:
+    """True once more generated text can no longer change the post-processed answer.
 
-    The base model rarely emits EOS for Turkish and would otherwise always run to
-    max_new_tokens. We stop after ``max_sentences + 2`` complete sentences if a link
-    was already generated (links are preserved), else after ``max_sentences + 4``.
+    ``text`` is the decoded generation so far (reasoning and turn markers removed, trailing
+    whitespace kept). The answer is final when ``max_sentences`` kept sentences are closed
+    and either one of them has a link or a link sentence to append was already generated.
+    Without a link the model gets a few more sentences to produce one: 4 after the last kept
+    sentence (2 once any link appeared). Never before all kept sentences are complete.
+    """
+    if not max_sentences:
+        return False
+    sentences, closed = _split_sentences(text)
+    closed_sentences = sentences[:closed]
+    kept, link = _select(closed_sentences, max_sentences)
+    if len(kept) < max_sentences:
+        return False
+    if link is not None or any(_URL_RE.search(closed_sentences[i]) for i in kept):
+        return True
+    patience = 2 if any(_URL_RE.search(s) for s in closed_sentences) else 4
+    return closed - (kept[-1] + 1) >= patience
+
+
+class SentenceLimitStoppingCriteria(StoppingCriteria):
+    """Stop as soon as the post-processed answer is final (see ``answer_is_final``).
+
+    The base model rarely emits EOS for Turkish and would otherwise run on to
+    max_new_tokens, generating sentences that ``_postprocess`` drops. A sentence can only
+    become closed when a token brings whitespace, so the decode + check runs only then.
     """
 
-    def __init__(self, tokenizer, prompt_length: int, max_sentences: int, check_every: int = 8):
+    def __init__(self, tokenizer, prompt_length: int, max_sentences: int):
         self.tokenizer = tokenizer
         self.prompt_length = prompt_length
         self.max_sentences = max_sentences
-        self.check_every = max(1, check_every)
         self.triggered = False
+
+    def _text(self, generated) -> str:
+        # the same cleaning as _postprocess, but the trailing whitespace is kept
+        text = prompt_guard.strip_reasoning(self.tokenizer.decode(generated, skip_special_tokens=True))
+        return prompt_guard.cut_at_turn_markers(text, strip=False)
 
     def __call__(self, input_ids, scores, **kwargs):
         done = []
         for row in input_ids:
             generated = row[self.prompt_length:]
             hit = False
-            if self.max_sentences and generated.shape[0] and generated.shape[0] % self.check_every == 0:
-                text = self.tokenizer.decode(generated, skip_special_tokens=True)
-                text = prompt_guard.cut_at_turn_markers(prompt_guard.strip_reasoning(text))
-                complete = sum(1 for s in split_sentences(text) if _ends_complete(s))
-                needed = self.max_sentences + (2 if _URL_RE.search(text) else 4)
-                hit = complete >= needed
+            if self.max_sentences and generated.shape[0]:
+                newest = self.tokenizer.decode(generated[-1:], skip_special_tokens=True)
+                if any(ch.isspace() for ch in newest):
+                    hit = answer_is_final(self._text(generated), self.max_sentences)
             done.append(hit)
         if any(done):
             self.triggered = True
@@ -1176,23 +1239,9 @@ class CengBotModel:
         if truncated and len(sentences) > 1 and not _ends_complete(sentences[-1]):
             sentences = sentences[:-1]  # drop the sentence cut off by max_new_tokens
 
-        kept: List[str] = []
-        dropped: List[str] = []
-        asked_question = False
-        limit = self.config.max_sentences
-        for sentence in sentences:
-            is_question = sentence.rstrip().endswith("?")
-            if (is_question and asked_question) or (limit and len(kept) >= limit):
-                dropped.append(sentence)
-                continue
-            asked_question = asked_question or is_question
-            kept.append(sentence)
-        # Links are the most useful part of many answers: keep the first one.
-        if dropped and not any(_URL_RE.search(s) for s in kept):
-            link = next((s for s in dropped if _URL_RE.search(s) and not s.rstrip().endswith("?")), None)
-            if link is not None:
-                kept.append(link)
-
+        kept, link = select_sentences(sentences, self.config.max_sentences)
+        if link is not None:
+            kept.append(link)
         text = "".join(kept).strip()
         if text and text[-1].isalnum():
             text += "."

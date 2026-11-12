@@ -93,11 +93,11 @@ class DatabaseToTrainingConverter:
     def __init__(self, base_path: Optional[str] = None, output_file: Optional[str] = None):
         self.base_path = Path(base_path) if base_path else PROJECT_ROOT
         self.data_dir = self.base_path / "data"
-        self.backup_dir = self.data_dir / "backups"
         self.training_file = Path(output_file) if output_file else self.data_dir / DEFAULT_OUTPUT_NAME
-
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.training_file.parent.mkdir(parents=True, exist_ok=True)
+        # Backups live next to the file they back up (data/backups/ by default), so
+        # --output elsewhere never writes into the project's data/ directory.
+        self.backup_dir = self.training_file.parent / "backups"
+        # Directories are created when something is written (the augmenter only reads).
 
     def map_language(self, db_language: Optional[str], text: Optional[str] = None) -> str:
         """Map database language codes ('TR'/'EN'/...) to 'turkish'/'english'.

@@ -4,7 +4,7 @@
 #
 # Checks GPU / interpreter / datasets, runs src/train_model.py with the project
 # venv (all unknown options are passed through to it), logs to
-# logs/training/auto_training_<ts>.log, then validates the produced model
+# <log-dir>/training/auto_training_<ts>.log (default logs/), then validates the produced model
 # directory against the model contract. It never switches the production
 # model - do that afterwards with
 #     scripts/switch_model.sh switch <new-model>       (see docs/MODEL_SWAP.md)
@@ -28,6 +28,7 @@ DATASETS=()
 FORWARD=()
 OUTPUT_NAME=""
 BASE_MODEL=""
+CACHE_DIR=""   # --cache-dir (else MODEL_CACHE_DIR / model_cache)
 DRY_RUN=0
 ASSUME_YES="${ASSUME_YES:-0}"
 
@@ -47,6 +48,12 @@ Common train_model.py options (passed through):
   --dataset FILE...    Training JSONL file(s) (default: data/merged_qa_data.jsonl
                        + data/cengbot_qa_augmented.jsonl)
   --models-dir DIR     Where the model directory is created (default: models/)
+  --checkpoint-dir DIR Trainer checkpoints (default: checkpoints/)
+  --log-dir DIR        Training logs + history; this wrapper's log goes to DIR/training/
+                       (default: logs/)
+  --max-steps N        Stop after N optimizer steps (smoke test), default: --epochs
+  --resume-from-checkpoint latest|DIR
+                       Continue an interrupted run (same --output-name/--checkpoint-dir)
   --output-name NAME   Model directory name (default: final-best-model-v<next>)
   --base-model ID|DIR  Base model, any Hugging Face org/name or a local directory
                        (default: BASE_MODEL_NAME from env/.env, else $DEFAULT_BASE_MODEL)
@@ -87,6 +94,18 @@ while (( $# > 0 )); do
             shift; [[ $# -gt 0 ]] || die "--base-model needs a model id or directory"
             BASE_MODEL="$1"; FORWARD+=(--base-model "$1") ;;
         --base-model=*) BASE_MODEL="${1#--base-model=}"; FORWARD+=("$1") ;;
+        --cache-dir)
+            shift; [[ $# -gt 0 ]] || die "--cache-dir needs a directory"
+            CACHE_DIR="$1"; FORWARD+=(--cache-dir "$1") ;;
+        --cache-dir=*) CACHE_DIR="${1#--cache-dir=}"; FORWARD+=("$1") ;;
+        --checkpoint-dir)
+            shift; [[ $# -gt 0 ]] || die "--checkpoint-dir needs a directory"
+            FORWARD+=(--checkpoint-dir "$(abspath "$1")") ;;
+        --checkpoint-dir=*) FORWARD+=(--checkpoint-dir "$(abspath "${1#--checkpoint-dir=}")") ;;
+        --log-dir)
+            shift; [[ $# -gt 0 ]] || die "--log-dir needs a directory"
+            TRAIN_LOG_DIR="$(abspath "$1")/training"; FORWARD+=(--log-dir "$(abspath "$1")") ;;
+        --log-dir=*) TRAIN_LOG_DIR="$(abspath "${1#--log-dir=}")/training"; FORWARD+=(--log-dir "$(abspath "${1#--log-dir=}")") ;;
         *)            FORWARD+=("$1") ;;
     esac
     shift
@@ -146,18 +165,29 @@ expected_model_name() {
 
 # check_base_model_cached - warn when the base model (any org/name) is not in the HF cache
 check_base_model_cached() {
-    local base="${BASE_MODEL:-${BASE_MODEL_NAME:-$(read_env_key BASE_MODEL_NAME)}}" cache token
+    local base="${BASE_MODEL:-${BASE_MODEL_NAME:-$(read_env_key BASE_MODEL_NAME)}}" cache token allow
     base="${base:-$DEFAULT_BASE_MODEL}"
     if [[ "$base" == /* || "$base" == ./* || "$base" == ../* || "$base" == "~"* || -d "$base" ]]; then
         return 0    # local directory: nothing to download
     fi
-    cache="${MODEL_CACHE_DIR:-$(read_env_key MODEL_CACHE_DIR)}"
+    cache="${CACHE_DIR:-${MODEL_CACHE_DIR:-$(read_env_key MODEL_CACHE_DIR)}}"
     cache="${cache:-model_cache}"
-    [[ "$cache" == /* ]] || cache="$PROJECT_ROOT/$cache"
+    # same rule as switch_model.sh model_cache_dir / train_model.py _default_cache_dir
+    # shellcheck disable=SC2088  # a literal "~/" prefix is expanded by hand
+    if [[ "${cache:0:2}" == '~/' ]]; then
+        cache="$HOME/${cache:2}"
+    elif [[ "$cache" != /* ]]; then
+        cache="$PROJECT_ROOT/$cache"
+    fi
     if compgen -G "$cache/models--${base//\//--}/snapshots/*/config.json" >/dev/null; then
         return 0
     fi
     token="${HUGGING_FACE_TOKEN:-$(read_env_key HUGGING_FACE_TOKEN)}"
+    allow="${MODEL_ALLOW_DOWNLOAD:-$(read_env_key MODEL_ALLOW_DOWNLOAD)}"
+    if [[ "${allow,,}" =~ ^(0|false|no|off|disabled)$ ]]; then
+        print_warning "Base model $base is not cached in $cache and MODEL_ALLOW_DOWNLOAD=$allow - training will fail until it is in the cache (allow the download once, see docs/MODEL_SWAP.md)"
+        return 0
+    fi
     print_warning "Base model $base is not cached in $cache - the first training run downloads it once (needs internet access to huggingface.co)"
     if [[ -z "$token" ]]; then
         print_warning "HUGGING_FACE_TOKEN is empty: downloading a gated base model (e.g. meta-llama/*, google/gemma-*) will fail"

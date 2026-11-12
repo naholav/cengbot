@@ -2,14 +2,16 @@
 
 # CengBot Training History Viewer
 # View and analyze training session logs and metadata (read-only)
-# (logs/training_history/v<N>.log + v<N>_info.json written by src/train_model.py)
+# (<log-dir>/training_history/v<N>.log + v<N>_info.json written by src/train_model.py;
+#  --log-dir DIR / --history-dir DIR / env TRAINING_HISTORY_DIR for runs made with
+#  train_model.py --log-dir DIR)
 
 set -euo pipefail
 
 # shellcheck source=scripts/_common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
-TRAINING_HISTORY_DIR="${LOG_DIR}/training_history"
+TRAINING_HISTORY_DIR="${TRAINING_HISTORY_DIR:-${LOG_DIR}/training_history}"
 PY="$PYTHON"
 [[ -x "$PY" ]] || PY="$(command -v python3 || echo python3)"
 
@@ -57,11 +59,14 @@ list_training_sessions() {
 import json, sys
 try:
     with open(sys.argv[1], encoding="utf-8") as f:
-        print("Loss: %s" % json.load(f).get("final_loss", "N/A"))
+        data = json.load(f)
+    loss = data.get("final_loss")
+    print("Loss: %s  Model: %s" % (round(loss, 4) if isinstance(loss, (int, float)) else "N/A",
+                                   data.get("model_dir_name") or "N/A"))
 except Exception:
     print("Loss: N/A")
 ' "$info_file" 2>/dev/null)
-                printf "%-15s" "$loss"
+                printf "%s" "$loss"
             else
                 printf "%-15s" "No metadata"
             fi
@@ -98,7 +103,8 @@ import json, sys
 try:
     with open(sys.argv[1], encoding="utf-8") as f:
         data = json.load(f)
-    for label, key in (("Version", "version"), ("Model", "model_version"), ("Final Loss", "final_loss"),
+    for label, key in (("Version", "version"), ("Model", "model_version"), ("Model Dir", "model_save_path"),
+                       ("Base Model", "base_model"), ("Final Loss", "final_loss"),
                        ("Total Steps", "total_steps"), ("Dataset Size", "dataset_size"),
                        ("Learning Rate", "learning_rate"), ("Batch Size", "batch_size"),
                        ("Epochs", "num_epochs"), ("Timestamp", "timestamp")):
@@ -199,7 +205,7 @@ else:
 show_help() {
     echo "CengBot Training History Viewer"
     echo
-    echo "Usage: $0 [COMMAND] [OPTIONS]"
+    echo "Usage: $0 [--log-dir DIR | --history-dir DIR] [COMMAND] [ARGS]"
     echo
     echo "Commands:"
     echo "  list                    List all training sessions"
@@ -208,12 +214,31 @@ show_help() {
     echo "  best                    Find best performing model"
     echo "  help                    Show this help message"
     echo
+    echo "Options:"
+    echo "  --log-dir DIR           Read DIR/training_history (the --log-dir given to train_model.py)"
+    echo "  --history-dir DIR       Read DIR directly (env: TRAINING_HISTORY_DIR)"
+    echo
     echo "Examples:"
     echo "  $0 list"
     echo "  $0 view v2"
     echo "  $0 compare v1 v2"
     echo "  $0 best"
 }
+
+# Options (anywhere on the command line)
+ARGS=()
+while (( $# > 0 )); do
+    case "$1" in
+        --log-dir)      [[ $# -ge 2 ]] || { print_error "--log-dir needs a directory"; exit 1; }
+                        TRAINING_HISTORY_DIR="$2/training_history"; shift 2 ;;
+        --log-dir=*)    TRAINING_HISTORY_DIR="${1#--log-dir=}/training_history"; shift ;;
+        --history-dir)  [[ $# -ge 2 ]] || { print_error "--history-dir needs a directory"; exit 1; }
+                        TRAINING_HISTORY_DIR="$2"; shift 2 ;;
+        --history-dir=*) TRAINING_HISTORY_DIR="${1#--history-dir=}"; shift ;;
+        *)              ARGS+=("$1"); shift ;;
+    esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
 
 # Main script logic
 case "${1:-list}" in

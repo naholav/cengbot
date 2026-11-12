@@ -37,20 +37,27 @@ for i, line in enumerate(sys.stdin, 1):
     print(f"     A: {str(d.get('answer', ''))[:50]}...")
 PY
 
-ARGS=("$@")
+# Relative --output paths are relative to the caller's directory (the export runs in the project root)
+abspath() {
+    if [[ "$1" == /* ]]; then printf '%s' "$1"; else printf '%s' "$PWD/$1"; fi
+}
+ARGS=()
 OUTPUT_FILE="$DATA_DIR/cengbot_qa_augmented.jsonl"
-for (( i = 0; i < ${#ARGS[@]}; i++ )); do
-    case "${ARGS[$i]}" in
+while (( $# > 0 )); do
+    case "$1" in
         -h|--help) show_help; exit 0 ;;
-        --output)  OUTPUT_FILE="${ARGS[$((i + 1))]:-$OUTPUT_FILE}" ;;
-        --output=*) OUTPUT_FILE="${ARGS[$i]#--output=}" ;;
+        --output)
+            [[ $# -ge 2 && -n "$2" ]] || die "--output needs a file"
+            OUTPUT_FILE="$(abspath "$2")"; ARGS+=(--output "$OUTPUT_FILE"); shift ;;
+        --output=*) OUTPUT_FILE="$(abspath "${1#--output=}")"; ARGS+=(--output "$OUTPUT_FILE") ;;
+        *) ARGS+=("$1") ;;
     esac
+    shift
 done
 
 print_header "CengBot Database to Training Data Export"
 require_python
 [[ -f "$EXPORT_SCRIPT" ]] || die "Export script not found: $EXPORT_SCRIPT"
-mkdir -p "$DATA_DIR"
 
 # Count active training rows through the ORM (honours DATABASE_URL)
 print_status "Checking database..."
@@ -79,7 +86,7 @@ fi
 print_success "Database contains $count exportable training records (active, not rejected)"
 
 print_status "Running database export..."
-( cd "$PROJECT_ROOT" && "$PYTHON" "$EXPORT_SCRIPT" "$@" ) || die "Database export failed!"
+( cd "$PROJECT_ROOT" && "$PYTHON" "$EXPORT_SCRIPT" "${ARGS[@]+"${ARGS[@]}"}" ) || die "Database export failed!"
 print_success "Database export completed successfully!"
 
 if [[ -f "$OUTPUT_FILE" ]]; then

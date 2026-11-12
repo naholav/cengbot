@@ -8,6 +8,8 @@ Everything is offline: fake tokenizers, a tiny randomly initialised Llama
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -745,6 +747,8 @@ def test_dry_run_writes_nothing(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     summary = json.loads(out[out.index("{"):])
     assert summary["train_examples"] + summary["val_examples"] == 18
+    # the plan (default batch 4 x 16): one optimizer step per epoch, 4 epochs
+    assert summary["plan"]["steps_per_epoch"] == 1 and summary["plan"]["total_steps"] == 4
     assert sorted(p.name for p in tmp_path.iterdir()) == ["d.jsonl"]
 
 
@@ -1119,3 +1123,356 @@ def test_effort_unset_or_invalid_not_sent(monkeypatch):
         aug._create_message("hi")
         kwargs = fake.messages.create.call_args.kwargs
         assert "output_config" not in kwargs.get("extra_body", {})
+
+
+# ---------------------------------------------------------------------------
+# Findings of the real end-to-end run: short runs, resume, redirection
+# ---------------------------------------------------------------------------
+def test_plan_and_training_arguments_honor_max_steps(tmp_path):
+    precision = tm.detect_precision(force_cpu=True)
+    cfg = tm.Config(per_device_train_batch_size=4, gradient_accumulation_steps=1, evals_per_epoch=5, max_steps=40)
+    plan = tm.plan_training_steps(cfg, n_train=186)  # the real 200-example smoke subset
+    assert plan["steps_per_epoch"] == 47 and plan["total_steps"] == 40
+    assert plan["eval_and_save_every_steps"] == 8  # spread over the short run, not over a whole epoch
+    args = tm.build_training_arguments(cfg, str(tmp_path / "run"), 186, has_eval=True, precision=precision)
+    assert args.max_steps == 40 and args.eval_steps == args.save_steps == 8
+    # default: epoch based, unchanged behaviour (64 per optimizer step, 4 epochs)
+    cfg = tm.Config()
+    plan = tm.plan_training_steps(cfg, n_train=20833)
+    assert plan["effective_batch_size"] == 64 and plan["steps_per_epoch"] == 326 and plan["total_steps"] == 1304
+    assert plan["eval_and_save_every_steps"] == 65
+    assert tm.build_training_arguments(cfg, str(tmp_path / "r"), 20833, True, precision).max_steps == -1
+    args = tm.parse_args(["--max-steps", "30", "--logging-steps", "2"])
+    built = tm.build_config(args)
+    assert built.max_steps == 30 and built.logging_steps == 2
+    assert tm.build_config(tm.parse_args([])).max_steps == -1
+
+
+def _fake_checkpoint(run_dir: Path, step: int, complete=True, broken_state=False):
+    ckpt = run_dir / f"checkpoint-{step}"
+    ckpt.mkdir(parents=True)
+    (ckpt / "adapter_model.safetensors").write_bytes(b"x")
+    if complete:
+        (ckpt / "optimizer.pt").write_bytes(b"x")
+        (ckpt / "trainer_state.json").write_text("{" if broken_state else json.dumps({"global_step": step}))
+    return ckpt
+
+
+def test_resume_latest_picks_the_newest_complete_checkpoint(tmp_path, caplog, monkeypatch):
+    monkeypatch.setattr(tm.logger, "propagate", True)  # main() in other tests turns it off
+    run = tmp_path / "checkpoints" / "final-best-model-v3"
+    with pytest.raises(FileNotFoundError, match="no complete checkpoint"):
+        tm.resolve_resume_checkpoint("latest", str(run))  # nothing there (yet)
+    assert tm.resolve_resume_checkpoint(None, str(run)) is None
+    _fake_checkpoint(run, 8)
+    good = _fake_checkpoint(run, 16)
+    _fake_checkpoint(run, 24, complete=False)        # killed while saving
+    _fake_checkpoint(run, 32, broken_state=True)     # killed while writing trainer_state.json
+    _fake_checkpoint(run, 100, complete=False).rename(run / "checkpoint-100.tmp")  # not a checkpoint name
+    assert tm.resolve_resume_checkpoint("latest", str(run)) == str(good)
+    assert "Skipping incomplete checkpoint" in caplog.text and "checkpoint-24" in caplog.text
+    assert tm.checkpoint_global_step(str(good)) == 16
+    assert tm.resolve_resume_checkpoint(str(good), str(run)) == str(good)
+    with pytest.raises(FileNotFoundError, match="no optimizer.pt"):
+        tm.resolve_resume_checkpoint(str(run / "checkpoint-24"), str(run))
+    with pytest.raises(FileNotFoundError, match="not a directory"):
+        tm.resolve_resume_checkpoint(str(run / "missing"), str(run))
+
+
+def test_whole_run_train_loss_corrects_the_trainer_value_after_resume():
+    # Real numbers of the GPU run (40 steps, killed after checkpoint-16, resumed): the
+    # Trainer reported 1.2053 (loss of steps 17-40 divided by 40); uninterrupted: 2.0810.
+    history = [{"loss": 2.3122, "step": 4}, {"eval_loss": 2.17, "step": 8}, {"loss": 2.2598, "step": 8},
+               {"loss": 2.085, "step": 12}, {"loss": 2.0993, "step": 16}, {"loss": 1.8609, "step": 20}]
+    assert tm.whole_run_train_loss(1.205339515209198, 40, 16, history) == pytest.approx(2.08098, abs=1e-4)
+    assert tm.whole_run_train_loss(2.0, 40, 0, history) == 2.0       # not resumed: unchanged
+    assert tm.whole_run_train_loss(None, 40, 16, history) is None
+    assert tm.whole_run_train_loss(1.2, 40, 16, []) == pytest.approx(2.0)  # nothing logged before the resume
+
+
+def _stub_error_handler(monkeypatch):
+    import error_handler  # the real module (conftest points its log at a temp dir)
+
+    calls = []
+    monkeypatch.setattr(error_handler, "handle_training_error", lambda exc, step, epoch=None: calls.append(step))
+    return calls
+
+
+def test_main_resume_after_a_crash_matches_an_uninterrupted_run(tmp_path, monkeypatch):
+    from transformers import TrainerCallback
+
+    _stub_error_handler(monkeypatch)
+    monkeypatch.setattr(tm, "_load_env", lambda: None)
+    monkeypatch.setattr(tm, "load_tokenizer", lambda cfg=None: fake_tokenizer())
+    monkeypatch.setattr(tm, "load_base_model", lambda cfg=None, precision=None: tiny_llama())
+    monkeypatch.delenv("TRAINING_VERSION", raising=False)
+    dataset = write_jsonl(tmp_path / "train.jsonl", synthetic_rows(n_groups=10, variants=4))
+    models, ckpts = tmp_path / "models", tmp_path / "ckpt"
+
+    def argv(name, *extra):
+        return ["--dataset", str(dataset), "--models-dir", str(models), "--checkpoint-dir", str(ckpts),
+                "--log-dir", str(tmp_path / "logs"), "--no-db-export", "--cpu", "--max-steps", "8",
+                "--batch-size", "4", "--grad-accum", "1", "--eval-batch-size", "4", "--val-ratio", "0.25",
+                "--evals-per-epoch", "4", "--logging-steps", "1", "--lora-r", "4", "--lora-alpha", "8",
+                "--output-name", name, *extra]
+
+    class Crash(TrainerCallback):  # the process dies right after checkpoint-4 was written
+        def on_save(self, args, state, control, **kwargs):
+            if state.global_step == 4:
+                raise RuntimeError("simulated crash")
+
+    real_create_trainer = tm.create_trainer
+
+    def crashing_create_trainer(*args, **kwargs):
+        trainer = real_create_trainer(*args, **kwargs)
+        trainer.add_callback(Crash())
+        return trainer
+
+    monkeypatch.setattr(tm, "create_trainer", crashing_create_trainer)
+    assert tm.main(argv("run")) == 1
+    run_dir = ckpts / "run"
+    assert sorted(p.name for p in run_dir.iterdir()) == ["checkpoint-2", "checkpoint-4"]
+    assert not (models / "run").exists()
+    monkeypatch.setattr(tm, "create_trainer", real_create_trainer)
+    # a checkpoint half-written by the crash must be skipped
+    shutil.copytree(run_dir / "checkpoint-4", run_dir / "checkpoint-6")
+    (run_dir / "checkpoint-6" / "trainer_state.json").unlink()
+
+    assert tm.main(argv("run", "--resume-from-checkpoint", "latest")) == 0
+    resumed = json.loads((models / "run" / "training_info.json").read_text(encoding="utf-8"))
+    assert resumed["resumed_from_checkpoint"] == str(run_dir / "checkpoint-4") and resumed["resumed_at_step"] == 4
+    assert resumed["total_steps"] == 8 and resumed["max_steps"] == 8
+
+    assert tm.main(argv("reference")) == 0
+    reference = json.loads((models / "reference" / "training_info.json").read_text(encoding="utf-8"))
+    assert reference["resumed_from_checkpoint"] is None and reference["total_steps"] == 8
+    # same result as without the crash; the train loss is the whole-run mean, not the Trainer's
+    # value for a resumed run (which is too low by resumed_at_step / total_steps)
+    assert resumed["metrics"]["final_eval_loss"] == pytest.approx(reference["metrics"]["final_eval_loss"], abs=1e-3)
+    assert resumed["final_loss"] == pytest.approx(reference["final_loss"], abs=1e-3)
+
+
+def test_resume_latest_without_checkpoints_fails_before_loading_the_model(tmp_path, monkeypatch, capsys):
+    _stub_error_handler(monkeypatch)
+    monkeypatch.setattr(tm, "_load_env", lambda: None)
+    monkeypatch.setattr(tm, "load_tokenizer", lambda cfg=None: fake_tokenizer())
+    monkeypatch.setattr(tm, "load_base_model", lambda cfg=None, precision=None: pytest.fail("model must not load"))
+    dataset = write_jsonl(tmp_path / "d.jsonl", synthetic_rows(n_groups=4, variants=2))
+    argv = ["--dataset", str(dataset), "--models-dir", str(tmp_path / "m"), "--checkpoint-dir", str(tmp_path / "c"),
+            "--log-dir", str(tmp_path / "logs"), "--no-db-export", "--cpu", "--resume-from-checkpoint", "latest",
+            "--output-name", "typo-name"]
+    assert tm.main(argv) == 1
+    err = capsys.readouterr().err
+    assert "no complete checkpoint" in err and "--output-name" in err
+
+
+def test_redirected_log_dir_also_redirects_the_error_log(tmp_path, monkeypatch):
+    calls = _stub_error_handler(monkeypatch)
+    monkeypatch.delenv("ERROR_LOG_FILE", raising=False)
+    monkeypatch.setattr(tm, "_load_env", lambda: None)
+    monkeypatch.setattr(tm, "load_tokenizer", lambda cfg=None: fake_tokenizer())
+    dataset = write_jsonl(tmp_path / "empty.jsonl", [])
+    logs = tmp_path / "logs"
+    argv = ["--dataset", str(dataset), "--models-dir", str(tmp_path / "m"), "--checkpoint-dir", str(tmp_path / "c"),
+            "--log-dir", str(logs), "--no-db-export", "--cpu"]
+    assert tm.main(argv) == 1
+    assert os.environ["ERROR_LOG_FILE"] == str(logs / "error.log") and calls == ["main_training"]
+    # a dry run writes nothing - not even the error log
+    calls.clear()
+    assert tm.main(argv + ["--dry-run", "--log-dir", str(tmp_path / "dry")]) == 1
+    assert calls == [] and not (tmp_path / "dry").exists()
+    # an explicit ERROR_LOG_FILE always wins
+    monkeypatch.setenv("ERROR_LOG_FILE", str(tmp_path / "mine.log"))
+    assert tm.main(argv) == 1 and os.environ["ERROR_LOG_FILE"] == str(tmp_path / "mine.log")
+
+
+def test_model_allow_download_false_blocks_base_model_downloads(tmp_path, monkeypatch):
+    repo = _fake_hf_cache(tmp_path / "cache", with_shard=False)  # not fully cached
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+    monkeypatch.setenv("HUGGING_FACE_TOKEN", "hf_dummy")
+    for value in ("false", "0", "no", "off"):
+        monkeypatch.setenv("MODEL_ALLOW_DOWNLOAD", value)
+        assert not tm.downloads_allowed()
+        with pytest.raises(RuntimeError, match="MODEL_ALLOW_DOWNLOAD=false"):
+            tm.resolve_model_source(repo, str(tmp_path / "cache"))
+    for value in ("true", "1", ""):
+        monkeypatch.setenv("MODEL_ALLOW_DOWNLOAD", value)
+        assert tm.downloads_allowed()
+        assert tm.resolve_model_source(repo, str(tmp_path / "cache"))["local_files_only"] is False
+    # a cached base model never needs the network, whatever the policy
+    monkeypatch.setenv("MODEL_ALLOW_DOWNLOAD", "false")
+    cached = _fake_hf_cache(tmp_path / "cache2")
+    assert tm.resolve_model_source(cached, str(tmp_path / "cache2"))["local_files_only"] is True
+
+
+def test_export_backup_goes_next_to_the_output_file(db_session, tmp_path):
+    _add_row(db_session, "Kayıt yenileme ne zaman?", "Akademik takvimde ilan ediliyor.", "TR")
+    project, scratch = tmp_path / "project", tmp_path / "scratch"
+    out = scratch / "export.jsonl"
+    args = ["--output", str(out), "--base-path", str(project)]
+    assert d2t.main(args) == 0 and d2t.main(args) == 0  # the second run backs up the first file
+    assert [p.name for p in (scratch / "backups").iterdir()][0].startswith("export_backup_")
+    assert not (project / "data").exists()  # the project's data/ is never touched
+    # default output: backups stay in data/backups/
+    conv = d2t.DatabaseToTrainingConverter(base_path=str(project))
+    assert conv.backup_dir == project / "data" / "backups"
+
+
+def test_auth_failure_on_the_first_item_writes_no_files(db_session, tmp_path, monkeypatch, capsys):
+    import anthropic
+
+    _add_row(db_session, "Staj zorunlu mu?", "Evet, staj zorunludur.", "TR")
+    out = tmp_path / "aug" / "aug.jsonl"
+    aug, client, _ = _augmenter(tmp_path, [_api_error(anthropic.AuthenticationError, 401)])
+    aug.output_file, aug.checkpoint_file = out, out.parent / da.CHECKPOINT_NAME
+    with pytest.raises(da.AugmentationAbort):
+        aug.process_all_data()
+    assert not out.exists() and not aug.checkpoint_file.exists()
+
+    # CLI: one clear line, no traceback, the key is never printed
+    secret = "FAKE-anthropic-key-invalid-key-for-tests-0000"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
+    monkeypatch.setattr(da, "_load_env", lambda: None)
+
+    class RejectingClient:
+        def __init__(self, api_key=None, **kwargs):
+            self.messages = SimpleNamespace(create=self._create)
+
+        def _create(self, **kwargs):
+            raise _api_error(anthropic.AuthenticationError, 401)
+
+    monkeypatch.setattr(anthropic, "Anthropic", RejectingClient)
+    assert da.main(["--yes", "--max-items", "1", "--output", str(out)]) == 1
+    captured = capsys.readouterr()
+    text = captured.out + captured.err
+    assert "Authentication failed" in text and "nothing processed, no files written" in text
+    assert secret not in text and "Traceback" not in text
+    assert not out.exists()
+
+
+# --- shell wrappers -----------------------------------------------------------
+SCRIPTS = ROOT / "scripts"
+_SCRIPT_ENV_TO_CLEAR = ("MODEL_PATH", "ASSUME_YES", "BASE_MODEL_NAME", "MODEL_CACHE_DIR", "MODEL_ALLOW_DOWNLOAD",
+                        "HUGGING_FACE_TOKEN", "HF_TOKEN", "TRAINING_HISTORY_DIR")
+
+STUB_TRAIN = r"""
+import json, struct, sys
+from pathlib import Path
+argv = sys.argv[1:]
+(Path(__file__).resolve().parent.parent / "argv.json").write_text(json.dumps(argv))
+if "--dry-run" not in argv:
+    d = Path(argv[argv.index("--models-dir") + 1]) / "final-best-model-v1"
+    d.mkdir(parents=True)
+    (d / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "base_model_name_or_path": "x/y"}))
+    hdr = json.dumps({"w": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}).encode()
+    (d / "adapter_model.safetensors").write_bytes(struct.pack("<Q", len(hdr)) + hdr + b"\0\0\0\0")
+    print(f"FINAL_MODEL_DIR={d}")
+print("stub done")
+"""
+
+
+def _run_script(script, *args, root, cwd=None, **env):
+    full_env = dict(os.environ, CENGBOT_ROOT=str(root), CENGBOT_PYTHON=sys.executable, NO_COLOR="1")
+    for name in _SCRIPT_ENV_TO_CLEAR:
+        full_env.pop(name, None)
+    full_env.update({k: str(v) for k, v in env.items()})
+    return subprocess.run(["bash", str(script), *map(str, args)], cwd=str(cwd or root), env=full_env,
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+
+
+@pytest.fixture
+def wrapper_project(tmp_path):
+    root = tmp_path / "proj"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "train_model.py").write_text(STUB_TRAIN)
+    (root / "data").mkdir()
+    (root / "data" / "merged_qa_data.jsonl").write_text('{"q": 1}\n')
+    (root / "models").mkdir()
+    (root / "logs").mkdir()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "nvidia-smi").write_text("#!/bin/sh\necho 'Fake GPU, 24576, 0'\n")
+    (bindir / "nvidia-smi").chmod(0o755)
+    return root, f"{bindir}:{os.environ['PATH']}"
+
+
+def _cache_entry(cache: Path, repo: str):
+    snap = cache / ("models--" + repo.replace("/", "--")) / "snapshots" / "abc"
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text("{}")
+
+
+def test_train_wrapper_expands_tilde_in_model_cache_dir(wrapper_project, tmp_path):
+    root, _ = wrapper_project
+    home = tmp_path / "home"
+    _cache_entry(home / "hf", LLAMA)
+    proc = _run_script(SCRIPTS / "train_model.sh", "--dry-run", root=root, HOME=home, MODEL_CACHE_DIR="~/hf",
+                       BASE_MODEL_NAME=LLAMA)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "not cached" not in proc.stdout and "HUGGING_FACE_TOKEN is empty" not in proc.stdout
+    proc = _run_script(SCRIPTS / "train_model.sh", "--dry-run", root=root, HOME=home, MODEL_CACHE_DIR="~/elsewhere",
+                       BASE_MODEL_NAME=LLAMA)
+    assert f"is not cached in {home}/elsewhere" in proc.stdout  # expanded, not <root>/~/elsewhere
+    # --cache-dir (forwarded to train_model.py) is what the check uses
+    proc = _run_script(SCRIPTS / "train_model.sh", "--dry-run", "--cache-dir", home / "hf", root=root,
+                       MODEL_CACHE_DIR="~/elsewhere", HOME=home, BASE_MODEL_NAME=LLAMA)
+    assert "not cached" not in proc.stdout
+    assert json.loads((root / "argv.json").read_text())[-2:] == ["--cache-dir", str(home / "hf")]
+
+
+def test_train_wrapper_hint_honours_model_allow_download(wrapper_project):
+    root, _ = wrapper_project
+    proc = _run_script(SCRIPTS / "train_model.sh", "--dry-run", root=root, BASE_MODEL_NAME="org/uncached",
+                       MODEL_ALLOW_DOWNLOAD="false")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "MODEL_ALLOW_DOWNLOAD=false - training will fail" in proc.stdout
+    assert "downloads it once" not in proc.stdout
+
+
+def test_train_wrapper_writes_logs_models_and_checkpoints_where_told(wrapper_project, tmp_path):
+    root, path = wrapper_project
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    proc = _run_script(SCRIPTS / "train_model.sh", "--yes", "--models-dir", "models", "--checkpoint-dir", "ckpt",
+                       "--log-dir", "logs", "--max-steps", "3", root=root, cwd=scratch, PATH=path,
+                       BASE_MODEL_NAME="x/y", MODEL_CACHE_DIR=tmp_path / "nocache")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "satisfies the model contract" in proc.stdout
+    assert (scratch / "models" / "final-best-model-v1" / "adapter_config.json").exists()
+    assert list((scratch / "logs" / "training").glob("auto_training_*.log"))
+    assert not (root / "logs" / "training").exists() and list((root / "models").iterdir()) == []
+    argv = json.loads((root / "argv.json").read_text())
+    for flag, value in (("--models-dir", scratch / "models"), ("--checkpoint-dir", scratch / "ckpt"),
+                        ("--log-dir", scratch / "logs"), ("--max-steps", "3")):
+        assert argv[argv.index(flag) + 1] == str(value)  # caller-relative paths made absolute
+
+
+def test_view_training_history_reads_a_redirected_log_dir(tmp_path):
+    logs = tmp_path / "scratch-logs"
+    hist = logs / "training_history"
+    hist.mkdir(parents=True)
+    (hist / "v1.log").write_text("line 1\nline 2\n")
+    (hist / "v1_info.json").write_text(json.dumps({"version": "v1", "final_loss": 2.04396,
+                                                   "model_dir_name": "final-best-model-v1", "total_steps": 47}))
+    for args in (("--log-dir", logs, "list"), ("list", f"--log-dir={logs}"), ("--history-dir", hist, "list")):
+        proc = _run_script(SCRIPTS / "view_training_history.sh", *args, root=tmp_path)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "v1:" in proc.stdout and "Loss: 2.044 " in proc.stdout and "final-best-model-v1" in proc.stdout
+    proc = _run_script(SCRIPTS / "view_training_history.sh", "view", "v1", root=tmp_path, TRAINING_HISTORY_DIR=hist)
+    assert proc.returncode == 0 and "Total Steps: 47" in proc.stdout
+    proc = _run_script(SCRIPTS / "view_training_history.sh", "list", root=tmp_path)  # default: <root>/logs
+    assert proc.returncode != 0 and str(tmp_path / "logs" / "training_history") in proc.stderr
+
+
+def test_augment_wrapper_output_option_reaches_the_augmenter(db_session, tmp_path):
+    _add_row(db_session, "Staj zorunlu mu?", "Evet, staj zorunludur.", "TR")
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "src").symlink_to(ROOT / "src")  # the real augmenter + ORM on the test database
+    proc = _run_script(SCRIPTS / "augment_training_data.sh", "--dry-run", "--output", "out/aug.jsonl",
+                       root=root, cwd=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"output_file: {tmp_path / 'out' / 'aug.jsonl'}" in proc.stdout
+    assert "to_process: 1" in proc.stdout
+    assert not (tmp_path / "out").exists() and not (root / ".augmentation_lock").exists()

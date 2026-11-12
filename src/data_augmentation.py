@@ -741,6 +741,7 @@ Return as JSON array. Each variation should have 'question' and 'answer' fields.
                 output_data.extend(group_items)
                 processed.add(qa["id"])
                 done += 1
+                self.stats["processed_items"] = done
                 if variations:
                     self.stats["augmented_items"] += 1
                     print(f"✨ Generated {len(variations)} variations")
@@ -754,9 +755,11 @@ Return as JSON array. Each variation should have 'question' and 'answer' fields.
                     self.save_output(output_data)
                     print(f"💾 Auto-save: {len(output_data)} records saved to file")
         finally:
-            # Always persist progress (also on Ctrl+C / abort) so a resume never re-pays for done items.
-            self.save_checkpoint(processed, output_data)
-            self.save_output(output_data)
+            # Persist progress (also on Ctrl+C / abort) so a resume never re-pays for done items.
+            # Nothing done (e.g. invalid API key on the first item): leave the files untouched.
+            if done:
+                self.save_checkpoint(processed, output_data)
+                self.save_output(output_data)
 
         complete = all(qa["id"] in processed for qa in input_data)
         if complete and self.checkpoint_file.exists():
@@ -856,10 +859,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         augmenter.process_all_data(max_items=args.max_items, reset=args.reset)
     except KeyboardInterrupt:
-        print("\n⚠️  Interrupted by user - progress saved, run again to resume")
+        saved = "progress saved" if augmenter.stats.get("processed_items") else "nothing processed yet"
+        print(f"\n⚠️  Interrupted by user - {saved}, run again to resume")
         return 130
     except AugmentationAbort as e:
-        print(f"\n❌ Aborted: {e} (progress saved)")
+        saved = "progress saved" if augmenter.stats.get("processed_items") else "nothing processed, no files written"
+        print(f"\n❌ Aborted: {e} ({saved})")
         return 1
     except Exception as e:
         print(f"\n❌ ERROR: {type(e).__name__}: {e}")

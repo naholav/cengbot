@@ -46,6 +46,10 @@ Usage::
     python3 src/train_model.py --dry-run     # validate data + tokenization, no model
     python3 src/train_model.py               # full training run
     python3 src/train_model.py --base-model Qwen/Qwen2.5-7B --load-in-4bit --output-name qwen25-7b-v1
+    python3 src/train_model.py --resume-from-checkpoint latest   # continue an interrupted run
+    # smoke run, every output outside the project:
+    python3 src/train_model.py --dataset small.jsonl --max-steps 30 --grad-accum 1 \\
+        --models-dir /tmp/x/models --checkpoint-dir /tmp/x/ckpt --log-dir /tmp/x/logs --no-db-export
     python3 src/train_model.py --help
 
 Author: naholav
@@ -64,6 +68,7 @@ import re
 import shutil
 import sys
 import time
+import warnings
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -149,6 +154,7 @@ class Config:
 
     # Training (effective batch size = 4 * 16 = 64)
     num_epochs: int = 4
+    max_steps: int = -1  # > 0: stop after this many optimizer steps (overrides num_epochs)
     per_device_train_batch_size: int = 4
     per_device_eval_batch_size: int = 16
     gradient_accumulation_steps: int = 16
@@ -437,8 +443,8 @@ def semantic_deduplicate(
         try:
             encoder = SentenceTransformer(name, cache_folder=cache_dir, local_files_only=True)
         except Exception:
-            if _is_offline():
-                logger.warning("Semantic dedup model not cached and HF offline mode is on - skipping")
+            if not downloads_allowed():
+                logger.warning("Semantic dedup model not cached and downloads are disabled - skipping")
                 return records
             try:
                 encoder = SentenceTransformer(name, cache_folder=cache_dir)
@@ -966,6 +972,14 @@ def _is_offline() -> bool:
     return _truthy(os.getenv("HF_HUB_OFFLINE")) or _truthy(os.getenv("TRANSFORMERS_OFFLINE"))
 
 
+def downloads_allowed() -> bool:
+    """Same policy as inference (llama_model_handler.downloads_allowed): no downloads in
+    HF offline mode or with MODEL_ALLOW_DOWNLOAD=false."""
+    if _is_offline():
+        return False
+    return str(os.getenv("MODEL_ALLOW_DOWNLOAD", "")).strip().lower() not in ("0", "false", "no", "off", "disabled")
+
+
 def get_hf_token() -> Optional[str]:
     for var in ("HUGGING_FACE_TOKEN", "HF_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
         value = os.getenv(var, "").strip()
@@ -1013,10 +1027,11 @@ def resolve_model_source(model_name: str, cache_dir: Optional[str]) -> Dict[str,
         return {"local_files_only": True}
     if is_model_cached(model_name, cache_dir):
         return {"cache_dir": cache_dir, "local_files_only": True}
-    if _is_offline():
+    if not downloads_allowed():
         raise RuntimeError(
-            f"Base model '{model_name}' is not fully cached in '{cache_dir}' and Hugging Face "
-            "offline mode is enabled (HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE). Download it first."
+            f"Base model '{model_name}' is not fully cached in '{cache_dir}' and downloads are disabled "
+            "(HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE or MODEL_ALLOW_DOWNLOAD=false). Download it first "
+            "(or allow the download once) - see docs/MODEL_SWAP.md."
         )
     token = get_hf_token()
     if token is None:
@@ -1251,18 +1266,42 @@ def setup_model_and_tokenizer(cfg: Optional[Config] = None):
 # ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
+def plan_training_steps(cfg: Config, n_train: int) -> Dict[str, Any]:
+    """Optimizer steps per epoch / in total and the eval (= checkpoint) interval.
+
+    Same arithmetic as the HF Trainer. ``eval_steps`` spreads ``evals_per_epoch``
+    evaluations over one epoch, or over the whole run when it is shorter
+    (``--max-steps`` / fractional ``--epochs``), so short runs still evaluate and
+    write checkpoints.
+    """
+    world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+    effective_batch = cfg.per_device_train_batch_size * cfg.gradient_accumulation_steps * world_size
+    steps_per_epoch = max(1, math.ceil(n_train / effective_batch))
+    if cfg.max_steps and cfg.max_steps > 0:
+        total_steps = int(cfg.max_steps)
+    else:
+        total_steps = max(1, math.ceil(cfg.num_epochs * steps_per_epoch))
+    eval_steps = max(1, min(steps_per_epoch, total_steps) // max(1, cfg.evals_per_epoch))
+    return {
+        "train_examples": n_train,
+        "effective_batch_size": effective_batch,
+        "steps_per_epoch": steps_per_epoch,
+        "total_steps": total_steps,
+        "epochs": round(total_steps / steps_per_epoch, 3),
+        "eval_and_save_every_steps": eval_steps,
+    }
+
+
 def build_training_arguments(cfg: Config, run_dir: str, n_train: int, has_eval: bool, precision: Dict[str, Any]):
     from transformers import TrainingArguments
 
     world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
-    steps_per_epoch = max(
-        1, math.ceil(n_train / (cfg.per_device_train_batch_size * cfg.gradient_accumulation_steps * world_size))
-    )
-    eval_steps = max(1, steps_per_epoch // max(1, cfg.evals_per_epoch))
+    eval_steps = plan_training_steps(cfg, n_train)["eval_and_save_every_steps"]
     workers = cfg.dataloader_num_workers if precision["cuda"] else 0
     kwargs: Dict[str, Any] = dict(
         output_dir=run_dir,
         num_train_epochs=cfg.num_epochs,
+        max_steps=cfg.max_steps if cfg.max_steps and cfg.max_steps > 0 else -1,
         per_device_train_batch_size=cfg.per_device_train_batch_size,
         per_device_eval_batch_size=cfg.per_device_eval_batch_size,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
@@ -1404,6 +1443,101 @@ def resolve_final_model_dir(models_dir: str, name: str, overwrite: bool = False)
         if final_dir.is_symlink() or (active.exists() and final_dir.resolve() == active.resolve()):
             raise ValueError(f"Refusing to overwrite the active model or a symlink: {final_dir}")
     return final_dir
+
+
+_CHECKPOINT_RE = re.compile(r"checkpoint-(\d+)")
+_CHECKPOINT_WEIGHTS = ("adapter_model.safetensors", "adapter_model.bin", "model.safetensors", "pytorch_model.bin")
+
+
+def checkpoint_problem(path: Path) -> Optional[str]:
+    """None if ``path`` is a complete Trainer checkpoint, else what is missing.
+
+    The Trainer writes a checkpoint in place and ``trainer_state.json`` last, so a
+    run killed while saving leaves a directory that cannot be resumed from.
+    """
+    path = Path(path)
+    if not path.is_dir():
+        return "not a directory"
+    if not any((path / name).is_file() for name in _CHECKPOINT_WEIGHTS):
+        return "no adapter/model weights"
+    if not (path / "optimizer.pt").is_file():
+        return "no optimizer.pt"
+    try:
+        with open(path / "trainer_state.json", "r", encoding="utf-8") as f:
+            json.load(f)
+    except (OSError, ValueError):
+        return "no readable trainer_state.json"
+    return None
+
+
+def find_resumable_checkpoint(run_dir: str) -> Optional[str]:
+    """Newest complete ``checkpoint-<step>`` in ``run_dir`` (incomplete ones are skipped)."""
+    run = Path(run_dir)
+    if not run.is_dir():
+        return None
+    candidates = [p for p in run.iterdir() if p.is_dir() and _CHECKPOINT_RE.fullmatch(p.name)]
+    for path in sorted(candidates, key=lambda p: int(_CHECKPOINT_RE.fullmatch(p.name).group(1)), reverse=True):
+        problem = checkpoint_problem(path)
+        if problem is None:
+            return str(path)
+        logger.warning("Skipping incomplete checkpoint %s (%s - the run was probably stopped while saving it)",
+                       path, problem)
+    return None
+
+
+def checkpoint_global_step(path: str) -> int:
+    """``global_step`` recorded in a checkpoint's trainer_state.json (0 if unknown)."""
+    try:
+        with open(Path(path) / "trainer_state.json", "r", encoding="utf-8") as f:
+            return int(json.load(f).get("global_step") or 0)
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
+def whole_run_train_loss(train_loss: Optional[float], global_step: int, resumed_at_step: int,
+                         log_history: Sequence[Dict[str, Any]]) -> Optional[float]:
+    """Mean train loss of the whole run, also after ``--resume-from-checkpoint``.
+
+    After a resume the Trainer divides the loss summed over the resumed steps only
+    by *all* steps, so its ``train_loss`` is too low by ``resumed_at_step/global_step``.
+    The steps before the resume are taken from the logged loss windows the
+    checkpoint carried over (``log_history``).
+    """
+    if train_loss is None or not resumed_at_step or global_step <= resumed_at_step:
+        return train_loss
+    session_sum = float(train_loss) * global_step
+    windows, last = [], 0
+    logged = [e for e in log_history if "loss" in e and isinstance(e.get("step"), int) and e["step"] <= resumed_at_step]
+    for entry in sorted(logged, key=lambda e: e["step"]):
+        if entry["step"] > last:
+            windows.append((float(entry["loss"]), entry["step"] - last))
+            last = entry["step"]
+    weight = sum(w for _, w in windows)
+    if not weight:  # nothing logged before the resume: mean over the resumed steps
+        return session_sum / (global_step - resumed_at_step)
+    before_mean = sum(loss * w for loss, w in windows) / weight
+    return (before_mean * resumed_at_step + session_sum) / global_step
+
+
+def resolve_resume_checkpoint(value: Optional[str], run_dir: str) -> Optional[str]:
+    """``--resume-from-checkpoint`` -> checkpoint directory (``latest``: newest complete
+    one in ``run_dir``). Raises before the model is loaded if there is nothing to resume."""
+    if not value:
+        return None
+    if value == "latest":
+        found = find_resumable_checkpoint(run_dir)
+        if found is None:
+            raise FileNotFoundError(
+                f"--resume-from-checkpoint latest: no complete checkpoint in {run_dir}. Pass the same "
+                "--output-name/--checkpoint-dir as the interrupted run (its checkpoints live in "
+                "<checkpoint-dir>/<output-name>/checkpoint-<step>) or a checkpoint directory."
+            )
+        return found
+    path = Path(value).expanduser()
+    problem = checkpoint_problem(path)
+    if problem is not None:
+        raise FileNotFoundError(f"--resume-from-checkpoint {value}: not a usable checkpoint ({problem})")
+    return str(path)
 
 
 def _write_json_atomic(path: Path, data: Any) -> None:
@@ -1570,6 +1704,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--checkpoint-dir", default=d.checkpoint_root, help="Root for Trainer checkpoints (default: checkpoints/)")
     p.add_argument("--log-dir", default=d.log_dir, help="Log directory (default: logs/)")
     p.add_argument("--epochs", type=float, default=d.num_epochs)
+    p.add_argument("--max-steps", type=int, default=d.max_steps,
+                   help="Stop after N optimizer steps (overrides --epochs; for smoke tests). Default: off")
+    p.add_argument("--logging-steps", type=int, default=d.logging_steps, help="Log the train loss every N steps")
     p.add_argument("--batch-size", type=int, default=d.per_device_train_batch_size)
     p.add_argument("--eval-batch-size", type=int, default=d.per_device_eval_batch_size)
     p.add_argument("--grad-accum", type=int, default=d.gradient_accumulation_steps)
@@ -1638,6 +1775,8 @@ def build_config(args: argparse.Namespace) -> Config:
         output_name=args.output_name,
         model_name=args.base_model or os.getenv("BASE_MODEL_NAME", "").strip() or DEFAULT_BASE_MODEL,
         num_epochs=args.epochs,
+        max_steps=args.max_steps if args.max_steps and args.max_steps > 0 else -1,
+        logging_steps=max(1, args.logging_steps),
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=args.grad_accum,
@@ -1734,8 +1873,12 @@ def _run(cfg: Config, dry_run: bool, history_version: Optional[int], log_files: 
     tokenizer = load_tokenizer(cfg)
     data = prepare_data(cfg, tokenizer)
     summary = data["summary"]
+    plan = plan_training_steps(cfg, summary["train_examples"])
+    logger.info("Plan: %d optimizer steps (%d per epoch, effective batch %d), eval + checkpoint every %d steps",
+                plan["total_steps"], plan["steps_per_epoch"], plan["effective_batch_size"],
+                plan["eval_and_save_every_steps"])
     if dry_run:
-        print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+        print(json.dumps({**summary, "plan": plan}, ensure_ascii=False, indent=2, default=str))
         logger.info("Dry run finished - no model loaded, nothing written")
         return 0
 
@@ -1743,7 +1886,10 @@ def _run(cfg: Config, dry_run: bool, history_version: Optional[int], log_files: 
     name = cfg.output_name or f"{MODEL_DIR_PREFIX}{model_version}"
     final_dir = resolve_final_model_dir(cfg.output_dir, name, cfg.overwrite_output)  # fail before hours of training
     run_dir = str(Path(cfg.checkpoint_root) / name)
-    if not cfg.resume_from_checkpoint and Path(run_dir).is_dir() and any(Path(run_dir).glob("checkpoint-*")):
+    resume = resolve_resume_checkpoint(cfg.resume_from_checkpoint, run_dir)  # fail before loading the model
+    if resume:
+        logger.info("Resuming from checkpoint %s", resume)
+    elif Path(run_dir).is_dir() and any(Path(run_dir).glob("checkpoint-*")):
         # Leftovers of an earlier (failed) run would confuse checkpoint rotation.
         stale = f"{run_dir}.old-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         logger.warning("Moving checkpoints of a previous run aside: %s -> %s (use --resume-from-checkpoint latest to continue it)", run_dir, stale)
@@ -1770,19 +1916,33 @@ def _run(cfg: Config, dry_run: bool, history_version: Optional[int], log_files: 
     eval_ds = to_hf_dataset(val_all) if val_all else None
     eval_tr = to_hf_dataset(data["val_tr"]) if data["val_tr"] else None
     eval_en = to_hf_dataset(data["val_en"]) if data["val_en"] else None
+    # The fast tokenizer has used its thread pool already; DataLoader workers are
+    # forked afterwards and do not tokenize (silences one warning per worker).
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    # Offline, PEFT cannot fetch the base config on every checkpoint save and
+    # warns; the vocabulary is never resized here (pad = EOS), so that is fine.
+    warnings.filterwarnings("ignore", message=r"Could not find a config file in .*vocabulary was not modified")
     trainer = create_trainer(model, tokenizer, train_ds, eval_ds, eval_tr, eval_en, cfg=cfg, run_dir=run_dir, precision=precision)
 
-    resume = cfg.resume_from_checkpoint
-    if resume == "latest":
-        resume = True
     logger.info("Starting training...")
     train_result = trainer.train(resume_from_checkpoint=resume)
+    peak_gpu_memory_gb = None
+    if precision["cuda"]:
+        try:
+            peak_gpu_memory_gb = round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
+            logger.info("Peak GPU memory allocated by training: %.2f GiB", peak_gpu_memory_gb)
+        except Exception:  # pragma: no cover - driver issues
+            pass
+
+    resumed_at_step = checkpoint_global_step(resume) if resume else 0
+    train_loss = whole_run_train_loss(train_result.metrics.get("train_loss"), train_result.global_step,
+                                      resumed_at_step, trainer.state.log_history)
 
     final_metrics: Dict[str, Any] = {}
     if eval_ds is not None:
         final_metrics = trainer.evaluate()
     metrics = {
-        "train_loss": train_result.metrics.get("train_loss"),
+        "train_loss": train_loss,
         "best_eval_loss": trainer.state.best_metric,
         "final_eval_loss": final_metrics.get("eval_loss"),
         "final_eval_loss_turkish": final_metrics.get("eval_loss_turkish"),
@@ -1829,6 +1989,11 @@ def _run(cfg: Config, dry_run: bool, history_version: Optional[int], log_files: 
         "seed": cfg.seed,
         "timestamp": datetime.now().isoformat(),
         "training_duration_seconds": round(duration, 1),
+        "train_runtime_seconds": train_result.metrics.get("train_runtime"),
+        "max_steps": cfg.max_steps if cfg.max_steps and cfg.max_steps > 0 else None,
+        "resumed_from_checkpoint": resume,
+        "resumed_at_step": resumed_at_step or None,
+        "peak_gpu_memory_gb": peak_gpu_memory_gb,
         "log_file": Path(log_files["versioned"]).name if log_files.get("versioned") else None,
         "checkpoint_dir": run_dir,
         "model_save_path": str(final_dir),
@@ -1860,6 +2025,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     cfg = build_config(args)
     config = cfg
+    # A redirected --log-dir also gets the error_handler log (default logs/error.log),
+    # so experiments and smoke runs never write into the production logs.
+    if Path(cfg.log_dir).resolve() != (PROJECT_ROOT / "logs").resolve() and not os.getenv("ERROR_LOG_FILE", "").strip():
+        os.environ["ERROR_LOG_FILE"] = str(Path(cfg.log_dir) / "error.log")
     history_version = None if args.dry_run else _resolve_history_version(cfg)
     _, log_files = setup_logging(cfg, history_version, to_files=not args.dry_run)
     logger.info("Configuration: %s", {k: v for k, v in asdict(cfg).items()})
@@ -1868,7 +2037,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     set_seed(cfg.seed)
     try:
-        if torch.cuda.is_available() and not cfg.force_cpu:
+        # A dry run never touches the GPU (get_device_name would create a CUDA context
+        # next to a running worker).
+        if args.dry_run:
+            pass
+        elif torch.cuda.is_available() and not cfg.force_cpu:
             logger.info("GPU: %s (count: %d)", torch.cuda.get_device_name(0), torch.cuda.device_count())
         else:
             logger.warning("No GPU in use - training will run on CPU (very slow)")
@@ -1884,12 +2057,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "native in transformers (e.g. the '-hf' variant), or re-run with --trust-remote-code "
                          "(SECURITY: executes that code; inference then needs MODEL_TRUST_REMOTE_CODE=true)",
                          cfg.model_name)
-        try:
-            from error_handler import handle_training_error
+        if not args.dry_run:  # a dry run writes nothing, not even the error log
+            try:
+                from error_handler import handle_training_error
 
-            handle_training_error(exc, "main_training")
-        except Exception:  # pragma: no cover
-            pass
+                handle_training_error(exc, "main_training")
+            except Exception:  # pragma: no cover
+                pass
         return 1
 
 

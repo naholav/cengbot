@@ -9,6 +9,7 @@ set -e
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
 BASE_DIR="$PROJECT_ROOT"
+OUTPUT_FILE="$BASE_DIR/data/cengbot_qa_augmented.jsonl"   # --output FILE
 LOCK_FILE="${BASE_DIR}/.augmentation_lock"
 OWN_LOCK=0
 
@@ -125,7 +126,7 @@ show_cost_warning() {
     echo -e "${YELLOW}PROCESS:${NC}"
     echo "• Loads approved training data from database"
     echo "• Generates variations using Claude API"
-    echo "• Saves to data/cengbot_qa_augmented.jsonl"
+    echo "• Saves to $OUTPUT_FILE"
     echo "• Runs database export script afterward"
     echo
 }
@@ -165,7 +166,7 @@ export_training_data() {
     # Run export script
     print_status "Running database export script..."
     
-    if "$BASE_DIR/scripts/export_training_data.sh"; then
+    if "$BASE_DIR/scripts/export_training_data.sh" --output "$OUTPUT_FILE"; then
         print_success "Training data export completed"
     else
         print_error "Training data export failed"
@@ -178,15 +179,15 @@ show_summary() {
     print_header "Augmentation Process Summary"
     
     # Check output file
-    if [ -f "$BASE_DIR/data/cengbot_qa_augmented.jsonl" ]; then
-        TOTAL_RECORDS=$(wc -l < "$BASE_DIR/data/cengbot_qa_augmented.jsonl")
-        FILE_SIZE=$(du -h "$BASE_DIR/data/cengbot_qa_augmented.jsonl" | cut -f1)
+    if [ -f "$OUTPUT_FILE" ]; then
+        TOTAL_RECORDS=$(wc -l < "$OUTPUT_FILE")
+        FILE_SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
         
         print_success "Augmentation completed successfully!"
         echo "📊 Results:"
         echo "   • Total records: $TOTAL_RECORDS"
         echo "   • File size: $FILE_SIZE"
-        echo "   • Output file: data/cengbot_qa_augmented.jsonl"
+        echo "   • Output file: $OUTPUT_FILE"
         echo
         echo "🔄 Next steps:"
         echo "   • Review the augmented data quality"
@@ -212,6 +213,8 @@ show_help() {
     echo "  --max-items N      Process at most N database rows (cost cap)"
     echo "  --model ID         Claude model id (default: env CLAUDE_MODEL or the built-in default)"
     echo "  --reset            Ignore checkpoint/existing output and re-augment everything"
+    echo "  --output FILE      Output JSONL (default: data/cengbot_qa_augmented.jsonl); the"
+    echo "                     database export afterwards merges into the same file"
     echo "  -y, --yes          Do not ask for confirmation (spends API credits!)"
     echo "  -h, --help         Show this help message"
     echo
@@ -270,6 +273,11 @@ while [[ $# -gt 0 ]]; do
             AUG_ARGS+=("$1" "$2"); shift 2 ;;
         --max-items=*|--model=*)
             AUG_ARGS+=("$1"); shift ;;
+        --output)
+            [[ $# -ge 2 && -n "$2" ]] || { print_error "$1 needs a file"; exit 1; }
+            OUTPUT_FILE="$2"; shift 2 ;;
+        --output=*)
+            OUTPUT_FILE="${1#--output=}"; shift ;;
         *)
             print_error "Unknown option: $1"
             show_help
@@ -277,6 +285,10 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Relative --output paths are relative to the caller's directory (the steps below run in the project root)
+[[ "$OUTPUT_FILE" == /* ]] || OUTPUT_FILE="$PWD/$OUTPUT_FILE"
+AUG_ARGS+=(--output "$OUTPUT_FILE")
 
 # Main execution
 main() {

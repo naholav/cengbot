@@ -330,9 +330,16 @@ def load_reference_questions(training_file: Optional[Path], db_path: Optional[Pa
                 questions.append(row["question"])
     if db_path and Path(db_path).exists():
         import sqlite3
+        from urllib.parse import quote
 
-        uri = f"file:{Path(db_path).resolve()}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
+        path = Path(db_path).resolve()
+        if os.access(path, os.W_OK) and os.access(path.parent, os.W_OK):
+            # Read-write but query-only: a mode=ro connection to a WAL database that no
+            # other process has open would leave -wal/-shm files behind.
+            conn = sqlite3.connect(str(path))
+            conn.execute("PRAGMA query_only = ON")
+        else:
+            conn = sqlite3.connect(f"file:{quote(str(path))}?mode=ro&immutable=1", uri=True)
         try:
             questions.extend(q for (q,) in conn.execute("SELECT question FROM raw_data") if isinstance(q, str))
         finally:

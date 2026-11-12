@@ -1,6 +1,6 @@
-# 📖 CengBot Admin API
+# CengBot Admin API
 
-## 🌐 Overview
+## Overview
 
 The admin API (`src/admin_rest_api.py`, FastAPI) serves the React admin panel:
 it lists and edits the collected questions, manages the training data, reports
@@ -14,7 +14,7 @@ statistics and duplicates, and shows the project's documentation and logs.
   `scripts/start_system.sh` and the `cengbot-admin` systemd unit). With
   `API_RELOAD=true` it runs with auto-reload (development only).
 
-## 🔐 Authentication
+## Authentication
 
 Every endpoint that reads or modifies data requires **HTTP Basic
 authentication**. Only these endpoints are public:
@@ -33,7 +33,7 @@ ADMIN_PASSWORD_HASH=<sha256 hex digest>
 ADMIN_PASSWORD=
 ```
 
-> ⚠️ **There is no default password.** Until `ADMIN_PASSWORD_HASH` or
+> **There is no default password.** Until `ADMIN_PASSWORD_HASH` or
 > `ADMIN_PASSWORD` is set, every request with credentials is rejected with
 > `401` and the API logs an ERROR at startup, so nobody can log into the panel.
 > An empty or malformed hash, the hash of the empty password and placeholder
@@ -46,6 +46,15 @@ is loaded only when the API starts, so **restart the API after editing `.env`**.
 Username and password are compared in constant time. Wrong or missing
 credentials return `401` with `WWW-Authenticate: Basic`.
 
+**Failed logins are rate limited per client IP** (in memory, per API process):
+after `ADMIN_LOGIN_MAX_FAILURES` (default 10) wrong passwords within
+`ADMIN_LOGIN_WINDOW_SECONDS` (900) the address gets `429 Too Many Requests` with
+a `Retry-After` header for `ADMIN_LOGIN_LOCKOUT_SECONDS` (900), even with the
+right password; `ADMIN_LOGIN_MAX_FAILURES=0` disables it. Credentials sent to
+`/health` count too. Behind nginx the client IP comes from `X-Forwarded-For`,
+which uvicorn trusts only from `FORWARDED_ALLOW_IPS` (default `127.0.0.1`: set it
+to the proxy's address if nginx runs on another host).
+
 Generate the hash (the password is read without echo):
 
 ```bash
@@ -56,7 +65,7 @@ There is no session or token: the client sends the `Authorization` header with
 every request. The admin panel keeps it in memory and in `sessionStorage`
 (cleared when the browser tab closes), never in `localStorage`.
 
-## 📊 Data Models
+## Data Models
 
 ### RawData
 ```typescript
@@ -126,7 +135,7 @@ interface Statistics {
 }
 ```
 
-## 🔌 Endpoints
+## Endpoints
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
@@ -140,7 +149,7 @@ interface Statistics {
 | GET | `/training-data` | required | Training data, paginated |
 | DELETE | `/training-data/{item_id}` | required | Remove from the training data |
 | GET | `/stats` | required | Statistics |
-| GET | `/duplicates` | required | Duplicate question groups |
+| GET | `/duplicates` | required | Duplicate question groups (paged: `limit`, `offset`) |
 | POST | `/detect-duplicates` | required | Recompute all duplicate markings |
 | GET | `/docs/list` | required | Viewable documentation, log and script files |
 | GET | `/docs/read?path=...` | required | Read one of those files |
@@ -153,7 +162,8 @@ interface Statistics {
 Returns `{"message": "University Bot Admin API"}`.
 
 #### `GET /health`
-Without credentials (or with wrong ones) only the minimal status is returned:
+Without credentials (or with wrong ones, which count as failed logins) only the
+minimal status is returned:
 
 ```json
 {
@@ -230,8 +240,8 @@ blank and may be at most 20,000 characters (`422` otherwise).
 - If the row was already approved, its training copy gets the new answer too,
   and the training copy's duplicate-answer markings are recomputed.
 - Rows that the worker answered automatically (an apology after repeated
-  failures, or a prompt-guard refusal) carry an `[auto]` note and cannot be
-  approved; editing the answer turns the note into `[auto-edited]`, after which
+  failures, a prompt-guard refusal, or an answer the output guard replaced
+  with the safe fallback) carry an `[auto]` note and cannot be approved; editing the answer turns the note into `[auto-edited]`, after which
   the row can be approved.
 
 ```json
@@ -294,7 +304,9 @@ Response: `Statistics`.
 
 #### `GET /duplicates`
 One entry per original question; both `original` and `duplicates` are `RawData`
-objects (with vote statistics).
+objects (with vote statistics). Groups are ordered by the original's id and
+paged with `limit` (1 to 1000, default 500) and `offset` (default 0); the
+`X-Total-Count` response header holds the total number of groups.
 ```json
 [
   {
@@ -307,12 +319,12 @@ objects (with vote statistics).
 ```
 
 #### `POST /detect-duplicates`
-Recomputes every duplicate marking with the same rules the bot uses for new
-questions: a question is a duplicate when its TF-IDF cosine similarity to one of
-the 100 questions before it is at least 0.45 (it then points to the oldest
-original); a training answer is a duplicate when its similarity to an older
-training answer is at least 0.85. Only texts longer than 10 characters are
-checked. Everything is computed first and written in one transaction, so a
+Recomputes every duplicate marking with the same similarity, thresholds and
+window the bot uses for new questions: a question is a duplicate when its
+TF-IDF cosine similarity to one of the 100 questions before it is at least 0.45
+(it then points to the oldest original); a training answer is a duplicate when
+its similarity to an older training answer is at least 0.85. Unlike the bot,
+the recheck only considers texts longer than 10 characters. Everything is computed first and written in one transaction, so a
 failure leaves the previous markings untouched.
 
 ```json
@@ -357,7 +369,7 @@ content: the **last** 1 MiB of a log (starting at a line boundary), the
 Errors: `400` invalid path or not a file, `403` file type not viewable,
 `404` not found, `500` read error.
 
-## 🚨 Errors
+## Errors
 
 Errors use FastAPI's format:
 
@@ -376,10 +388,11 @@ log and `logs/error.log`, not to the client.
 | `403` | File type not viewable (`/docs/read`) |
 | `404` | Resource not found |
 | `422` | Validation error (query, path or body) |
+| `429` | Too many failed logins from this client IP (`Retry-After` header) |
 | `500` | Server or database error |
 | `503` | `/health` when the database is unreachable |
 
-## 📝 Examples
+## Examples
 
 ### Python
 ```python
@@ -424,21 +437,22 @@ await fetch(`${BASE_URL}/raw-data/123`, {
 });
 ```
 
-## 🔄 Pagination
+## Pagination
 
 `/raw-data` and `/training-data` take `page` (1 to 1,000,000) and `page_size`
 (1 to 100, default 20) and return the `PaginatedResponse` envelope.
 `total_pages` is 0 when there are no rows; a page past the end returns an empty
 `data` list.
 
-## 📊 Rate Limiting
+## Rate Limiting
 
-The API has **no rate limiting and no brute-force throttling** on failed
-logins yet. HTTP Basic sends the password with every request, so keep the API
-on `127.0.0.1` and publish it only through an HTTPS reverse proxy (see
-[DEPLOYMENT.md](DEPLOYMENT.md)); limit requests there if needed.
+Only failed logins are limited (see [Authentication](#authentication): `429`
+with `Retry-After` per client IP, `ADMIN_LOGIN_*`); other requests are not.
+HTTP Basic sends the password with every request, so keep the API on
+`127.0.0.1` and publish it only through an HTTPS reverse proxy (see
+[DEPLOYMENT.md](DEPLOYMENT.md)); add general request limits there if needed.
 
-## 🔗 CORS
+## CORS
 
 Allowed origins come from `CORS_ORIGINS` (comma separated; default
 `http://localhost:3000`). Trailing slashes are removed. It must contain the

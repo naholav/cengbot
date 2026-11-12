@@ -1,6 +1,6 @@
-# 🏗️ CengBot System Architecture
+# CengBot System Architecture
 
-## 📋 Overview
+## Overview
 
 CengBot consists of a few independent processes that share a RabbitMQ broker
 and one SQLite database. The Telegram bot never touches the GPU; only the AI
@@ -80,7 +80,7 @@ flowchart TB
     model -.->|"score each new model"| bench
 ```
 
-## 🔄 Data Flow
+## Data Flow
 
 ```
 ┌──────────────┐  1 question   ┌──────────────────────────┐  3 publish   ┌──────────────────────────┐
@@ -117,13 +117,15 @@ flowchart TB
 4. **Publish.** A waiter is registered in the `AnswerRouter` for the row id,
    then the question is published (persistent message, publisher confirms) with
    `raw_data_id`, `telegram_id`, `username`, `question`, `message_thread_id`,
-   `update_message_id` and `chat_id`. Duplicate marking runs in the background
+   `update_message_id`, `chat_id`, `asked_at` and `deliver_until`. Duplicate marking runs in the background
    and does not delay the answer.
-5. **Worker.** The worker skips rows that no longer exist or are already
-   answered, runs the prompt guard, generates the answer, stores it in
-   `raw_data` (answer, `answered_at`, `processing_time`, `model_version`, token
-   counts) and publishes it to `answers` with every field of the question plus
-   `answer` and `status` (`ok`, `blocked` or `error`).
+5. **Worker.** The worker skips rows that no longer exist; for a row that is
+   already answered it publishes the stored answer again (status `resent`)
+   instead of generating a new one. Otherwise it runs the prompt guard,
+   generates the answer, stores it in `raw_data` (answer, `answered_at`,
+   `processing_time`, `model_version`, token counts) and publishes it to
+   `answers` with every field of the question plus `answer` and `status`
+   (`ok`, `blocked`, `error` or `resent`).
 6. **Routing.** A consumer thread in the bot reads `answers` and hands each
    message to the coroutine waiting for that `raw_data_id`. The bot handles
    updates concurrently, so one slow answer never blocks other users.
@@ -132,8 +134,13 @@ flowchart TB
    messages within Telegram's length limit. The id of the reply message is stored
    in `raw_data.telegram_message_id`.
 8. **Timeout.** If no answer arrives within `BOT_ANSWER_TIMEOUT` seconds
-   (default 30), the user gets a fallback reply without vote buttons. The worker
-   still answers and stores the question later; the bot drops the late answer.
+   (default 30), the bot says the answer is on its way and posts it as a reply
+   to the question when it arrives within `BOT_LATE_ANSWER_WINDOW` (10 min;
+   0 turns late replies off and sends the old fallback reply). The question
+   payload carries `asked_at` and `deliver_until`; the worker does not generate
+   answers that could no longer reach the asker in time (`deliver_until` minus
+   about 4 s; `WORKER_SKIP_EXPIRED`) and notes such rows
+   with `[auto]` (admins can still answer them).
 9. **Votes.** A button press is accepted only from the allowed chat, only with
    well-formed callback data, and only on the message whose id is stored for that
    question. Each user has one vote per answer and can change it at most twice.
@@ -148,9 +155,15 @@ flowchart TB
   RabbitMQ, with exponential backoff (`WORKER_BACKOFF_INITIAL` 5 s up to
   `WORKER_BACKOFF_MAX` 300 s) and one concise log line per attempt. A model
   that cannot be loaded never causes a busy loop.
-- **Reconnects.** Lost RabbitMQ connections are retried with the same backoff;
-  a connection that stayed up for `WORKER_HEALTHY_AFTER` seconds (60) resets it.
-  The bot's answer consumer reconnects with its own backoff (1 s up to 60 s).
+- **Reconnects.** Lost RabbitMQ connections are retried with the same backoff,
+  but capped at `WORKER_RECONNECT_MAX` (default 15 s; keep it below
+  `BOT_ANSWER_TIMEOUT`), so answers resume within the bot's timeout after an
+  outage; model-load and unexpected errors keep the 5 s to 300 s backoff. The
+  first failure is logged at once, the same error at most every 5 minutes after
+  that. A connection that stayed up for `WORKER_HEALTHY_AFTER` seconds (60)
+  resets the backoff.
+  The bot's answer consumer reconnects with its own backoff (1 s up to 15 s,
+  reset after a connection that stayed up 30 s).
 - **Heartbeats.** Generation runs in a helper thread while the consumer thread
   keeps servicing the AMQP connection, so a long generation does not miss heartbeats.
 - **Poison messages.** A question that fails is republished with an
@@ -160,7 +173,7 @@ flowchart TB
   user is notified and the message is acknowledged. The worker never uses
   `basic_nack(requeue=True)`. Malformed messages are dropped with a log line.
 
-## 🧠 Model Layer
+## Model Layer
 
 `src/llama_model_handler.py` is used by the worker (and by the standalone dev bot).
 
@@ -201,11 +214,13 @@ flowchart TB
   `MODEL_REPETITION_PENALTY`. Generation stops at every end-of-turn token the
   tokenizer and model know (EOS, `generation_config.eos_token_id` and the
   family tokens such as `<|eot_id|>`, `<|im_end|>`, `<end_of_turn>`), at a new
-  dialogue turn marker, or after `MODEL_MAX_SENTENCES` (4) sentences; the
-  answer keeps at most one question sentence. `<think>` blocks of reasoning
+  dialogue turn marker, or as soon as the post-processed answer can no longer
+  change (`MODEL_MAX_SENTENCES`, 4, kept sentences complete and a link kept or
+  rescued; otherwise up to 4 more sentences, waiting for a link); the answer
+  keeps at most one question sentence. `<think>` blocks of reasoning
   models are removed.
 
-## 🛡️ Prompt Guard
+## Prompt Guard
 
 `src/prompt_guard.py` is a rule-based, offline filter for Turkish and English,
 applied once in the worker before generation (`PROMPT_GUARD_ENABLED`, default on).
@@ -223,16 +238,23 @@ applied once in the worker before generation (`PROMPT_GUARD_ENABLED`, default on
   special tokens are removed, and an answer that repeats a substantial part of
   the system prompt is replaced with a safe fallback.
 
-Rows answered automatically (refusals, apologies after repeated failures) carry
-an `[auto]` note in `admin_notes`. The Admin API refuses to approve them for
+Rows answered automatically (refusals, apologies after repeated failures,
+answers the output guard replaced with the safe fallback) carry an `[auto]`
+note in `admin_notes`. The Admin API refuses to approve them for
 training until an admin has edited the answer.
 
-## 💾 Data Layer
+## Data Layer
 
 SQLite (`DATABASE_URL`, default `university_bot.db` in the project root; a
 relative path is resolved against the project root, so every process uses the
 same file). Models are in `src/database_models.py`; `init_db()` creates missing
-tables and indexes and never drops data.
+tables and indexes (taken from the model metadata) and never drops data;
+`src/db_migrations.py` (`--dry-run` first) drops redundant indexes of older
+databases and adds missing ones. Every connection uses WAL mode
+(`SQLITE_JOURNAL_MODE`, default `wal`), `synchronous=NORMAL` and a 5 s busy
+timeout (`SQLITE_SYNCHRONOUS`, `SQLITE_BUSY_TIMEOUT_MS`), so readers never block
+the bot's writes. Recent commits live in `university_bot.db-wal`: backups take
+an online snapshot (`scripts/backup_data.sh`).
 
 | Table | Content |
 |---|---|
@@ -245,9 +267,10 @@ tables and indexes and never drops data.
 character folding. A new question is compared with the 100 questions before it
 (threshold 0.45) and points to the oldest original; an approved answer is
 compared with older training answers (threshold 0.85). The admin API's
-`POST /detect-duplicates` recomputes all markings with the same rules.
+`POST /detect-duplicates` recomputes all markings with the same similarity,
+thresholds and window; unlike the bot, it ignores texts of 10 characters or fewer.
 
-## 🎓 Training Pipeline
+## Training Pipeline
 
 ```
 university_bot.db --(database_to_training.py)--> data/cengbot_qa_augmented.jsonl --+
@@ -259,25 +282,31 @@ data/merged_qa_data.jsonl (base corpus) ----------------------------------------
 
 - `src/database_to_training.py` exports active, non-rejected training rows (one
   JSON object per line with `group_id`); by default it merges into the existing
-  file and keeps up to 10 backups in `data/backups/`.
+  file and keeps up to 10 backups in `backups/` next to it (`data/backups/` by
+  default).
 - `src/data_augmentation.py` asks the Claude API for 15 variations per pair;
   variants share the `group_id` of their original.
 - `src/train_model.py` cleans and deduplicates the data, builds a group-aware
   train/validation split (an original, its variants, exact duplicates and rows
   that mention the same course code stay on one side), tokenizes with the
   inference prompt and masks the prompt so the loss covers the answer and the
-  EOS token only, trains the LoRA adapter (Hugging Face Trainer, early stopping,
-  separate Turkish and English validation loss) and writes the model directory
-  atomically. It never changes the active model. The base is `--base-model`
+  EOS token only, trains the LoRA adapter (Hugging Face Trainer, early stopping;
+  one evaluation pass over a length-sorted validation set gives the
+  token-weighted `eval_loss` plus the Turkish and English losses;
+  micro-batches of similar length) and writes the model directory atomically. It never changes the active model. The base is `--base-model`
   (default `BASE_MODEL_NAME`); `--load-in-4bit` trains QLoRA for 7-12B bases;
   `--lora-target-modules auto` adapts `q/k/v/o/gate/up/down_proj`, or every
   linear layer for models with fused projections (Phi, GLM); Gemma is trained
-  with eager attention.
+  with eager attention. `--resume-from-checkpoint latest` continues an
+  interrupted run from its newest complete checkpoint (optimizer, scheduler,
+  data position and early-stopping state); it skips the database export and
+  refuses to start when the tokenized data differ from the interrupted run
+  (`data_fingerprint.json` next to the checkpoints).
 - `benchmark/run_benchmark.py` scores a model on 100 verified Turkish and
   English questions through the production path (prompt guard, handler) and
   updates `benchmark/LEADERBOARD.md`; see [benchmark/README.md](../benchmark/README.md).
 
-## 📝 Logging and Monitoring
+## Logging and Monitoring
 
 | File | Written by | Rotation |
 |---|---|---|
@@ -285,13 +314,13 @@ data/merged_qa_data.jsonl (base corpus) ----------------------------------------
 | `logs/error.log` | `src/error_handler.py` (first occurrence of an error with its full traceback; identical errors within `ERROR_DEDUP_WINDOW`, 300 s, as one line with a repeat counter) | Python `RotatingFileHandler`, 10 MB × 5 |
 | `logs/system_monitor.log`, `logs/monitoring/*.jsonl` | `src/system_monitor.py` (service mode) | Python `RotatingFileHandler` (10 MB × 3); JSONL entries older than 30 days are dropped |
 | `logs/excel_export.log`, `deployment.log`, `optimization.log` | the corresponding scripts | logrotate |
-| `logs/training/`, `logs/training_history/`, `logs/training_*.log` | training | not in the logrotate config |
+| `logs/training/`, `logs/training_history/`, `logs/training_*.log` | training (`train_model.sh --log-dir DIR` writes them, and the error log, under `DIR`) | not in the logrotate config |
 
 Health checks: `scripts/health_check.sh` (services, `/health`, active model,
 resources, log sizes), `GET /health` on the Admin API, and
 `src/system_monitor.py --check-logs` / `--once` (exit code 1 on an alert).
 
-## 🔐 Security Architecture
+## Security Architecture
 
 - **Secrets** only in `.env` (gitignored); `config/env_loader.py` loads it once
   and never overrides variables that are already set. Placeholder values from
@@ -299,7 +328,9 @@ resources, log sizes), `GET /health` on the Admin API, and
 - **Admin API**: HTTP Basic auth on every data endpoint (router-level
   dependency), no default password, constant-time comparison. Public: `/`,
   minimal `/health`, OpenAPI docs. The document viewer serves only an allowlist.
-  No brute-force throttling: bind to `127.0.0.1` behind an HTTPS reverse proxy.
+  Failed logins (also credentials sent to `/health`) are rate limited per
+  client IP: HTTP 429 with `Retry-After` (`ADMIN_LOGIN_*`). Bind to `127.0.0.1`
+  behind an HTTPS reverse proxy.
 - **Admin panel**: credentials in memory and `sessionStorage` only; production
   builds ship without source maps.
 - **Bot**: answers only in the allowed chat; user and model text is
@@ -308,12 +339,14 @@ resources, log sizes), `GET /health` on the Admin API, and
 - **Model**: blocked prompts never reach the model; offline loading can be
   enforced with `MODEL_ALLOW_DOWNLOAD=false` or `HF_HUB_OFFLINE=1`; code from a
   model repository runs only with `MODEL_TRUST_REMOTE_CODE=true`.
-- **Scripts**: root actions use interactive `sudo` (no stored passwords),
-  system-wide changes are shown and confirmed first, and only processes of this
-  project are stopped. Services started by the scripts never inherit the locks
+- **Scripts**: root actions use interactive `sudo` (no stored passwords);
+  `setup_system.sh`, `optimize_linux.sh` and `deploy_production.sh` ask before
+  changing the system (`start_system.sh` installs/starts RabbitMQ and
+  `switch_model.sh` restarts a systemd worker through `sudo` without a
+  question), and only processes of this project are stopped. Services started by the scripts never inherit the locks
   of `train_model.sh` or `switch_model.sh`.
 
-## 🔧 Technology Stack
+## Technology Stack
 
 - **Backend:** Python 3.11, FastAPI + uvicorn, SQLAlchemy 2.0 + SQLite, pika
   (RabbitMQ), python-telegram-bot 20.7

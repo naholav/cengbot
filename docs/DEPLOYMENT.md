@@ -1,13 +1,15 @@
-# 🚀 CengBot Deployment Guide
+# CengBot Deployment Guide
 
 This guide covers a single Linux server (the scripts target Ubuntu 22.04+ with
 `apt` and systemd). The scripts print their options with `--help`
 (`health_check.sh` and `test_environment.sh` take no options and only read).
-System-wide scripts show their plan and ask before changing anything
-(`--dry-run` changes nothing, `--yes` skips the question). Details on every
+`optimize_linux.sh` and `deploy_production.sh` show their plan and ask before
+changing anything (`--dry-run` changes nothing, `--yes` skips the question);
+`setup_system.sh` asks once (`--yes`); `start_system.sh` installs and starts
+RabbitMQ through `sudo` without asking. Details on every
 script: [scripts/README.md](../scripts/README.md).
 
-## 📋 Requirements
+## Requirements
 
 - **Python 3.11** (the pinned web stack needs it)
 - **Node.js 22.13+ or 24+** and npm for the admin panel build (Vite 8). Ubuntu's
@@ -27,11 +29,11 @@ script: [scripts/README.md](../scripts/README.md).
 - A Telegram bot token from [@BotFather](https://t.me/BotFather), and the bot
   added to the department group
 
-## 🛠️ 1. Install
+## 1. Install
 
 ```bash
-git clone https://github.com/naholav/cu_ceng_bot.git
-cd cu_ceng_bot
+git clone https://github.com/naholav/cengbot.git
+cd cengbot
 ./scripts/setup_system.sh            # [--upgrade] [--yes]
 ```
 
@@ -59,7 +61,7 @@ sudo apt install rabbitmq-server && sudo systemctl enable --now rabbitmq-server
 cp .env.example .env && chmod 600 .env
 ```
 
-## ⚙️ 2. Configure
+## 2. Configure
 
 Edit `.env`. [`.env.example`](../.env.example) documents every variable.
 For production:
@@ -106,7 +108,7 @@ set `MODEL_ALLOW_DOWNLOAD=false` (or `HF_HUB_OFFLINE=1`) so the server never
 downloads model files. `./scripts/test_environment.sh` shows whether the base
 model is cached.
 
-## ▶️ 3. Run
+## 3. Run
 
 Use **one** of the two modes. `start_system.sh` refuses to start while the
 systemd units are active.
@@ -165,9 +167,11 @@ sudo ./scripts/deploy_production.sh [--with-firewall] [--tune-system] [--yes]
 Before step 1 it checks that the service user has Node.js 22.13+ (or 24+)
 and npm, and stops without changing anything if not.
 
-1. **backup**: archive of the project (code, `.env`, data, database, models;
-   without logs, `.venv`, `model_cache`, `node_modules`, build) in
-   `<parent dir>/cengbot_deploy_backups/` (mode 600)
+1. **backup**: archive of the project (code, `.env`, data, models and a
+   consistent online snapshot of the database instead of the live `.db`/`-wal`
+   files; without logs, `.venv`, `model_cache`, `backups`, `checkpoints`,
+   `node_modules`, build, `__pycache__`) in `<parent dir>/cengbot_deploy_backups/`
+   (`CENGBOT_DEPLOY_BACKUP_DIR` to change; directory mode 700, archive mode 600)
 2. **stop**: the `cengbot-*` units and processes started by `start_system.sh`
 3. **packages**: `nginx`, `rabbitmq-server`, `logrotate`, `curl`
 4. **app**: `pip install -r config/requirements.txt` into `.venv` (which must
@@ -177,10 +181,14 @@ and npm, and stops without changing anything if not.
    build copied there, `.env` set to mode 600
 5. **units**: `optimize_linux.sh --only services,logrotate` (all steps with `--tune-system`)
 6. **nginx**: `/etc/nginx/sites-available/cengbot` on port 80: the panel from
-   `/var/www/cengbot`, `/api/` → `http://127.0.0.1:8001/`, `/health`
+   `/var/www/cengbot`, `/api/` → `http://127.0.0.1:8001/`, `/health`; the
+   content-hashed `/assets/` are cached for a year, `index.html` is always
+   revalidated (`Cache-Control: no-cache`)
 7. **monitoring**: `/usr/local/bin/cengbot-health.sh` every 5 minutes (cron);
-   it starts stopped services and restarts `cengbot-admin` when `/health` fails;
-   output in `/var/log/cengbot-health.log`
+   it starts a stopped `cengbot-worker`, `cengbot-bot`, `cengbot-admin`,
+   `rabbitmq-server` or `nginx` (not `cengbot-monitor`) and restarts
+   `cengbot-admin` when `/health` fails; output in `/var/log/cengbot-health.log`
+   (rotated by `/etc/logrotate.d/cengbot-health`: 10 MB, 3 generations)
 8. **firewall**: only with `--with-firewall`: `ufw` allows SSH, 80 and 443 and
    denies other incoming traffic
 9. **start**: enables and starts the units and checks `/health`
@@ -207,7 +215,7 @@ sudo apt install -y certbot python3-certbot-nginx
 sudo certbot --nginx -d admin.example.edu
 ```
 
-## 📝 Logs
+## Logs
 
 - `logs/error.log` is rotated by Python itself (`src/error_handler.py`, 10 MB × 5).
 - The service output logs (`worker.log`, `bot.log`, `admin.log`,
@@ -238,62 +246,81 @@ Check sizes and free disk space at any time:
 .venv/bin/python src/system_monitor.py --check-logs     # exit code 1 if a threshold is exceeded
 ```
 
-## 💾 Backups
+## Backups
 
 ```bash
 ./scripts/backup_data.sh                 # backups/backup_<timestamp>.tar.gz
 ./scripts/backup_data.sh --no-models --keep 10 --dry-run
 ```
 
-The archive holds a consistent snapshot of the SQLite database (online backup
-API; the file `DATABASE_URL` points to, default `university_bot.db`), `data/`,
+The archive holds a consistent snapshot of the SQLite database (sqlite3
+`.backup` or the Python online backup API, so the commits still in the WAL file
+are included; the file `DATABASE_URL` points to, default `university_bot.db`), `data/`,
 `models/` (`--no-models` to skip), the last part of big logs and
 `.env.example` (never `.env`). The 5 newest archives are kept (`--keep N` or
 `KEEP_BACKUPS`). Copy the archives to another machine; `backups/` contains user
-data, so never commit it.
+data, so never commit it. Schedule it as the service user (its own crontab),
+not as root: the snapshot opens the database read-write with
+`PRAGMA query_only=ON`, so it leaves no `-wal`/`-shm` files behind, and when it
+does run as root any such file stays owned by the database owner.
 
-## 🔄 Updates
+**Restoring the database.** SQLite runs in WAL mode, and a leftover
+`university_bot.db-wal` next to a restored database is replayed into it (it can
+empty whole tables). Stop every service first, delete `university_bot.db-wal`
+and `university_bot.db-shm`, then copy the database from the archive back and
+start the services. Never back up by copying the `.db` file alone while the
+services run. `backup_info.txt` in each archive repeats these steps.
+
+## Updates
 
 ```bash
-./scripts/backup_data.sh
 git pull
 .venv/bin/python -m pip install -r config/requirements.txt
+sudo systemctl stop cengbot-worker cengbot-bot cengbot-admin cengbot-monitor
+./scripts/backup_data.sh
 .venv/bin/python -c "import sys; sys.path.insert(0, 'src'); from database_models import init_db; init_db()"   # adds missing tables only
-sudo systemctl restart cengbot-worker cengbot-bot cengbot-admin cengbot-monitor
+.venv/bin/python src/db_migrations.py --dry-run   # index changes it would make (--db PATH for another file)
+.venv/bin/python src/db_migrations.py
+sudo systemctl start cengbot-worker cengbot-bot cengbot-admin cengbot-monitor
 # frontend changes: re-run deploy_production.sh, or rebuild with the same API URL and replace the web root
 (cd admin_frontend && npm install && REACT_APP_API_URL=/api npm run build) \
   && sudo find /var/www/cengbot -mindepth 1 -delete && sudo cp -a admin_frontend/build/. /var/www/cengbot/
 ```
 
 In manual mode use `./scripts/stop_system.sh` and `./scripts/start_system.sh
---install-deps` instead of the `systemctl` and `pip` steps. Restarting the
-worker reloads the model (a few minutes); questions asked meanwhile get the
-bot's fallback reply.
+--install-deps` instead of the `systemctl` and `pip` steps. `db_migrations.py`
+drops redundant indexes and adds missing ones; it needs the services stopped
+and a backup first. Restarting the
+worker reloads the model (a few minutes); askers meanwhile are told the
+answer is on its way, and it is posted as a reply once the model is loaded
+(within `BOT_LATE_ANSWER_WINDOW`, 10 min).
 
 The ML stack upgrade (torch ≥ 2.10, transformers ≥ 4.57.6, accelerate ≥ 1.15)
 recommended in the comments of `config/requirements.txt` should be done
 together with the next retrain, after testing on the GPU.
 
-## 🔒 Hardening
+## Hardening
 
 - `.env` mode 600, owned by the service user (`deploy_production.sh` sets this).
 - `API_HOST=127.0.0.1`; publish the API only through the nginx proxy with HTTPS.
-  The API has no brute-force throttling yet; restrict the panel to trusted
-  networks if you can.
+  Failed logins are rate limited per client IP (`ADMIN_LOGIN_*`, HTTP 429); if
+  nginx runs on another host, set `FORWARDED_ALLOW_IPS` to its address so the
+  limit applies to the real client. Restrict the panel to trusted networks if
+  you can.
 - `MODEL_ALLOW_DOWNLOAD=false` or `HF_HUB_OFFLINE=1`.
 - Use RabbitMQ credentials other than `guest` if the broker is not local.
 - Keep `university_bot.db`, `logs/`, `backups/` and the deploy backups readable
   only by the service user.
 - See [PRODUCTION_SECURITY_CHECKLIST.md](../PRODUCTION_SECURITY_CHECKLIST.md).
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 | Problem | What to check |
 |---|---|
 | A unit keeps restarting | `tail -n 100 logs/<service>.log`; `systemctl status <unit>` |
 | Worker logs `Model load failed ... Retrying` | `./scripts/switch_model.sh current`; base model cached? `nvidia-smi`; GPU memory used by another process? |
 | Bot logs `409 Conflict` / "Telegram connectivity problem: Conflict" | Another poller uses the token: a second instance, the legacy or the standalone bot (`./scripts/health_check.sh` warns) |
-| Users always get the fallback reply | Worker not running or still loading; `sudo rabbitmqctl list_queues` (growing `questions` queue) |
+| Users always get "the answer is on its way" (or the fallback reply) | Worker not running or still loading; `sudo rabbitmqctl list_queues` (growing `questions` queue) |
 | Panel: login fails | Password set and ASCII? API restarted after editing `.env`? |
 | Panel: network errors | `REACT_APP_API_URL` used at build time (`PANEL_API_URL` for the deploy script, default `/api`); `CORS_ORIGINS` contains the panel origin (when the API is on another origin) |
 | `npm run build` fails / panel not started | `node --version` must be 22.13+ or 24+ for the service user (nvm: `~/.nvm/nvm.sh` is loaded by the deploy script) |

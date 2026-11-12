@@ -1,6 +1,6 @@
-# 🔧 CengBot Development Guide
+# CengBot Development Guide
 
-## 🚀 Setup
+## Setup
 
 Requirements: Python 3.11, **Node.js 22.13+ or 24+** and npm (Vite 8 and
 Vitest 5 need it; Ubuntu's apt package is too old, use
@@ -9,8 +9,8 @@ RabbitMQ, and a CUDA GPU if you want to run the real model (the tests do not
 need one).
 
 ```bash
-git clone https://github.com/naholav/cu_ceng_bot.git
-cd cu_ceng_bot
+git clone https://github.com/naholav/cengbot.git
+cd cengbot
 
 python3.11 -m venv .venv                                   # the scripts always use .venv/bin/python
 .venv/bin/python -m pip install -r config/requirements.txt
@@ -25,7 +25,7 @@ cp .env.example .env && chmod 600 .env                     # fill in a test bot 
 `config/requirements-dev.txt` does not include `config/requirements.txt`, so
 installing it never upgrades torch or transformers in an existing environment.
 
-## ▶️ Running the components
+## Running the components
 
 All at once: `./scripts/start_system.sh` (`--no-frontend` without the Vite
 dev server; with a missing or too old Node.js it skips the panel and prints an
@@ -54,7 +54,7 @@ LOG_LEVEL=DEBUG .venv/bin/python src/telegram_bot_rabbitmq.py
 
 (The Admin API always logs at INFO.)
 
-## 📁 Code layout and conventions
+## Code layout and conventions
 
 ```
 src/                 application code; modules import each other WITHOUT a "src." prefix
@@ -97,7 +97,7 @@ benchmark/           benchmark questions, grader and runner (see benchmark/READM
   scripts should accept `--help`, and `--dry-run` / `--yes` if they change the
   system.
 
-## 🧩 Common changes
+## Common changes
 
 **Admin API endpoint.** Register data endpoints on the `protected` router in
 `src/admin_rest_api.py`; it applies `verify_credentials` to every route. Only
@@ -146,6 +146,13 @@ put secrets in them. The dev server origin `http://localhost:3000` is in the
 default `CORS_ORIGINS`. Credentials are kept in memory and `sessionStorage`
 only (`src/services/api.ts`); keep it that way.
 
+The dashboard and the Documentation tab are lazy-loaded (`React.lazy` in
+`src/App.tsx` and `src/components/Dashboard.tsx`; spinner and a Reload prompt
+when a chunk fails to load in `src/components/LazyScreen.tsx`), and third-party
+code is split into `react` and `vendor` chunks (`build.rolldownOptions` in
+`vite.config.ts`). Put new heavy screens behind `lazy()` too, so the login page
+stays small.
+
 **Base model families.** Family-specific behaviour lives in
 `src/llama_model_handler.py` (stop tokens in `STOP_TOKEN_CANDIDATES`, BOS and
 appended-EOS handling, 4-bit loading, remote-code errors), `src/train_model.py`
@@ -154,13 +161,14 @@ appended-EOS handling, 4-bit loading, remote-code errors), `src/train_model.py`
 `tests/test_model_families.py` when you touch one of them; see
 [MODEL_SWAP.md](MODEL_SWAP.md#retrain-on-a-different-base-model).
 
-## 🧪 Testing
+## Testing
 
 ```bash
-.venv/bin/python -m pytest                                  # whole suite (~1,400 tests)
+.venv/bin/python -m pytest                                  # whole suite (1,800+ tests)
 .venv/bin/python -m pytest tests/test_prompt_guard.py -q    # one file
 .venv/bin/python -m pytest -k switch                        # by name
 RUN_GPU_TESTS=1 .venv/bin/python -m pytest -m gpu           # opt-in: loads the real model on the GPU
+RUN_LIVE_TESTS=1 .venv/bin/python -m pytest tests/live      # opt-in: real RabbitMQ + GPU worker + uvicorn
 SHELLCHECK=/usr/bin/shellcheck .venv/bin/python -m pytest tests/test_shell_scripts.py
 
 cd admin_frontend && npm test                               # frontend (Vitest + Testing Library, jsdom)
@@ -181,9 +189,11 @@ before any project module is imported and:
 Mock pika, Telegram, torch/transformers and the Anthropic client; never load
 the real model outside tests marked `gpu` (tiny randomly initialised models
 built from a config are fine). The `gpu` tests are skipped unless
-`RUN_GPU_TESTS=1`; the shellcheck test is skipped unless `shellcheck` is on
-`PATH` or `SHELLCHECK` points to it. Markers are defined in `pytest.ini`
-(`gpu`, `slow`).
+`RUN_GPU_TESTS=1`, the `live` tests in `tests/live/` unless `RUN_LIVE_TESTS=1`
+(they need a running RabbitMQ, the GPU and the cached base model, and use
+throw-away queues and a copy of the database); the shellcheck test is skipped
+unless `shellcheck` is on `PATH` or `SHELLCHECK` points to it. Markers are
+defined in `pytest.ini` (`gpu`, `slow`) and `tests/live/conftest.py` (`live`).
 
 | Test file | Covers |
 |---|---|
@@ -196,12 +206,14 @@ built from a config are fine). The `gpu` tests are skipped unless
 | `test_switch_model_families.py` | `switch_model.sh` / `train_model.sh` with non-Llama bases in a temporary project |
 | `test_benchmark.py` | question set schema, grader, LLM judge (mocked), benchmark runner with a fake model |
 | `test_prompt_guard.py` | blocked attacks and allowed questions (TR + EN) |
-| `test_training_pipeline.py` | prompt alignment, label masking, group split, export, augmentation |
+| `test_training_pipeline.py` | prompt alignment, label masking, group split, resume, export, augmentation, training wrappers |
+| `test_training_e2e_gpu.py` | opt-in (`RUN_GPU_TESTS=1`): `train_model.sh` runs 3 real steps of the cached base model (outputs in a temp dir), validate, history viewer, the production handler answers TR + EN |
+| `tests/live/test_integration_live.py` | opt-in (`RUN_LIVE_TESTS=1`): bot publisher/router, real worker and Admin API over a real RabbitMQ |
 | `test_database_models.py` | schema, duplicates, votes and `like` sync |
 | `test_shell_scripts.py` | the bash scripts in a temporary project (+ shellcheck) |
 | `test_env_loader.py`, `test_error_handler.py`, `test_export_to_excel.py`, `test_system_monitor.py`, `test_smoke_infra.py` | the remaining modules |
 
-## 🔍 Debugging
+## Debugging
 
 ```bash
 # What would the worker load? (filesystem only, no weights)

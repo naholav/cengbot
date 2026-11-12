@@ -128,7 +128,10 @@ flowchart TB
 2. The worker runs the prompt guard, generates the answer, stores it and
    publishes it to the `answers` queue.
 3. The bot replies in the group with 👍/👎 buttons. If no answer arrives in
-   time it sends a fallback reply; the worker still stores the late answer.
+   time it says the answer is on its way and posts it as a reply to the
+   question when it arrives within `BOT_LATE_ANSWER_WINDOW` (10 min). The
+   worker does not generate answers nobody would see any more (`deliver_until`
+   in the question; such rows get an `[auto]` note, admins can still answer).
 
 Only `src/telegram_bot_rabbitmq.py` is a production bot. `src/telegram_bot.py`
 (legacy) and `src/telegram_bot_standalone.py` (development, model in-process)
@@ -150,8 +153,8 @@ models: [Supported base models](#supported-base-models)).
 
 ```bash
 # 1. Clone
-git clone https://github.com/naholav/cu_ceng_bot.git
-cd cu_ceng_bot
+git clone https://github.com/naholav/cengbot.git
+cd cengbot
 
 # 2. Python 3.11 virtual environment (all scripts use .venv/bin/python)
 python3.11 -m venv .venv
@@ -184,7 +187,8 @@ template). It does not install Node.js: install it first.
 `data/` are gitignored). Put a trained model directory into `models/` and
 activate it with `./scripts/switch_model.sh switch <name>`, or train one (see
 [Training](#training-and-data)). The first start downloads the base model into
-`model_cache/` if `HUGGING_FACE_TOKEN` is set and downloads are allowed.
+`model_cache/` if downloads are allowed (a gated base such as Llama also needs
+`HUGGING_FACE_TOKEN`).
 
 Once running: admin panel <http://localhost:3000>, API docs
 <http://localhost:8001/docs>, health `./scripts/health_check.sh`.
@@ -206,7 +210,7 @@ commented reference**; values already set in the process environment win over
 | `MODEL_PATH` | Optional override; empty = `models/active-model` |
 | `BASE_MODEL_NAME` | Default base for training, and the fallback when an adapter does not name its base (default `meta-llama/Llama-3.2-3B`) |
 | `HUGGING_FACE_TOKEN` | Only to download a gated base model (Llama, Gemma, most Mistral) |
-| `MODEL_ALLOW_DOWNLOAD` / `HF_HUB_OFFLINE` | `false` / `1` forbids model downloads by the worker; training honours only `HF_HUB_OFFLINE=1` |
+| `MODEL_ALLOW_DOWNLOAD` / `HF_HUB_OFFLINE` | `false` / `1` forbids model downloads (worker and training) |
 | `MODEL_LOAD_IN_4BIT` | `true` loads the base in 4-bit NF4 for inference (bases of ~12B+ on a 24 GB GPU; default `false`) |
 | `MODEL_TRUST_REMOTE_CODE` | `true` executes Python code from the model repository; only for legacy remote-code models you trust (default `false`) |
 | `LORA_TARGET_MODULES` | Training: `auto` (default), `all-linear` or a comma-separated list |
@@ -301,6 +305,17 @@ static panel and `/api/` proxy, health cron, optional firewall); see
 - `.venv/bin/python src/system_monitor.py --check-logs` reports log sizes and
   free disk space (exit code 1 on an alert; `--json`, `--once`).
 
+**Database**
+
+- SQLite runs in WAL mode (`SQLITE_JOURNAL_MODE`, default `wal`): recent
+  commits live in `university_bot.db-wal`, so never back up the `.db` file
+  alone. `./scripts/backup_data.sh` takes a consistent online snapshot. To
+  restore one: stop the services, delete `university_bot.db-wal` and
+  `university_bot.db-shm`, then copy the database back.
+- After an upgrade, with the services stopped and a fresh backup:
+  `.venv/bin/python src/db_migrations.py --dry-run`, then without `--dry-run`
+  (index changes; `--db PATH` for another database file).
+
 ## Supported base models
 
 Training, validation, swapping and inference work with any open-weight causal
@@ -346,8 +361,9 @@ keep running.
 ```
 
 Every command accepts `--dry-run`; `--yes` skips the questions. While the
-worker reloads (a few minutes), users get the bot's fallback reply; their
-questions stay in RabbitMQ and are answered and stored once the model is loaded.
+worker reloads (a few minutes), users are told their answer is on its way;
+their questions stay in RabbitMQ, and the answers are posted as replies once
+the model is loaded (within `BOT_LATE_ANSWER_WINDOW`, 10 min by default).
 
 **Step-by-step runbook (training → validation → switch → verification →
 rollback): [docs/MODEL_SWAP.md](docs/MODEL_SWAP.md).**
@@ -360,25 +376,27 @@ rollback): [docs/MODEL_SWAP.md](docs/MODEL_SWAP.md).**
 
 # Optional: 15 Claude-generated variations per approved pair (costs money, asks first)
 ./scripts/augment_training_data.sh --dry-run          # no API calls, no writes
-./scripts/augment_training_data.sh [--max-items N] [--model ID] [--reset] [--yes]
+./scripts/augment_training_data.sh [--max-items N] [--model ID] [--reset] [--output FILE] [--yes]
 
 # Train -> models/final-best-model-v<N>/ (never activates the model)
 ./scripts/train_model.sh --dry-run                    # data + tokenization stats only
 ./scripts/train_model.sh [train_model.py options]
 
-# Training sessions (logs/training_history/)
-./scripts/view_training_history.sh list | view v1 | compare v1 v2 | best
+# Training sessions (logs/training_history/; --log-dir DIR for runs trained with --log-dir DIR)
+./scripts/view_training_history.sh [--log-dir DIR | --history-dir DIR] list | view v1 | compare v1 v2 | best
 ```
 
 **`src/train_model.py` options** (all optional): `--dataset FILE...`,
 `--base-model ID|DIR`, `--cache-dir`, `--models-dir`, `--output-name`,
-`--checkpoint-dir`, `--log-dir`, `--epochs` (4), `--batch-size` (4),
-`--eval-batch-size` (16), `--grad-accum` (16), `--lr` (2e-4), `--max-length`
+`--checkpoint-dir`, `--log-dir`, `--epochs` (4), `--max-steps N` (off: stop
+after N optimizer steps, for smoke runs), `--logging-steps` (10), `--batch-size` (8),
+`--eval-batch-size` (16), `--grad-accum` (8), `--lr` (2e-4), `--max-length`
 (512), `--truncation drop|truncate`, `--val-ratio` (0.07), `--evals-per-epoch`
 (5), `--early-stopping-patience` (3), `--seed` (42), `--lora-r` (16),
 `--lora-alpha` (32), `--lora-dropout` (0.1),
 `--lora-target-modules auto|all-linear|a,b,c`, `--load-in-4bit`,
-`--trust-remote-code`, `--cpu`, `--workers` (4), `--semantic-dedup`,
+`--trust-remote-code`, `--cpu`, `--workers` (0), `--[no-]sort-by-length` (on),
+`--[no-]gradient-checkpointing` (on), `--semantic-dedup`,
 `--no-db-export`, `--resume-from-checkpoint DIR|latest`, `--overwrite`,
 `--dry-run`.
 
@@ -389,10 +407,30 @@ rollback): [docs/MODEL_SWAP.md](docs/MODEL_SWAP.md).**
   duplicates with `sentence-transformers`.
 - The base model is loaded offline-first from `model_cache/`; a download needs
   network access (and `HUGGING_FACE_TOKEN` for gated models) and is impossible
-  with `HF_HUB_OFFLINE=1`.
+  with `HF_HUB_OFFLINE=1` or `MODEL_ALLOW_DOWNLOAD=false`.
+- `train_model.sh --log-dir DIR` writes every log there (its own log in
+  `DIR/training/`, the session history in `DIR/training_history/`, the error
+  log); `--checkpoint-dir DIR` and `--cache-dir DIR` move the checkpoints and
+  the base-model cache. Path options are relative to your current directory.
+- `--resume-from-checkpoint latest` continues an interrupted run from its
+  newest complete checkpoint (pass the same `--output-name`/`--checkpoint-dir`).
+  It skips the database export and refuses to start if the training data
+  changed, so the run continues on the same split and data order.
 - Output: adapter, tokenizer and `training_info.json` in
   `models/final-best-model-v<N>/` (written atomically); Trainer checkpoints in
   `checkpoints/<name>/`.
+- Speed (RTX 3090, Llama-3.2-3B, 20.8k examples): about 4.4 s per optimizer
+  step and 26 s per evaluation, roughly 1.8 h for the default 4 epochs (was
+  about 2.7 h). Micro-batches of 8 whose examples are sorted by length inside
+  each step (the same examples per step as a random order, so the training
+  result does not change), one evaluation pass, at most 12 GiB of GPU memory,
+  so it fits next to the running inference worker. Only with the worker
+  stopped: `--no-gradient-checkpointing` cut the step time by about 40% in a
+  micro-batch-4 test, but needs 18 GiB or more.
+- `eval_loss` is the token-weighted mean over all answer tokens (also used
+  for early stopping and the best checkpoint); runs before 2026-11-12 reported
+  a mean of per-batch means, so compare their values only roughly
+  (`metrics.eval_loss_definition` in `training_info.json`).
 
 **Data augmentation** (`src/data_augmentation.py`, options `--model`,
 `--max-items`, `--dry-run`, `--yes`, `--output`, `--base-path`, `--reset`):
@@ -421,14 +459,20 @@ an optional LLM judge (Claude API) adds a correctness score.
 
 | Model | Scoring | Overall | TR | EN | Key-fact coverage | Correct link | Wrong official link | Invented URLs |
 |---|---|---|---|---|---|---|---|---|
-| Llama-3.2-3B + LoRA v1.2 | deterministic (`det-v2`) | **30.2** / 100 | 30.2 | 30.2 | 20.3% | 32% | 56% | 0% |
+| Llama-3.2-3B + LoRA v1.2 | deterministic (`det-v3`) | **29.1** / 100 | 28.9 | 29.2 | 18.7% | 32% | 56% | 0% |
+
+The first baseline, scored with the older `det-v2` rules, was 30.2; `det-v3`
+(2026-11-12) also checks negation and yes/no polarity, compares numbers by
+value and requires URLs named in a key fact. The leaderboard keeps older
+rubrics as history.
 
 The LLM judge has not run yet: the API key in `.env` was rejected (HTTP 401)
 when the baseline was made. With a valid key, re-grade the existing answers
 (no GPU needed; judgments are cached):
 
 ```bash
-.venv/bin/python benchmark/run_benchmark.py --regrade benchmark/results/final-best-model-v1.2_20261111-174055
+.venv/bin/python benchmark/run_benchmark.py --regrade benchmark/results/final-best-model-v1.2_20261111-174055_det-v3 \
+    --output-dir benchmark/results/final-best-model-v1.2_det-v3_llm
 ```
 
 **Score a new model** (needs GPU memory for a second copy of the model while
@@ -459,8 +503,9 @@ export, train and benchmark.
 
 ```bash
 .venv/bin/python -m pip install -r config/requirements-dev.txt
-.venv/bin/python -m pytest                    # ~1,400 tests, offline
+.venv/bin/python -m pytest                    # 1,800+ tests, offline
 RUN_GPU_TESTS=1 .venv/bin/python -m pytest    # also the real-model GPU tests (opt-in)
+RUN_LIVE_TESTS=1 .venv/bin/python -m pytest tests/live   # opt-in: real RabbitMQ + GPU worker + API server
 SHELLCHECK=/path/to/shellcheck .venv/bin/python -m pytest tests/test_shell_scripts.py
 (cd admin_frontend && npm test)               # frontend tests (Vitest + Testing Library)
 (cd admin_frontend && npm run typecheck)      # TypeScript check (npm run test:watch for watch mode)
@@ -468,7 +513,8 @@ SHELLCHECK=/path/to/shellcheck .venv/bin/python -m pytest tests/test_shell_scrip
 
 `tests/conftest.py` uses a temporary SQLite database, a temporary log directory
 and dummy tokens, and fails the run if the real `university_bot.db` changes.
-The tests never contact Telegram, RabbitMQ, Hugging Face or the Claude API.
+The tests never contact Telegram, Hugging Face or the Claude API, and only the
+opt-in `tests/live` tests use RabbitMQ (throw-away queues, a copy of the database).
 
 ## Security
 
@@ -483,7 +529,9 @@ The tests never contact Telegram, RabbitMQ, Hugging Face or the Claude API.
   `localStorage`.
 - **Bind the API to `127.0.0.1`** (`API_HOST`, as in `.env.example`) and expose
   it only through an HTTPS reverse proxy. HTTP Basic sends the password with
-  every request, and there is **no brute-force throttling** on the login yet.
+  every request. Failed logins are rate limited per client IP (10 wrong
+  passwords in 15 minutes lock the address out for 15 minutes with HTTP 429;
+  `ADMIN_LOGIN_*`; behind a proxy on another host set `FORWARDED_ALLOW_IPS`).
 - Set `MODEL_ALLOW_DOWNLOAD=false` or `HF_HUB_OFFLINE=1` in production. Model
   code from a repository is never executed unless `MODEL_TRUST_REMOTE_CODE=true`.
 - `config/requirements.txt` pins audited minimum versions. Upgrading the ML
@@ -495,7 +543,7 @@ Checklist: [PRODUCTION_SECURITY_CHECKLIST.md](PRODUCTION_SECURITY_CHECKLIST.md).
 ## Project Structure
 
 ```
-cu_ceng_bot/
+cengbot/
 ├── src/
 │   ├── telegram_bot_rabbitmq.py   # PRODUCTION Telegram bot (RabbitMQ)
 │   ├── ai_model_worker.py         # RabbitMQ consumer: guard -> model -> answer
@@ -513,7 +561,7 @@ cu_ceng_bot/
 │   └── telegram_bot_standalone.py # optional dev bot (model in-process, no RabbitMQ)
 ├── admin_frontend/                # React + TypeScript + Ant Design admin panel (Vite)
 │   ├── index.html                 # Vite entry page
-│   ├── vite.config.ts             # dev server/preview on localhost:3000, build (no source maps), Vitest
+│   ├── vite.config.ts             # dev server/preview on localhost:3000, build (no source maps, vendor chunks), Vitest
 │   ├── package.json               # npm start | build | preview | test | test:watch | typecheck
 │   └── src/                       # App.tsx, components/, contexts/, hooks/,
 │                                  # services/api.ts, types/, utils/, *.test.ts(x)
@@ -546,7 +594,7 @@ run's `answers.jsonl`; run it again after a model change.
 |---|---|
 | Bot does not answer | `./scripts/health_check.sh`; the group's chat id must equal `TELEGRAM_ALLOWED_CHAT_ID`; `logs/bot.log` |
 | `409 Conflict` in `bot.log` | Another poller uses the same token (a second bot instance, or the legacy/standalone bot) |
-| Fallback reply for every question | Worker not running or still loading: `tail -f logs/worker.log` |
+| Every question gets "the answer is on its way" (or the fallback reply) | Worker not running or still loading: `tail -f logs/worker.log` |
 | Model fails to load | `./scripts/switch_model.sh current`; `nvidia-smi`; base model in `model_cache/`; [MODEL_SWAP troubleshooting](docs/MODEL_SWAP.md#troubleshooting) |
 | RabbitMQ errors | `sudo systemctl status rabbitmq-server`; `sudo rabbitmqctl list_queues` |
 | Admin login always fails | `ADMIN_PASSWORD_HASH` / `ADMIN_PASSWORD` set? ASCII only? API restarted after editing `.env`? |

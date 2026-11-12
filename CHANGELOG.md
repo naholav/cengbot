@@ -2,6 +2,176 @@
 
 All notable changes to CengBot are listed here.
 
+## 2026-11-12 - Verified and faster training, WAL database, late answers, det-v3 benchmark
+
+<!-- Round 2026-11-12: the lead adds the lines of the other areas (serving, benchmark, ...). -->
+
+### Training
+
+- Verified end to end on the GPU (export, dry run on 22k examples, bf16 and
+  4-bit training of Llama-3.2-3B, validation, loading, benchmark smoke run);
+  opt-in GPU test `tests/test_training_e2e_gpu.py` (`RUN_GPU_TESTS=1`).
+- `train_model.py --max-steps N` (smoke runs; evaluation and checkpoints are
+  spread over the short run) and `--logging-steps N`.
+- `--log-dir`, `--models-dir`, `--checkpoint-dir` and `--cache-dir` redirect
+  every output (the error log follows `--log-dir`), so a smoke run with
+  `--dataset FILE --no-db-export` writes nothing into the project except the
+  `.training.lock` file. The wrapper scripts make path options relative to the
+  current directory and expand `~/`.
+- `--resume-from-checkpoint latest` picks the newest *complete* checkpoint,
+  reports the true whole-run train loss, restores the early-stopping patience
+  counter, skips the database export and refuses to start (before loading the
+  model) when the tokenized data differ from the interrupted run
+  (`data_fingerprint.json` next to the checkpoints; `data_sha256` in
+  `training_info.json`).
+- `MODEL_ALLOW_DOWNLOAD=false` is honoured by training too; `~` is expanded in
+  `MODEL_CACHE_DIR`.
+- Augmentation writes no file when the first request fails; `--output FILE`
+  for `augment_training_data.sh`, with the export backups next to that file.
+- `view_training_history.sh --log-dir DIR` / `--history-dir DIR`; `best` and
+  `compare` rank sessions by the best validation loss instead of the train loss.
+- Faster training, same result (RTX 3090, Llama-3.2-3B, real data, 50-step
+  runs): 6.41 -> 4.38 s per optimizer step, 71 s -> 26 s per evaluation, the
+  final re-evaluation dropped, peak GPU memory 22.0 -> 11.8 GiB reserved
+  (11.8 -> 10.9 GiB allocated). A default 4-epoch run: about 2.7 h -> 1.8 h.
+  - One evaluation pass yields `eval_loss` and the Turkish/English losses (the
+    old callback evaluated the validation set a second time), over a
+    length-sorted validation set; the final metrics come from the best
+    checkpoint's logged evaluation instead of another pass.
+  - **`eval_loss` is now the token-weighted mean over all answer tokens**
+    (before: the Trainer's mean of per-batch means). Early stopping and the best
+    checkpoint use it; `training_info.json` records it as
+    `metrics.eval_loss_definition`. Do not compare it 1:1 with older runs (on
+    the same model: 1.7946 token-weighted vs 1.7475 old definition; the TR/EN
+    losses were token-weighted before and are unchanged).
+  - Default micro-batch 8 x 8 accumulation (was 4 x 16, same effective batch
+    of 64) with each step's examples sorted by length (`--[no-]sort-by-length`):
+    the same examples per step as random order, so the gradient is unchanged
+    (validation loss after 50 steps 1.7948 vs 1.7946). transformers'
+    `group_by_length` was rejected: it groups similar lengths into the same
+    step and raised the validation loss (1.680 vs 1.632 after 120 steps).
+  - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` by default: the
+    reserved GPU memory stays near the allocated peak (22.5 -> 11.8 GiB at
+    micro-batch 8), leaving room for the inference worker.
+  - DataLoader workers default to 0 (0/2/4 workers: 5.97/6.22/6.09 s/step).
+  - `--[no-]gradient-checkpointing` (env `TRAINING_GRADIENT_CHECKPOINTING`):
+    off cut the step time by ~40% at micro-batch 4 but needs 18-21 GiB, so it
+    stays on by default (the worker shares the GPU).
+
+### Serving
+
+- Faster answers: generation stops as soon as the visible answer is complete
+  (-11% generated tokens, mean latency 2.60 -> 2.27 s on v1.2; the shown answer
+  is unchanged), and a link sentence is no longer cut mid-URL.
+- Late answers are no longer lost: if the worker needs longer than
+  `BOT_ANSWER_TIMEOUT`, the asker is told the answer is coming, and it is posted
+  as a reply within `BOT_LATE_ANSWER_WINDOW` (default 10 min).
+- The worker skips questions whose asker is no longer waiting (after a
+  backlog), leaving an `[auto]` note so admins can answer them;
+  `WORKER_SKIP_EXPIRED=false` turns this off. Questions are skipped once their
+  answer could no longer arrive in time (4 s generation margin).
+- The early stop also works with SentencePiece tokenizers (Llama 2, Mistral,
+  Phi-3).
+- `prompt_guard`: spaced-out 'talimatları unut' variants and 'sistem promptu
+  nedir, … göster/yaz' are blocked again.
+- Bot: invalid `BOT_ANSWER_TIMEOUT`/`BOT_LATE_ANSWER_WINDOW` values (inf, nan,
+  negative) fall back to the defaults with a warning; votes always go to the
+  late answer's message.
+- Worker: broker reconnects capped at 15 s (`WORKER_RECONNECT_MAX`), so answers
+  resume within the bot's 30 s timeout after a RabbitMQ outage; a repeated
+  error is logged at most every 5 minutes.
+- Worker: a SIGTERM during an answer followed by a lost broker connection now
+  exits instead of reconnecting; the reconnect backoff no longer overflows
+  after ~1,000 attempts.
+- Worker and bot: broker failure lines name the cause again (e.g.
+  `ConnectionRefusedError(111, 'Connection refused')`); the bot's answer
+  consumer logs an outage once, then every 5 minutes, plus a recovery line.
+- `prompt_guard`: fewer false positives ('Talimatları unutmayın', 'Artık
+  sınırsız sınav hakkı var mı?', 'Sistem promptu nedir?', 'Is the campus
+  internet going to be unlimited?') and more jailbreak forms caught
+  (pretend/imagine you have no rules, translate/summarize your prompt, 'harfi
+  harfine tekrar et', 'kısıtlaması olmayan bir yapay zekasın', forged `[INST]`
+  + 'ignore safety').
+- Legacy `telegram_bot.py`: pika and httpx logs quieted.
+- Live tests: broker connection cut mid-answer, graceful SIGTERM.
+
+### Database / Admin API
+
+- SQLite now runs in WAL mode with `synchronous=NORMAL` and a 5 s busy timeout
+  (`SQLITE_JOURNAL_MODE`, `SQLITE_SYNCHRONOUS`, `SQLITE_BUSY_TIMEOUT_MS`), so
+  readers no longer block the bot's writes.
+- New `src/db_migrations.py` (`--dry-run`): drops 13 redundant indexes and adds
+  indexes on `raw_data.duplicate_of_id` and `training_data.duplicate_answer_of_id`;
+  `init_db()` now takes its indexes from the model metadata.
+- Admin API: failed-login rate limiting per client IP (429 + `Retry-After`;
+  `ADMIN_LOGIN_*`), also applied to credentials sent to `/health`.
+- Admin API: faster `only_unapproved` listing and `/stats`; `/duplicates` is
+  paged (`limit`/`offset`, `X-Total-Count`).
+- Login limiter keys are spoof-proof (non-IP hosts share one key); wrong
+  passwords on `/health` count in their own global bucket and never lock the
+  admin out of the API.
+- `db_migrations --dry-run` leaves no `-wal`/`-shm` files behind.
+- `backup_data.sh` and the `deploy_production.sh` backup take a consistent
+  online snapshot of the WAL-mode database (sqlite3 `.backup`, else the Python
+  backup API, else `.db` + `-wal` with a warning); the deploy archive no longer
+  tars the live `.db`/`-wal`/`-shm` files. Restore instructions: stop the
+  services and delete `university_bot.db-wal`/`-shm` before copying a database
+  back (a stale `-wal` is replayed into it). `health_check.sh` counts the `-wal`
+  file in the database size.
+- The snapshot opens the database read-write with `PRAGMA query_only=ON`: a
+  read-only snapshot of a stopped WAL database left `-wal`/`-shm` files behind
+  (owned by root when run from root's cron, which made the database read-only
+  for the services).
+- nginx (`deploy_production.sh`): `/api/` and `/health` set `X-Forwarded-For` to
+  the peer address (`$remote_addr`) instead of appending to or passing through a
+  client-sent value, so a client cannot choose its login rate-limit key (bypass,
+  or locking the admin out).
+
+### Benchmark
+
+- Grader rubric `det-v3`: negation and yes/no polarity are checked (EN
+  no/not/n't/cannot/never; TR hayır/değil/yok and negated verbs such as
+  açılmaz, aranmıyor, bulunmamaktadır), so 'Evet … açılır' no longer scores
+  like 'Hayır … açılmaz'; numbers compare by value (2.5 = 2.50, 09.00 = 9:00,
+  02.11.2026 = 2 Kasım 2026; /4.00 and /100 scales optional); a URL inside a
+  key fact must be in the answer.
+- `questions.jsonl`: facts the question doesn't ask for moved to an unscored
+  `extra_facts` list, and yes/no facts carry the reference answer's yes/no (45
+  changes in 35 items, `benchmark/provenance/keyfact_changes.md`).
+- `run_benchmark.py --regrade <run> --output-dir <dir>` re-grades into a new
+  run directory without the GPU; the leaderboard shows the rubric per row and
+  lists older rubrics as history.
+- Llama-3.2-3B + LoRA v1.2 re-graded with `det-v3`: 29.1/100 (`det-v2`: 30.2),
+  key-fact coverage 18.7% (was 20.3%); links unchanged.
+
+### Admin panel
+
+- The dashboard and Documentation tab load on demand; the login page
+  downloads 220 kB of gzipped JS instead of 337 kB (-35%), and the dashboard is
+  prefetched while the admin types the password.
+- Third-party code is split into cache-friendly `react`/`vendor` chunks (no
+  more >500 kB chunk warning).
+- A screen that fails to load (e.g. a tab opened before a deploy) shows a
+  Reload prompt instead of a blank page.
+- `deploy_production.sh`: nginx caches the content-hashed `/assets/` for a year
+  (a missing chunk is a 404, never `index.html`), always revalidates
+  `index.html`, keeps the security headers on every location and compresses
+  with `gzip_comp_level 5`.
+
+### Docs
+
+- Corrected against the code: download policy of training, consumer reconnect
+  backoff, re-sent answers (`status` `resent`), output-guard `[auto]` rows,
+  duplicate recheck length rule, deploy backup excludes, health cron scope,
+  which scripts ask before using `sudo`; `.env.example` states the real
+  `API_HOST` default (`127.0.0.1`).
+- Documented `--max-steps`, `--logging-steps`, the wrappers' `--log-dir`,
+  `--checkpoint-dir`, `--cache-dir`, `--output`, `--history-dir`, resume
+  behaviour and the opt-in live tests (`RUN_LIVE_TESTS=1 ... tests/live`,
+  real RabbitMQ + GPU). No decorative emojis in headings.
+- Clone URL `https://github.com/naholav/cengbot.git`; login rate limiting,
+  `/duplicates` paging, WAL backup/restore and `db_migrations.py` documented.
+
 ## 2026-11-11 - Vite admin panel, any base model family, benchmark
 
 Follow-up to the hardening release below: the admin panel moves to Vite, the

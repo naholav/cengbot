@@ -80,7 +80,9 @@ Check that `MODEL_PATH` is empty in `.env` (see above).
   shares the GPU with training. If the GPU cannot hold both, stop the worker
   first (systemd: `sudo systemctl stop cengbot-worker`; manual mode:
   `./scripts/stop_system.sh` stops all services) and start it again after
-  training. While the worker is stopped, users get the bot's fallback reply.
+  training. While the worker is stopped, users are told the answer is on its
+  way; it is posted as a reply if the worker is back within
+  `BOT_LATE_ANSWER_WINDOW` (10 min), otherwise the question stays unanswered.
 - **Output directory.** The new model is written to
   **`models/final-best-model-v<N>/`**, where `<N>` is the highest integer
   version in `models/` plus one: with v1, v1.1 and v1.2 present, the next one is
@@ -91,12 +93,18 @@ Check that `MODEL_PATH` is empty in `.env` (see above).
   directory is never overwritten unless you pass `--overwrite`, and the active
   model is never overwritten at all.
 - **Checkpoints** go to `checkpoints/final-best-model-v<N>/`. An interrupted
-  run can be resumed with `./scripts/train_model.sh --resume-from-checkpoint latest`.
+  run can be resumed with `./scripts/train_model.sh --resume-from-checkpoint latest`
+  (same `--output-name` / `--checkpoint-dir` as the interrupted run). It picks
+  the newest complete checkpoint, skips the database export and stops before
+  loading the model if the training data changed since the run started.
 - **Logs.** `logs/training/auto_training_<timestamp>.log` (wrapper output),
   `logs/training_history/v<K>.log` + `v<K>_info.json` and
   `logs/training_<timestamp>.log`. `<K>` is the *training session* number,
   which is counted separately from the model version `<N>`;
   `./scripts/view_training_history.sh list|view vK|compare vA vB|best` reads it.
+  `--log-dir DIR` puts all of these under `DIR` instead of `logs/` (read them with
+  `view_training_history.sh --log-dir DIR`). For a quick smoke run outside the
+  project: `--max-steps 5 --no-db-export --models-dir DIR --checkpoint-dir DIR --log-dir DIR`.
 - **End of a successful run.** The last lines are `FINAL_MODEL_DIR=.../models/final-best-model-v2`,
   then `train_model.sh` validates the directory and prints
   `The new model satisfies the model contract.` and the exact `switch` command.
@@ -185,9 +193,11 @@ Models are never deleted.
 
 **During the restart** the worker needs a few minutes to load the model.
 Questions asked meanwhile are not lost: they wait in RabbitMQ and are answered
-and stored in the database once the model is loaded. The users who asked them,
-however, get the bot's fallback reply in Telegram, because the bot waits only
-`BOT_ANSWER_TIMEOUT` seconds (default 30) for an answer. Switch at a quiet time.
+and stored in the database once the model is loaded. The askers are told after
+`BOT_ANSWER_TIMEOUT` seconds (default 30) that the answer is on its way, and it
+is posted as a reply when it arrives within `BOT_LATE_ANSWER_WINDOW` (10 min);
+questions older than that are not generated (`[auto]` note, admins can still
+answer them). Switch at a quiet time.
 
 ## 5. Kontrol et / Verify
 
@@ -269,7 +279,7 @@ sudo systemctl start cengbot-worker                          #    ... start the 
 **Step 9, benchmark.** Score every new model on the fixed 100-question
 benchmark and compare it with the earlier runs on
 [`benchmark/LEADERBOARD.md`](../benchmark/LEADERBOARD.md) (current baseline:
-Llama-3.2-3B + LoRA v1.2, 30.2/100 deterministic). The benchmark loads its own
+Llama-3.2-3B + LoRA v1.2, 29.1/100 deterministic, rubric det-v3). The benchmark loads its own
 copy of the model: a 3-4B model fits next to the running worker; for a 7B+
 model run it before step 8, while the worker is still stopped, with
 `--model-path models/final-best-model-v2`, which also shows the score before any
@@ -312,7 +322,7 @@ memory, and 4-bit inference of the same model at 2.3 GiB.
 | Base not cached, but the server must stay offline (any family, e.g. a Qwen or Phi model) | Download it once on a machine with network access, for example `.venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2.5-7B-Instruct', cache_dir='model_cache')"`, and copy the directory `model_cache/models--<org>--<name>` into the server's `model_cache/`. Or switch to a model whose base is already cached. |
 | `architecture '...' is not supported by the installed transformers` (warning), or the worker logs `this transformers version does not support the architecture` | The base is newer than the installed transformers (`config/requirements.txt` pins `<5`). Use a natively supported model from the table above, or upgrade transformers and test on the GPU before switching. |
 | `ships custom code (auto_map): loading it needs MODEL_TRUST_REMOTE_CODE=true` (warning), or the worker logs `needs custom code from its repository` | The repository needs remote code. Prefer a checkpoint that is native in transformers (for GLM the `-hf` or `-0414` variant). Only for a repository you trust: `MODEL_TRUST_REMOTE_CODE=true` in `.env` (and `--trust-remote-code` for training); this executes the repository's Python code. |
-| `CUDA out of memory` while training | Stop the worker first, train with `--load-in-4bit`, and/or use `--batch-size 2 --grad-accum 32` (same effective batch). |
+| `CUDA out of memory` while training | Stop the worker first, train with `--load-in-4bit`, and/or use `--batch-size 4 --grad-accum 16` or `--batch-size 2 --grad-accum 32` (same effective batch, same result, slower). Keep gradient checkpointing on (the default) next to the worker. |
 | `The AI worker exited right after starting` | Check `logs/worker.log`, then `./scripts/switch_model.sh rollback --yes`. |
 | Worker keeps logging `Model load failed ... Retrying in Ns` | The worker retries with exponential backoff (5 s up to 300 s) instead of exiting. Fix the cause shown in the log, or roll back. |
 | `models/active-model exists and is NOT a symlink` | Someone replaced the link with a directory. Move it away (`mv models/active-model models/<name>`), then `switch <name>`. |

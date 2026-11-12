@@ -1,9 +1,9 @@
-# 🔒 Production Security Checklist
+# Production Security Checklist
 
 Go through this list before the bot and the admin panel serve real users.
 Background: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md), [docs/API.md](docs/API.md).
 
-## ✅ Before going live
+## Before going live
 
 ### 1. Secrets and `.env`
 - [ ] `.env` created from `.env.example`, mode 600, owned by the service user
@@ -33,6 +33,9 @@ python3 -c "import hashlib,getpass; print(hashlib.sha256(getpass.getpass().encod
 - [ ] The panel and the API are reachable only through nginx **with HTTPS**
       (HTTP Basic sends the password with every request)
 - [ ] `CORS_ORIGINS` lists only the real panel origin(s)
+- [ ] Failed-login rate limiting left on (`ADMIN_LOGIN_MAX_FAILURES` > 0); if
+      nginx runs on another host, `FORWARDED_ALLOW_IPS` is set to its address
+      (otherwise every client counts as the proxy's IP)
 - [ ] The panel is built with the right `REACT_APP_API_URL` (`deploy_production.sh`
       uses `/api` behind its nginx site; `PANEL_API_URL` overrides it)
 - [ ] Firewall: only SSH, 80 and 443 (`deploy_production.sh --with-firewall`)
@@ -59,17 +62,22 @@ python3 -c "import hashlib,getpass; print(hashlib.sha256(getpass.getpass().encod
 - [ ] systemd units installed and enabled (`Restart=always`)
 - [ ] Log rotation installed (`./scripts/rotate_logs.sh --install-cron` or
       `sudo ./scripts/optimize_linux.sh --only logrotate`)
-- [ ] Backups scheduled (`./scripts/backup_data.sh`) and copied off the server
+- [ ] Backups scheduled (`./scripts/backup_data.sh`: online snapshot of the
+      WAL-mode database) and copied off the server; a restore deletes
+      `university_bot.db-wal` / `-shm` first (see docs/DEPLOYMENT.md)
 - [ ] `./scripts/health_check.sh` and `./scripts/test_environment.sh` pass
 - [ ] Test suite passes: `.venv/bin/python -m pytest`
 
-## 🛡️ What the code already does
+## What the code already does
 
 **Admin API and panel**
 - HTTP Basic auth on every data endpoint; public only `GET /`, a minimal
   `GET /health` and the OpenAPI docs
 - No default or hardcoded password; empty, placeholder or malformed values are
   treated as unset; constant-time comparison
+- Failed logins rate limited per client IP: 10 wrong passwords within 15
+  minutes lock the address out for 15 minutes (HTTP 429 + `Retry-After`;
+  `ADMIN_LOGIN_*`), also for credentials sent to `/health`
 - The document viewer serves only Markdown files, `logs/*.log` and
   `scripts/*.sh` (at most 1 MiB); never `.env`, the database or model files;
   no path traversal
@@ -97,18 +105,22 @@ python3 -c "import hashlib,getpass; print(hashlib.sha256(getpass.getpass().encod
 
 **Scripts**
 - No stored passwords; root actions use interactive `sudo`
-- System-wide changes are shown and confirmed first (`--dry-run`, `--yes`)
+- `setup_system.sh`, `optimize_linux.sh` and `deploy_production.sh` ask before
+  changing the system (`--dry-run`, `--yes`); `start_system.sh` installs/starts
+  RabbitMQ and `switch_model.sh` restarts a systemd worker through `sudo` without
+  a question
 - Only processes of this project are stopped (PIDs verified against the command line)
 
-## ⚠️ Known limitations
+## Known limitations
 
-- **No brute-force throttling** on admin logins and no rate limiting in the
-  API. Keep it behind the proxy; add rate limiting there if needed.
+- The failed-login limit is kept in memory per API process: a restart clears
+  it. Other requests are not rate limited; keep the API behind the proxy and
+  add limits there if needed.
 - The password hash is an unsalted SHA-256: use a long, random password.
 - HTTP Basic has no logout on the server side; closing the tab clears the
   panel's copy of the credentials.
 
-## 🔐 Emergency procedures
+## Emergency procedures
 
 ### Change the admin password
 ```bash

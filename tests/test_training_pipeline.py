@@ -7,6 +7,7 @@ Everything is offline: fake tokenizers, a tiny randomly initialised Llama
 """
 
 import json
+import random
 import os
 import shutil
 import subprocess
@@ -1198,58 +1199,136 @@ def _stub_error_handler(monkeypatch):
     return calls
 
 
-def test_main_resume_after_a_crash_matches_an_uninterrupted_run(tmp_path, monkeypatch):
-    from transformers import TrainerCallback
+class _TinyRun:
+    """CPU runs of main() on a tiny Llama (8 steps, eval + checkpoint every 2 steps) that
+    can crash right after a given checkpoint was written."""
 
-    _stub_error_handler(monkeypatch)
-    monkeypatch.setattr(tm, "_load_env", lambda: None)
-    monkeypatch.setattr(tm, "load_tokenizer", lambda cfg=None: fake_tokenizer())
-    monkeypatch.setattr(tm, "load_base_model", lambda cfg=None, precision=None: tiny_llama())
-    monkeypatch.delenv("TRAINING_VERSION", raising=False)
-    dataset = write_jsonl(tmp_path / "train.jsonl", synthetic_rows(n_groups=10, variants=4))
-    models, ckpts = tmp_path / "models", tmp_path / "ckpt"
+    def __init__(self, tmp_path, monkeypatch):
+        self.tmp, self.mp = tmp_path, monkeypatch
+        _stub_error_handler(monkeypatch)
+        monkeypatch.setattr(tm, "_load_env", lambda: None)
+        monkeypatch.setattr(tm, "load_tokenizer", lambda cfg=None: fake_tokenizer())
+        monkeypatch.setattr(tm, "load_base_model", lambda cfg=None, precision=None: tiny_llama())
+        monkeypatch.delenv("TRAINING_VERSION", raising=False)
+        self.dataset = write_jsonl(tmp_path / "train.jsonl", synthetic_rows(n_groups=10, variants=4))
+        self.models, self.ckpts = tmp_path / "models", tmp_path / "ckpt"
+        self.real_create_trainer = tm.create_trainer
 
-    def argv(name, *extra):
-        return ["--dataset", str(dataset), "--models-dir", str(models), "--checkpoint-dir", str(ckpts),
-                "--log-dir", str(tmp_path / "logs"), "--no-db-export", "--cpu", "--max-steps", "8",
+    def argv(self, name, *extra, db_export=False):
+        return ["--dataset", str(self.dataset), "--models-dir", str(self.models), "--checkpoint-dir",
+                str(self.ckpts), "--log-dir", str(self.tmp / "logs"), "--cpu", "--max-steps", "8",
                 "--batch-size", "4", "--grad-accum", "1", "--eval-batch-size", "4", "--val-ratio", "0.25",
                 "--evals-per-epoch", "4", "--logging-steps", "1", "--lora-r", "4", "--lora-alpha", "8",
-                "--output-name", name, *extra]
+                "--output-name", name, *([] if db_export else ["--no-db-export"]), *extra]
 
-    class Crash(TrainerCallback):  # the process dies right after checkpoint-4 was written
-        def on_save(self, args, state, control, **kwargs):
-            if state.global_step == 4:
-                raise RuntimeError("simulated crash")
+    def crash_after_checkpoint(self, name, step=4):
+        from transformers import TrainerCallback
 
-    real_create_trainer = tm.create_trainer
+        class Crash(TrainerCallback):  # the process dies right after checkpoint-<step> was written
+            def on_save(self, args, state, control, **kwargs):
+                if state.global_step == step:
+                    raise RuntimeError("simulated crash")
 
-    def crashing_create_trainer(*args, **kwargs):
-        trainer = real_create_trainer(*args, **kwargs)
-        trainer.add_callback(Crash())
-        return trainer
+        def crashing_create_trainer(*args, **kwargs):
+            trainer = self.real_create_trainer(*args, **kwargs)
+            trainer.add_callback(Crash())
+            return trainer
 
-    monkeypatch.setattr(tm, "create_trainer", crashing_create_trainer)
-    assert tm.main(argv("run")) == 1
-    run_dir = ckpts / "run"
-    assert sorted(p.name for p in run_dir.iterdir()) == ["checkpoint-2", "checkpoint-4"]
-    assert not (models / "run").exists()
-    monkeypatch.setattr(tm, "create_trainer", real_create_trainer)
+        self.mp.setattr(tm, "create_trainer", crashing_create_trainer)
+        try:
+            assert tm.main(self.argv(name)) == 1
+        finally:
+            self.mp.setattr(tm, "create_trainer", self.real_create_trainer)
+        return self.ckpts / name
+
+    def info(self, name):
+        return json.loads((self.models / name / "training_info.json").read_text(encoding="utf-8"))
+
+
+def test_main_resume_after_a_crash_matches_an_uninterrupted_run(tmp_path, monkeypatch):
+    run = _TinyRun(tmp_path, monkeypatch)
+    run_dir = run.crash_after_checkpoint("run")
+    assert sorted(p.name for p in run_dir.iterdir()) == ["checkpoint-2", "checkpoint-4", tm.DATA_FINGERPRINT_FILE]
+    assert not (run.models / "run").exists()
     # a checkpoint half-written by the crash must be skipped
     shutil.copytree(run_dir / "checkpoint-4", run_dir / "checkpoint-6")
     (run_dir / "checkpoint-6" / "trainer_state.json").unlink()
 
-    assert tm.main(argv("run", "--resume-from-checkpoint", "latest")) == 0
-    resumed = json.loads((models / "run" / "training_info.json").read_text(encoding="utf-8"))
+    assert tm.main(run.argv("run", "--resume-from-checkpoint", "latest")) == 0
+    resumed = run.info("run")
     assert resumed["resumed_from_checkpoint"] == str(run_dir / "checkpoint-4") and resumed["resumed_at_step"] == 4
     assert resumed["total_steps"] == 8 and resumed["max_steps"] == 8
 
-    assert tm.main(argv("reference")) == 0
-    reference = json.loads((models / "reference" / "training_info.json").read_text(encoding="utf-8"))
+    assert tm.main(run.argv("reference")) == 0
+    reference = run.info("reference")
     assert reference["resumed_from_checkpoint"] is None and reference["total_steps"] == 8
+    assert resumed["data_sha256"] == reference["data_sha256"]
     # same result as without the crash; the train loss is the whole-run mean, not the Trainer's
     # value for a resumed run (which is too low by resumed_at_step / total_steps)
     assert resumed["metrics"]["final_eval_loss"] == pytest.approx(reference["metrics"]["final_eval_loss"], abs=1e-3)
     assert resumed["final_loss"] == pytest.approx(reference["final_loss"], abs=1e-3)
+
+
+def test_resume_restores_the_early_stopping_patience_counter(tmp_path, monkeypatch):
+    run = _TinyRun(tmp_path, monkeypatch)
+    run_dir = run.crash_after_checkpoint("run")
+    # The interrupted run had already seen 2 evaluations without improvement (patience 3):
+    # the first non-improving evaluation after the resume (step 6) must stop training.
+    state_file = run_dir / "checkpoint-4" / "trainer_state.json"
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    early = state["stateful_callbacks"]["EarlyStoppingCallback"]
+    assert early["args"]["early_stopping_patience"] == 3
+    early["attributes"]["early_stopping_patience_counter"] = 2
+    state["best_metric"] = 0.0  # no later evaluation can beat it
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    assert tm.main(run.argv("run", "--resume-from-checkpoint", "latest")) == 0
+    assert run.info("run")["total_steps"] == 6  # without the restored counter: 8
+
+
+def test_resume_skips_the_db_export_and_refuses_changed_data(tmp_path, monkeypatch, capsys):
+    run = _TinyRun(tmp_path, monkeypatch)
+    exports = []
+    monkeypatch.setattr(tm, "run_database_export", lambda cfg: exports.append(cfg.resume_from_checkpoint))
+    run_dir = run.crash_after_checkpoint("run")
+
+    # The database changed while the run was down: a resume must not pick that up ...
+    rows = synthetic_rows(n_groups=11, variants=4)
+    write_jsonl(run.dataset, rows)
+    monkeypatch.setattr(tm, "load_base_model", lambda cfg=None, precision=None: pytest.fail("model must not load"))
+    assert tm.main(run.argv("run", "--resume-from-checkpoint", "latest", db_export=True)) == 1
+    assert exports == []  # no export on resume
+    err = capsys.readouterr().err
+    assert "training data differ from the interrupted run" in err and "train_examples 32 -> 36" in err
+    assert not (run.models / "run").exists()
+
+    # ... same data again: the resume works (a fresh run with export enabled does export)
+    write_jsonl(run.dataset, rows[:40])
+    monkeypatch.setattr(tm, "load_base_model", lambda cfg=None, precision=None: tiny_llama())
+    assert tm.main(run.argv("run", "--resume-from-checkpoint", "latest", db_export=True)) == 0
+    assert exports == [] and run.info("run")["resumed_at_step"] == 4
+    assert tm.main(run.argv("fresh", db_export=True)) == 0 and exports == [None]
+
+    # checkpoints of an older version (no fingerprint): resume with a warning
+    other = run.crash_after_checkpoint("old")
+    (other / tm.DATA_FINGERPRINT_FILE).unlink()
+    capsys.readouterr()
+    assert tm.main(run.argv("old", "--resume-from-checkpoint", str(other / "checkpoint-4"))) == 0
+    assert "cannot verify that the resumed run sees the same data" in capsys.readouterr().err
+
+
+def test_data_fingerprint_covers_order_ids_and_labels():
+    base = {"train": [{"input_ids": [1, 5, 6, 2], "labels": [-100, -100, 6, 2]},
+                      {"input_ids": [1, 7, 2], "labels": [-100, 7, 2]}],
+            "val_tr": [{"input_ids": [1, 9, 2], "labels": [-100, 9, 2]}], "val_en": []}
+    fp = tm.data_fingerprint(base)
+    assert fp["train_examples"] == 2 and fp["val_examples_turkish"] == 1 and fp["val_examples_english"] == 0
+    assert tm.data_fingerprint(json.loads(json.dumps(base))) == fp  # deterministic
+    reordered = dict(base, train=base["train"][::-1])
+    relabeled = dict(base, train=[base["train"][0], {"input_ids": [1, 7, 2], "labels": [-100, -100, 2]}])
+    moved = dict(base, train=base["train"] + base["val_tr"], val_tr=[])  # val example leaked into train
+    for changed in (reordered, relabeled, moved):
+        assert tm.data_fingerprint(changed)["sha256"] != fp["sha256"]
 
 
 def test_resume_latest_without_checkpoints_fails_before_loading_the_model(tmp_path, monkeypatch, capsys):
@@ -1476,3 +1555,259 @@ def test_augment_wrapper_output_option_reaches_the_augmenter(db_session, tmp_pat
     assert f"output_file: {tmp_path / 'out' / 'aug.jsonl'}" in proc.stdout
     assert "to_process: 1" in proc.stdout
     assert not (tmp_path / "out").exists() and not (root / ".augmentation_lock").exists()
+
+
+def test_common_abspath_is_caller_relative_and_expands_tilde(tmp_path):
+    script = f'source "{SCRIPTS}/_common.sh"; for p in "$@"; do abspath "$p"; echo; done'
+    home = tmp_path / "home"
+    proc = subprocess.run(["bash", "-c", script, "_", "rel/x", "/abs/y", "~/z", "~", "a~/b", "./c", ".", "./"],
+                          cwd=str(tmp_path), env=dict(os.environ, HOME=str(home), CENGBOT_ROOT=str(ROOT)),
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines() == [f"{tmp_path}/rel/x", "/abs/y", f"{home}/z", str(home), f"{tmp_path}/a~/b",
+                                        f"{tmp_path}/c", str(tmp_path), str(tmp_path)]
+
+
+def test_train_wrapper_makes_every_path_option_caller_relative(wrapper_project, tmp_path):
+    root, _ = wrapper_project
+    home, scratch = tmp_path / "home", tmp_path / "scratch"
+    (scratch / "local-base").mkdir(parents=True)
+    proc = _run_script(SCRIPTS / "train_model.sh", "--dry-run", "--cache-dir", "hf", "--log-dir=~/logs",
+                       "--resume-from-checkpoint", "ckpt/run/checkpoint-4", "--base-model=./local-base",
+                       "--max-steps", "5", root=root, cwd=scratch, HOME=home)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    argv = json.loads((root / "argv.json").read_text())
+
+    def value(flag):
+        return argv[argv.index(flag) + 1]
+
+    assert value("--cache-dir") == str(scratch / "hf")  # not <root>/hf (train_model.py runs in the root)
+    assert value("--log-dir") == str(home / "logs")      # "--opt=~/x" is not expanded by the shell
+    assert value("--resume-from-checkpoint") == str(scratch / "ckpt" / "run" / "checkpoint-4")
+    assert value("--base-model") == str(scratch / "local-base") and value("--max-steps") == "5"
+    # a Hugging Face id and "latest" are passed unchanged
+    proc = _run_script(SCRIPTS / "train_model.sh", "--dry-run", "--base-model", "Qwen/Qwen2.5-7B",
+                       "--resume-from-checkpoint=latest", root=root, cwd=scratch, HOME=home)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    argv = json.loads((root / "argv.json").read_text())
+    assert value("--base-model") == "Qwen/Qwen2.5-7B" and value("--resume-from-checkpoint") == "latest"
+    proc = _run_script(SCRIPTS / "train_model.sh", "--dry-run", "--resume-from-checkpoint", root=root, cwd=scratch)
+    assert proc.returncode != 0 and "needs 'latest' or a checkpoint directory" in proc.stderr
+
+
+def test_augment_wrapper_rejects_an_empty_output_and_expands_tilde(db_session, tmp_path):
+    _add_row(db_session, "Staj zorunlu mu?", "Evet, staj zorunludur.", "TR")
+    root, home = tmp_path / "proj", tmp_path / "home"
+    root.mkdir()
+    (root / "src").symlink_to(ROOT / "src")
+    proc = _run_script(SCRIPTS / "augment_training_data.sh", "--dry-run", "--output=", root=root, cwd=tmp_path)
+    assert proc.returncode == 1 and "--output needs a file" in proc.stdout + proc.stderr
+    proc = _run_script(SCRIPTS / "augment_training_data.sh", "--dry-run", "--output=~/aug.jsonl", root=root,
+                       cwd=tmp_path, HOME=home)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"output_file: {home / 'aug.jsonl'}" in proc.stdout
+
+
+def test_view_training_history_ranks_by_validation_loss(tmp_path):
+    hist = tmp_path / "logs" / "training_history"
+    hist.mkdir(parents=True)
+    sessions = {  # v1 has the lowest TRAIN loss but generalises worse than v2
+        "v1": {"final_loss": 0.40, "metrics": {"best_eval_loss": 0.75}, "model_dir_name": "final-best-model-v1"},
+        "v2": {"final_loss": 0.55, "metrics": {"best_eval_loss": 0.70}, "model_dir_name": "final-best-model-v2"},
+        "v3": {"final_loss": 0.30, "model_dir_name": "no-validation"},
+    }
+    for version, info in sessions.items():
+        (hist / f"{version}.log").write_text("line\n")
+        (hist / f"{version}_info.json").write_text(json.dumps({"version": version, **info}))
+    proc = _run_script(SCRIPTS / "view_training_history.sh", "--log-dir", tmp_path / "logs", "best", root=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Best performing model: v2 (final-best-model-v2) with best validation loss 0.7" in proc.stdout
+    ranking = proc.stdout[proc.stdout.index("All sessions"):]
+    assert ranking.index("v2 (") < ranking.index("v1 (") < ranking.index("v3 (")
+    proc = _run_script(SCRIPTS / "view_training_history.sh", "--log-dir", tmp_path / "logs", "compare", "v1", "v2",
+                       root=tmp_path)
+    assert "Best Val Loss:      0.75         0.7" in proc.stdout
+    assert "Improvement (validation loss): 6.67% (better)" in proc.stdout
+    proc = _run_script(SCRIPTS / "view_training_history.sh", "--log-dir", tmp_path / "logs", "compare", "v1", "v3",
+                       root=tmp_path)
+    assert "Improvement (train loss): 25.00% (better)" in proc.stdout  # no validation loss on one side
+
+
+# ---------------------------------------------------------------------------
+# Training speed (phase B): one eval pass, sorted eval, length grouping, flags
+# ---------------------------------------------------------------------------
+def _encoded(tok, rows):
+    out = []
+    for row in rows:
+        feats, status = tm.encode_example(tok, row["question"], row["answer"], row["language"], 512)
+        assert status == "ok"
+        out.append(feats)
+    return out
+
+
+def test_eval_dataset_is_one_set_sorted_longest_first_with_a_lang_column():
+    tok = fake_tokenizer()
+    rows = synthetic_rows(n_groups=4, variants=3)
+    tr = _encoded(tok, [r for r in rows if r["language"] == "turkish"])
+    en = _encoded(tok, [r for r in rows if r["language"] == "english"])
+    tr[0]["input_ids"] = tr[0]["input_ids"] + [7] * 40  # make one Turkish example the longest
+    tr[0]["attention_mask"] = [1] * len(tr[0]["input_ids"])
+    tr[0]["labels"] = tr[0]["labels"] + [7] * 40
+    ds = tm.build_eval_dataset(tr, en)
+    lengths = [len(x) for x in ds["input_ids"]]
+    assert lengths == sorted(lengths, reverse=True) and len(ds) == len(tr) + len(en)
+    assert ds["lang"][0] == tm.LANG_IDS["turkish"] and sorted(ds["lang"]).count(1) == len(en)
+    assert tm.build_eval_dataset([], []) is None
+    batch = tm.CausalLMCollator(tok.pad_token_id)([ds[0], ds[1]])
+    assert batch["lang"].tolist() == ds["lang"][:2]  # passed through as a tensor
+    assert "lang" not in tm.CausalLMCollator(tok.pad_token_id)([{k: v for k, v in ds[0].items() if k != "lang"}])
+
+
+def test_one_eval_pass_gives_token_weighted_eval_loss_and_per_language_losses(tmp_path):
+    tok = fake_tokenizer()
+    rows = synthetic_rows(n_groups=6, variants=3)
+    tr = _encoded(tok, [r for r in rows if r["language"] == "turkish"])
+    en = _encoded(tok, [r for r in rows if r["language"] == "english"])
+    cfg = tm.Config(force_cpu=True, lora_r=4, lora_alpha=8, per_device_eval_batch_size=4,
+                    per_device_train_batch_size=4, gradient_accumulation_steps=1, max_steps=1)
+    model = tm.apply_lora(tiny_llama(), cfg)
+    eval_ds = tm.build_eval_dataset(tr, en)
+    trainer = tm.create_trainer(model, tok, tm.to_hf_dataset(tr + en), eval_ds, cfg=cfg,
+                                run_dir=str(tmp_path / "run"), precision=tm.detect_precision(True))
+    calls = []
+    handle = model.base_model.model.model.register_forward_hook(lambda *a: calls.append(1))
+    metrics = trainer.evaluate()
+    handle.remove()
+    assert len(calls) == -(-len(eval_ds) // 4)  # exactly one forward per eval batch, no second pass
+
+    def reference(examples):  # token-weighted mean, one example at a time
+        total, n = 0.0, 0
+        model.eval()
+        with torch.no_grad():
+            for ex in examples:
+                labels = torch.tensor([ex["labels"]])
+                out = model(input_ids=torch.tensor([ex["input_ids"]]), labels=labels)
+                k = int((labels[:, 1:] != tm.IGNORE_INDEX).sum())
+                total, n = total + out.loss.item() * k, n + k
+        return total / n
+
+    assert metrics["eval_loss_turkish"] == pytest.approx(reference(tr), rel=1e-4)
+    assert metrics["eval_loss_english"] == pytest.approx(reference(en), rel=1e-4)
+    assert metrics["eval_loss"] == pytest.approx(reference(tr + en), rel=1e-4)
+
+
+def test_step_sorted_sampler_keeps_the_random_steps_and_sorts_inside_them():
+    from accelerate.data_loader import SeedableRandomSampler
+
+    rng = random.Random(1)
+    lengths = [rng.randint(30, 470) for _ in range(2000)]
+    sampler = tm.StepSortedRandomSampler(lengths, step_size=64, seed=42)
+    for epoch in (0, 1):
+        sampler.set_epoch(epoch)
+        ours = list(sampler)
+        reference = SeedableRandomSampler(range(2000), data_seed=42)  # what the Trainer uses without sorting
+        reference.set_epoch(epoch)
+        theirs = list(reference)
+        assert sorted(ours) == list(range(2000))
+        for k in range(0, 2000, 64):  # every optimizer step: the same examples ...
+            step = ours[k:k + 64]
+            assert set(step) == set(theirs[k:k + 64])
+            assert [lengths[i] for i in step] == sorted((lengths[i] for i in step), reverse=True)  # ... sorted
+    sampler.set_epoch(0)
+    first = list(sampler)
+    torch.manual_seed(123)  # no global RNG involved
+    assert list(tm.StepSortedRandomSampler(lengths, 64, seed=42)) == first == list(sampler)
+
+    def padding(order, bs=8):
+        return sum(max(lengths[i] for i in order[k:k + bs]) * len(order[k:k + bs]) for k in range(0, len(order), bs))
+
+    assert padding(first) < 0.85 * padding(theirs)  # micro-batches of similar length
+
+
+def test_sorting_inside_steps_does_not_change_training(tmp_path, monkeypatch):
+    """Same examples per optimizer step, gradients summed over the step: with dropout
+    off, a run with sorted micro-batches ends with the same model as random order."""
+    run = _TinyRun(tmp_path, monkeypatch)
+    for name, flag in (("sorted", "--sort-by-length"), ("random", "--no-sort-by-length")):
+        assert tm.main(run.argv(name, flag, "--lora-dropout", "0", "--batch-size", "2", "--grad-accum", "2")) == 0
+    sorted_info, random_info = run.info("sorted"), run.info("random")
+    assert sorted_info["sort_by_length"] is True and random_info["sort_by_length"] is False
+    for key in ("final_eval_loss", "final_eval_loss_turkish", "final_eval_loss_english"):
+        assert sorted_info["metrics"][key] == pytest.approx(random_info["metrics"][key], abs=1e-4)
+    assert sorted_info["final_loss"] == pytest.approx(random_info["final_loss"], abs=1e-3)
+
+
+def test_speed_flags_cli_env_and_defaults(monkeypatch):
+    monkeypatch.delenv("TRAINING_SORT_BY_LENGTH", raising=False)
+    monkeypatch.delenv("TRAINING_GRADIENT_CHECKPOINTING", raising=False)
+    cfg = tm.build_config(tm.parse_args([]))
+    assert cfg.sort_by_length is tm.Config.sort_by_length
+    assert cfg.gradient_checkpointing is tm.Config.gradient_checkpointing
+    cfg = tm.build_config(tm.parse_args(["--no-sort-by-length", "--no-gradient-checkpointing"]))
+    assert cfg.sort_by_length is False and cfg.gradient_checkpointing is False
+    monkeypatch.setenv("TRAINING_GRADIENT_CHECKPOINTING", "off")
+    monkeypatch.setenv("TRAINING_SORT_BY_LENGTH", "false")
+    cfg = tm.build_config(tm.parse_args([]))
+    assert cfg.gradient_checkpointing is False and cfg.sort_by_length is False
+    cfg = tm.build_config(tm.parse_args(["--gradient-checkpointing", "--sort-by-length"]))  # CLI wins
+    assert cfg.gradient_checkpointing is True and cfg.sort_by_length is True
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_gradient_checkpointing_flag_reaches_model_and_trainer(tmp_path, enabled):
+    cfg = tm.Config(force_cpu=True, lora_r=4, lora_alpha=8, gradient_checkpointing=enabled)
+    model = tm.apply_lora(tiny_llama(), cfg)
+    assert model.base_model.model.is_gradient_checkpointing is enabled
+    args = tm.build_training_arguments(cfg, str(tmp_path / "r"), 40, True, tm.detect_precision(True))
+    assert args.gradient_checkpointing is enabled
+
+
+def test_main_evaluates_once_per_eval_step_and_reuses_the_best_eval(tmp_path, monkeypatch):
+    run = _TinyRun(tmp_path, monkeypatch)
+    evaluations, samplers = [], []
+
+    def counting_create_trainer(*args, **kwargs):
+        trainer = run.real_create_trainer(*args, **kwargs)
+        real_evaluate = trainer.evaluate
+
+        def evaluate(*a, **k):
+            evaluations.append(trainer.state.global_step)
+            return real_evaluate(*a, **k)
+
+        trainer.evaluate = evaluate
+        samplers.append(type(trainer._get_train_sampler()).__name__)
+        return trainer
+
+    monkeypatch.setattr(tm, "create_trainer", counting_create_trainer)
+    assert tm.main(run.argv("run")) == 0
+    info = run.info("run")
+    assert evaluations == [2, 4, 6, 8]  # one per eval step, no final re-evaluation
+    assert samplers == ["StepSortedRandomSampler"]  # sorting inside steps is on by default
+    metrics = info["metrics"]
+    assert metrics["final_eval_loss"] == metrics["best_eval_loss"]
+    assert metrics["final_eval_step"] in (2, 4, 6, 8)
+    assert metrics["final_eval_loss_turkish"] is not None and metrics["final_eval_loss_english"] is not None
+    assert metrics["eval_loss_definition"] == tm.EVAL_LOSS_DEFINITION
+    assert info["sort_by_length"] is True and info["gradient_checkpointing"] is tm.Config.gradient_checkpointing
+    history = (run.ckpts / "run" / "metrics_history.csv").read_text()
+    assert "eval_loss_turkish" in history and "eval_loss_english" in history
+
+
+def test_final_eval_metrics_pick_the_best_checkpoint_entry():
+    state = SimpleNamespace(best_model_checkpoint="/x/run/checkpoint-4", log_history=[
+        {"eval_loss": 2.0, "eval_loss_turkish": 2.1, "step": 2}, {"loss": 1.5, "step": 4},
+        {"eval_loss": 1.0, "eval_loss_turkish": 1.1, "step": 4}, {"eval_loss": 1.2, "step": 6}])
+    assert tm.final_eval_metrics(state)["eval_loss_turkish"] == 1.1
+    assert tm.final_eval_metrics(SimpleNamespace(best_model_checkpoint=None, log_history=state.log_history)) == {}
+
+
+def test_main_asks_for_expandable_cuda_segments_unless_configured(tmp_path, monkeypatch):
+    monkeypatch.setattr(tm, "_load_env", lambda: None)
+    monkeypatch.setattr(tm, "load_tokenizer", lambda cfg=None: fake_tokenizer())
+    dataset = write_jsonl(tmp_path / "d.jsonl", synthetic_rows(n_groups=4, variants=2))
+    argv = ["--dataset", str(dataset), "--no-db-export", "--cpu", "--dry-run", "--log-dir", str(tmp_path / "logs")]
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    assert tm.main(argv) == 0
+    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")  # an explicit setting wins
+    assert tm.main(argv) == 0 and os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:128"

@@ -69,6 +69,7 @@ import shutil
 import sys
 import time
 import warnings
+from array import array
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -152,12 +153,15 @@ class Config:
     # Model
     model_name: str = DEFAULT_BASE_MODEL
 
-    # Training (effective batch size = 4 * 16 = 64)
+    # Training (effective batch size = 8 * 8 = 64). The micro-batch split does not
+    # change the step's gradient (summed over the micro-batches, normalised by the
+    # step's answer tokens); 8 x 8 instead of 4 x 16 cut the RTX 3090 step time
+    # from 6.4 s to 4.4 s at 10.9 GiB peak (fits next to the ~7 GB inference worker).
     num_epochs: int = 4
     max_steps: int = -1  # > 0: stop after this many optimizer steps (overrides num_epochs)
-    per_device_train_batch_size: int = 4
+    per_device_train_batch_size: int = 8
     per_device_eval_batch_size: int = 16
-    gradient_accumulation_steps: int = 16
+    gradient_accumulation_steps: int = 8
     learning_rate: float = 2e-4
     warmup_ratio: float = 0.05
     weight_decay: float = 0.01
@@ -182,7 +186,11 @@ class Config:
     force_cpu: bool = False
     semantic_dedup: bool = False
     export_from_db: bool = True
-    dataloader_num_workers: int = 4
+    # The data is tokenized in memory and collation is trivial: worker processes
+    # measured no faster (0: 5.97, 2: 6.22, 4: 6.09 s/step on the RTX 3090).
+    dataloader_num_workers: int = 0
+    sort_by_length: bool = True  # micro-batches of similar length inside each step (StepSortedRandomSampler)
+    gradient_checkpointing: bool = True
     logging_steps: int = 10
     save_total_limit: int = 3
     resume_from_checkpoint: Optional[str] = None
@@ -787,7 +795,8 @@ def check_tokenization_consistency(tokenizer, records: Sequence[Dict[str, Any]],
 class CausalLMCollator:
     """Right-pads input_ids/attention_mask/labels. Labels are padded with -100,
     so padding (pad == eos for tokenizers without a pad token) never hides the
-    real EOS label."""
+    real EOS label. A ``lang`` field (evaluation: 0 Turkish, 1 English) is passed
+    through as a tensor."""
 
     def __init__(self, pad_token_id: int, pad_to_multiple_of: Optional[int] = 8, label_pad_token_id: int = IGNORE_INDEX):
         if pad_token_id is None:
@@ -813,23 +822,46 @@ class CausalLMCollator:
             input_ids.append(r["input_ids"] + [self.pad_token_id] * pad)
             attention.append(r["attention_mask"] + [0] * pad)
             labels.append(r["labels"] + [self.label_pad_token_id] * pad)
-        return {
+        batch = {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
         }
+        if features and all("lang" in f for f in features):
+            batch["lang"] = torch.tensor([int(f["lang"]) for f in features], dtype=torch.long)
+        return batch
 
 
-def to_hf_dataset(encoded: Sequence[Dict[str, List[int]]]):
+LANG_IDS = {"turkish": 0, "english": 1}
+
+
+def to_hf_dataset(encoded: Sequence[Dict[str, List[int]]], langs: Optional[Sequence[int]] = None):
+    """HF dataset of encoded examples (+ a ``lang`` column for evaluation)."""
     from datasets import Dataset
 
-    return Dataset.from_dict(
-        {
-            "input_ids": [e["input_ids"] for e in encoded],
-            "attention_mask": [e["attention_mask"] for e in encoded],
-            "labels": [e["labels"] for e in encoded],
-        }
-    )
+    columns: Dict[str, Any] = {
+        "input_ids": [e["input_ids"] for e in encoded],
+        "attention_mask": [e["attention_mask"] for e in encoded],
+        "labels": [e["labels"] for e in encoded],
+    }
+    if langs is not None:
+        columns["lang"] = list(langs)
+    return Dataset.from_dict(columns)
+
+
+def build_eval_dataset(val_tr: Sequence[Dict[str, List[int]]], val_en: Sequence[Dict[str, List[int]]]):
+    """One evaluation set for both languages, longest examples first.
+
+    Sorted by length, every eval batch holds similar lengths (about 4% padding
+    instead of about 40% in random order); longest first, so an out-of-memory
+    shows up in the first batch. The order does not change any metric: the
+    losses are token-weighted sums. None if there is no validation data.
+    """
+    rows = [(e, LANG_IDS["turkish"]) for e in val_tr] + [(e, LANG_IDS["english"]) for e in val_en]
+    if not rows:
+        return None
+    rows.sort(key=lambda r: len(r[0]["input_ids"]), reverse=True)  # stable: deterministic
+    return to_hf_dataset([r[0] for r in rows], langs=[r[1] for r in rows])
 
 
 # ---------------------------------------------------------------------------
@@ -846,73 +878,128 @@ class SimpleProgressCallback(TrainerCallback):
         if train_loss is not None:
             logger.info("Step %s/%s - Train Loss: %.4f", state.global_step, state.max_steps, train_loss)
         if eval_loss is not None:
-            logger.info("Step %s/%s - Eval Loss: %.4f", state.global_step, state.max_steps, eval_loss)
+            per_lang = ", ".join(f"{short} {logs[f'eval_loss_{name}']:.4f}"
+                                 for name, short in (("turkish", "TR"), ("english", "EN"))
+                                 if isinstance(logs.get(f"eval_loss_{name}"), (int, float)))
+            logger.info("Step %s/%s - Eval Loss: %.4f%s (%.0fs)", state.global_step, state.max_steps, eval_loss,
+                        f" ({per_lang})" if per_lang else "", logs.get("eval_runtime") or 0)
 
 
-class DualLanguageEvalCallback(TrainerCallback):
-    """Separate TR/EN validation loss (token-weighted, answer tokens only)."""
+# eval_loss of this script since 2026-11-12 (recorded in training_info.json); older
+# runs reported the Trainer's mean of per-batch means, which weighs short batches more.
+EVAL_LOSS_DEFINITION = "token-weighted mean over all answer+EOS tokens"
 
-    def __init__(self, eval_dataset_tr, eval_dataset_en, tokenizer, batch_size: Optional[int] = None, collator=None):
-        self.eval_dataset_tr = eval_dataset_tr
-        self.eval_dataset_en = eval_dataset_en
-        self.tokenizer = tokenizer
-        self.batch_size = batch_size or config.per_device_eval_batch_size
-        self.collator = collator or CausalLMCollator(tokenizer.pad_token_id)
-        self.metrics_history: List[Dict[str, Any]] = []
 
-    def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
-        if model is None:
-            return control
-        was_training = model.training
-        model.eval()
-        try:
-            tr_loss = self._calculate_loss(model, self.eval_dataset_tr)
-            en_loss = self._calculate_loss(model, self.eval_dataset_en)
-        finally:
-            if was_training:
-                model.train()
-        entry: Dict[str, Any] = {"step": state.global_step}
-        if tr_loss is not None:
-            entry["eval_loss_turkish"] = tr_loss
-        if en_loss is not None:
-            entry["eval_loss_english"] = en_loss
-        if len(entry) == 1:
-            return control
-        self.metrics_history.append(entry)
-        if metrics is not None:
-            metrics.update({k: v for k, v in entry.items() if k != "step"})
-        logger.info(
-            "Step %s: TR loss: %s, EN loss: %s",
-            state.global_step,
-            f"{tr_loss:.4f}" if tr_loss is not None else "n/a",
-            f"{en_loss:.4f}" if en_loss is not None else "n/a",
-        )
-        return control
+def answer_token_loss_sums(logits: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per example: (sum of the answer-token losses, number of answer tokens).
 
-    def _calculate_loss(self, model, dataset) -> Optional[float]:
-        """Token-weighted average loss over the answer tokens of ``dataset``."""
-        if dataset is None or len(dataset) == 0:
-            return None
-        from torch.utils.data import DataLoader
+    Same shift and masking as the causal LM loss of the model; only the label
+    positions are up-cast to float32 (not the whole logits tensor).
+    """
+    shift_labels = labels[:, 1:]
+    mask = shift_labels != IGNORE_INDEX
+    token_losses = torch.nn.functional.cross_entropy(
+        logits[:, :-1, :][mask].float(), shift_labels[mask], reduction="none")
+    example_of_token = mask.nonzero(as_tuple=True)[0]
+    sums = torch.zeros(labels.size(0), dtype=torch.float64, device=logits.device)
+    sums.index_add_(0, example_of_token, token_losses.double())
+    return sums, mask.sum(dim=1)
 
-        device = next(model.parameters()).device
-        loader = DataLoader(dataset, batch_size=self.batch_size, collate_fn=self.collator, shuffle=False)
-        total_loss, total_tokens = 0.0, 0
-        with torch.no_grad():
-            for batch in loader:
-                labels = batch["labels"].to(device)
-                outputs = model(
-                    input_ids=batch["input_ids"].to(device),
-                    attention_mask=batch["attention_mask"].to(device),
-                    labels=labels,
-                )
-                # Causal LM loss is the mean over shifted (predicted) label tokens.
-                n_tokens = int((labels[:, 1:] != IGNORE_INDEX).sum().item())
-                if n_tokens == 0:
-                    continue
-                total_loss += float(outputs.loss.item()) * n_tokens
-                total_tokens += n_tokens
-        return total_loss / total_tokens if total_tokens else None
+
+class StepSortedRandomSampler(torch.utils.data.Sampler):
+    """Random training order with micro-batches of similar length.
+
+    The permutation is the one the Trainer's default sampler draws
+    (``torch.randperm`` seeded with ``seed + epoch``, like accelerate's
+    ``SeedableRandomSampler``), so every optimizer step (``step_size`` =
+    micro-batch x gradient accumulation examples) trains on exactly the same
+    examples as without sorting: the step's gradient (summed over its
+    micro-batches and normalised by its answer tokens) does not change. Only
+    inside a step are the examples ordered by length, longest first, so its
+    micro-batches carry little padding (real data, micro-batch 8: 14% instead of
+    54%). ``transformers``' ``group_by_length`` was not used: it puts similar
+    lengths into the same *step*, which measurably raised the validation loss.
+    Deterministic per epoch, so a resumed run replays the same order.
+    """
+
+    def __init__(self, lengths: Sequence[int], step_size: int, seed: int = 42):
+        self.lengths = [int(n) for n in lengths]
+        self.step_size = max(1, int(step_size))
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:  # called by the Trainer (via accelerate) every epoch
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return len(self.lengths)
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        order = torch.randperm(len(self.lengths), generator=generator).tolist()
+        sorted_steps: List[int] = []
+        for start in range(0, len(order), self.step_size):
+            sorted_steps.extend(sorted(order[start:start + self.step_size], key=lambda i: -self.lengths[i]))
+        return iter(sorted_steps)
+
+
+@lru_cache(maxsize=1)
+def cengbot_trainer_class():
+    """``transformers.Trainer`` subclass (built lazily: importing Trainer costs ~3 s).
+
+    * One evaluation pass yields ``eval_loss`` and the Turkish/English losses: eval
+      batches carry a ``lang`` column and the answer-token loss sums are tallied
+      per language inside the Trainer's own loop (no second pass over the data).
+      ``eval_loss`` is the token-weighted mean (``EVAL_LOSS_DEFINITION``).
+    * ``train_lengths`` set: a ``StepSortedRandomSampler`` for training.
+    """
+    from transformers import Trainer
+
+    class CengBotTrainer(Trainer):
+        train_lengths: Optional[List[int]] = None
+        _eval_sums: Optional[torch.Tensor] = None
+
+        def _get_train_sampler(self, train_dataset=None):
+            if self.train_lengths is None:
+                return super()._get_train_sampler(train_dataset)
+            seed = self.args.data_seed if self.args.data_seed is not None else self.args.seed
+            return StepSortedRandomSampler(
+                self.train_lengths, self.args.train_batch_size * self.args.gradient_accumulation_steps, seed)
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            lang = inputs.pop("lang", None)
+            if self._eval_sums is None or lang is None:
+                return super().compute_loss(model, inputs, return_outputs=return_outputs,
+                                            num_items_in_batch=num_items_in_batch)
+            labels = inputs.pop("labels")
+            outputs = model(**inputs)
+            example_sums, example_tokens = answer_token_loss_sums(outputs.logits, labels)
+            self._eval_sums[0].index_add_(0, lang, example_sums)
+            self._eval_sums[1].index_add_(0, lang, example_tokens.double())
+            loss = example_sums.sum() / example_tokens.sum().clamp(min=1)
+            return (loss, outputs) if return_outputs else loss
+
+        def evaluation_loop(self, dataloader, description, prediction_loss_only=None, ignore_keys=None,
+                            metric_key_prefix="eval"):
+            self._eval_sums = torch.zeros(2, len(LANG_IDS), dtype=torch.float64, device=self.args.device)
+            try:
+                output = super().evaluation_loop(dataloader, description, prediction_loss_only, ignore_keys,
+                                                 metric_key_prefix)
+                sums = self._eval_sums
+                if self.args.world_size > 1:
+                    sums = self.accelerator.reduce(sums, reduction="sum")
+                loss_sums, tokens = sums.tolist()
+            finally:
+                self._eval_sums = None
+            if sum(tokens):
+                output.metrics[f"{metric_key_prefix}_loss"] = sum(loss_sums) / sum(tokens)
+                for name, idx in LANG_IDS.items():
+                    if tokens[idx]:
+                        output.metrics[f"{metric_key_prefix}_loss_{name}"] = loss_sums[idx] / tokens[idx]
+            return output
+
+    return CengBotTrainer
 
 
 # ---------------------------------------------------------------------------
@@ -1231,9 +1318,10 @@ def apply_lora(model, cfg: Optional[Config] = None, target_modules: Any = None):
         target_modules, _ = resolve_lora_target_modules(model, cfg.lora_target_modules)
     if cfg.load_in_4bit:
         model = prepare_model_for_kbit_training(
-            model, use_gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False}
+            model, use_gradient_checkpointing=cfg.gradient_checkpointing,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
         )
-    else:
+    elif cfg.gradient_checkpointing:
         # prepare_model_for_kbit_training would up-cast the whole bf16 model to fp32.
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.enable_input_require_grads()
@@ -1321,7 +1409,7 @@ def build_training_arguments(cfg: Config, run_dir: str, n_train: int, has_eval: 
         report_to=[],
         run_name=f"cengbot-{datetime.now().strftime('%Y%m%d-%H%M')}",
         label_names=["labels"],  # PeftModel hides forward() args; without this eval_loss can go missing
-        gradient_checkpointing=True,
+        gradient_checkpointing=cfg.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         optim="adamw_torch_fused" if precision["cuda"] else "adamw_torch",
         adam_beta1=0.9,
@@ -1331,6 +1419,9 @@ def build_training_arguments(cfg: Config, run_dir: str, n_train: int, has_eval: 
         seed=cfg.seed,
         data_seed=cfg.seed,
         use_cpu=not precision["cuda"],
+        # --resume-from-checkpoint also restores the early-stopping patience counter
+        # (saved in every checkpoint, ignored by the Trainer by default).
+        restore_callback_states_from_checkpoint=True,
     )
     if precision["tf32"]:
         kwargs["tf32"] = True
@@ -1356,13 +1447,12 @@ def create_trainer(
     tokenizer,
     train_dataset,
     eval_dataset,
-    eval_dataset_tr,
-    eval_dataset_en,
     cfg: Optional[Config] = None,
     run_dir: Optional[str] = None,
     precision: Optional[Dict[str, Any]] = None,
 ):
-    """Create the HF Trainer (answer-only loss collator, early stopping, TR/EN eval)."""
+    """Create the Trainer (answer-only loss collator, early stopping, one eval pass with
+    TR/EN losses: ``eval_dataset`` from ``build_eval_dataset``, with a ``lang`` column)."""
     from transformers import EarlyStoppingCallback, Trainer
 
     cfg = cfg or config
@@ -1375,14 +1465,6 @@ def create_trainer(
     callbacks: List[TrainerCallback] = [SimpleProgressCallback()]
     if has_eval:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=cfg.early_stopping_patience))
-        has_tr = eval_dataset_tr is not None and len(eval_dataset_tr) > 0
-        has_en = eval_dataset_en is not None and len(eval_dataset_en) > 0
-        if has_tr or has_en:
-            callbacks.append(
-                DualLanguageEvalCallback(
-                    eval_dataset_tr, eval_dataset_en, tokenizer, batch_size=cfg.per_device_eval_batch_size, collator=collator
-                )
-            )
 
     trainer_kwargs: Dict[str, Any] = dict(
         model=model,
@@ -1396,7 +1478,10 @@ def create_trainer(
         trainer_kwargs["processing_class"] = tokenizer
     else:  # pragma: no cover - transformers < 4.46
         trainer_kwargs["tokenizer"] = tokenizer
-    return Trainer(**trainer_kwargs)
+    trainer = cengbot_trainer_class()(**trainer_kwargs)
+    if cfg.sort_by_length:
+        trainer.train_lengths = [len(ids) for ids in train_dataset["input_ids"]]
+    return trainer
 
 
 # ---------------------------------------------------------------------------
@@ -1517,6 +1602,65 @@ def whole_run_train_loss(train_loss: Optional[float], global_step: int, resumed_
         return session_sum / (global_step - resumed_at_step)
     before_mean = sum(loss * w for loss, w in windows) / weight
     return (before_mean * resumed_at_step + session_sum) / global_step
+
+
+def final_eval_metrics(state) -> Dict[str, Any]:
+    """The logged evaluation of the checkpoint the run ends with: the best one
+    (``load_best_model_at_end``). Empty if it cannot be identified."""
+    best = getattr(state, "best_model_checkpoint", None)
+    match = _CHECKPOINT_RE.fullmatch(Path(best).name) if best else None
+    if match is None:
+        return {}
+    step = int(match.group(1))
+    logged = [entry for entry in state.log_history if "eval_loss" in entry and entry.get("step") == step]
+    return dict(logged[-1]) if logged else {}
+
+
+DATA_FINGERPRINT_FILE = "data_fingerprint.json"
+
+
+def data_fingerprint(data: Dict[str, Any]) -> Dict[str, Any]:
+    """SHA-256 of the tokenized train/validation split (ids + labels, in order).
+
+    Written next to the checkpoints of a run; a resumed run must see exactly the
+    same examples, otherwise the Trainer would skip batches of a different data
+    order and validation examples could leak into training.
+    """
+    digest = hashlib.sha256()
+    counts: Dict[str, int] = {}
+    for part in ("train", "val_tr", "val_en"):
+        rows = data.get(part) or []
+        counts[part] = len(rows)
+        digest.update(f"{part}:{len(rows)};".encode())
+        for row in rows:
+            ids, labels = row["input_ids"], row["labels"]
+            digest.update(len(ids).to_bytes(4, "little"))
+            digest.update(array("q", ids).tobytes())
+            digest.update(array("q", labels).tobytes())
+    return {"sha256": digest.hexdigest(), "train_examples": counts["train"],
+            "val_examples_turkish": counts["val_tr"], "val_examples_english": counts["val_en"]}
+
+
+def check_resume_data(checkpoint: str, fingerprint: Dict[str, Any]) -> None:
+    """Raise if the data differ from the run that wrote ``checkpoint`` (its
+    ``data_fingerprint.json`` lives next to it). Older runs without one: warning only."""
+    path = Path(checkpoint).parent / DATA_FINGERPRINT_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        logger.warning("No readable %s next to %s - cannot verify that the resumed run sees the same data",
+                       DATA_FINGERPRINT_FILE, checkpoint)
+        return
+    if saved.get("sha256") == fingerprint["sha256"]:
+        return
+    counts = ", ".join(f"{k} {saved.get(k)} -> {fingerprint[k]}" for k in fingerprint if k != "sha256")
+    raise ValueError(
+        f"--resume-from-checkpoint {checkpoint}: the training data differ from the interrupted run ({counts}). "
+        "Resuming would continue on another train/validation split and data order. Use the same dataset files "
+        "and --val-ratio/--seed/--max-length/--truncation/--semantic-dedup as that run (the database export is "
+        "skipped on resume), or start a new run without --resume-from-checkpoint."
+    )
 
 
 def resolve_resume_checkpoint(value: Optional[str], run_dir: str) -> Optional[str]:
@@ -1730,10 +1874,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Execute Python code from the model repository (env MODEL_TRUST_REMOTE_CODE). SECURITY RISK - "
                         "only for legacy remote-code models (chatglm3, internlm2) from repositories you trust")
     p.add_argument("--cpu", action="store_true", help="Force CPU (debugging only)")
-    p.add_argument("--workers", type=int, default=d.dataloader_num_workers, help="DataLoader workers (GPU runs)")
+    p.add_argument("--workers", type=int, default=d.dataloader_num_workers,
+                   help=f"DataLoader worker processes (GPU runs; default {d.dataloader_num_workers})")
+    p.add_argument("--sort-by-length", action=argparse.BooleanOptionalAction, default=None,
+                   help="Order the examples of each optimizer step by length: micro-batches with little "
+                        "padding, the same examples per step as random order (env TRAINING_SORT_BY_LENGTH). "
+                        f"Default: {'on' if d.sort_by_length else 'off'}")
+    p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=None,
+                   help="Recompute activations in the backward pass: less GPU memory, slower "
+                        f"(env TRAINING_GRADIENT_CHECKPOINTING). Default: {'on' if d.gradient_checkpointing else 'off'}")
     p.add_argument("--semantic-dedup", action="store_true", help="Also remove near-duplicates (sentence-transformers)")
     p.add_argument("--no-db-export", action="store_true", help="Do not refresh data/cengbot_qa_augmented.jsonl from the DB")
-    p.add_argument("--resume-from-checkpoint", default=None, help="Resume from a checkpoint dir (or 'latest')")
+    p.add_argument("--resume-from-checkpoint", default=None,
+                   help="Resume from a checkpoint dir, or 'latest' (newest complete one of this --output-name); "
+                        "skips the DB export and stops if the training data changed")
     p.add_argument("--overwrite", action="store_true", help="Overwrite an existing (non-active) model dir")
     p.add_argument("--dry-run", action="store_true",
                    help="Load, clean, split and tokenize the data and print stats; no model, no writes")
@@ -1753,6 +1907,18 @@ def _lora_targets_arg(value: str) -> Any:
         return parse_lora_target_modules(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _flag_or_env(value: Optional[bool], env_name: str, default: bool) -> bool:
+    """CLI --x/--no-x wins, then env (true/false/1/0/...), then the default."""
+    if value is not None:
+        return bool(value)
+    raw = os.getenv(env_name, "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
 
 
 def build_config(args: argparse.Namespace) -> Config:
@@ -1796,6 +1962,9 @@ def build_config(args: argparse.Namespace) -> Config:
         trust_remote_code=bool(args.trust_remote_code) or _truthy(os.getenv("MODEL_TRUST_REMOTE_CODE")),
         force_cpu=args.cpu,
         dataloader_num_workers=max(0, args.workers),
+        sort_by_length=_flag_or_env(args.sort_by_length, "TRAINING_SORT_BY_LENGTH", Config.sort_by_length),
+        gradient_checkpointing=_flag_or_env(args.gradient_checkpointing, "TRAINING_GRADIENT_CHECKPOINTING",
+                                            Config.gradient_checkpointing),
         semantic_dedup=args.semantic_dedup,
         export_from_db=not args.no_db_export,
         resume_from_checkpoint=args.resume_from_checkpoint,
@@ -1868,7 +2037,11 @@ def _run(cfg: Config, dry_run: bool, history_version: Optional[int], log_files: 
             cfg.model_name,
         )
     if cfg.export_from_db and not dry_run:
-        run_database_export(cfg)
+        if cfg.resume_from_checkpoint:
+            # A resumed run must see the data it started with (checked below).
+            logger.info("Resuming: database export skipped - the run continues on its original data")
+        else:
+            run_database_export(cfg)
 
     tokenizer = load_tokenizer(cfg)
     data = prepare_data(cfg, tokenizer)
@@ -1887,13 +2060,16 @@ def _run(cfg: Config, dry_run: bool, history_version: Optional[int], log_files: 
     final_dir = resolve_final_model_dir(cfg.output_dir, name, cfg.overwrite_output)  # fail before hours of training
     run_dir = str(Path(cfg.checkpoint_root) / name)
     resume = resolve_resume_checkpoint(cfg.resume_from_checkpoint, run_dir)  # fail before loading the model
+    fingerprint = data_fingerprint(data)
     if resume:
+        check_resume_data(resume, fingerprint)
         logger.info("Resuming from checkpoint %s", resume)
     elif Path(run_dir).is_dir() and any(Path(run_dir).glob("checkpoint-*")):
         # Leftovers of an earlier (failed) run would confuse checkpoint rotation.
         stale = f"{run_dir}.old-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         logger.warning("Moving checkpoints of a previous run aside: %s -> %s (use --resume-from-checkpoint latest to continue it)", run_dir, stale)
         os.rename(run_dir, stale)
+    _write_json_atomic(Path(run_dir) / DATA_FINGERPRINT_FILE, fingerprint)  # checked by a later resume
     logger.info("Final model: %s | checkpoints: %s", final_dir, run_dir)
 
     precision = detect_precision(cfg.force_cpu)
@@ -1912,25 +2088,24 @@ def _run(cfg: Config, dry_run: bool, history_version: Optional[int], log_files: 
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
     train_ds = to_hf_dataset(data["train"])
-    val_all = data["val_tr"] + data["val_en"]
-    eval_ds = to_hf_dataset(val_all) if val_all else None
-    eval_tr = to_hf_dataset(data["val_tr"]) if data["val_tr"] else None
-    eval_en = to_hf_dataset(data["val_en"]) if data["val_en"] else None
+    eval_ds = build_eval_dataset(data["val_tr"], data["val_en"])
     # The fast tokenizer has used its thread pool already; DataLoader workers are
     # forked afterwards and do not tokenize (silences one warning per worker).
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     # Offline, PEFT cannot fetch the base config on every checkpoint save and
     # warns; the vocabulary is never resized here (pad = EOS), so that is fine.
     warnings.filterwarnings("ignore", message=r"Could not find a config file in .*vocabulary was not modified")
-    trainer = create_trainer(model, tokenizer, train_ds, eval_ds, eval_tr, eval_en, cfg=cfg, run_dir=run_dir, precision=precision)
+    trainer = create_trainer(model, tokenizer, train_ds, eval_ds, cfg=cfg, run_dir=run_dir, precision=precision)
 
     logger.info("Starting training...")
     train_result = trainer.train(resume_from_checkpoint=resume)
-    peak_gpu_memory_gb = None
+    peak_gpu_memory_gb = peak_gpu_memory_reserved_gb = None
     if precision["cuda"]:
         try:
             peak_gpu_memory_gb = round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2)
-            logger.info("Peak GPU memory allocated by training: %.2f GiB", peak_gpu_memory_gb)
+            peak_gpu_memory_reserved_gb = round(torch.cuda.max_memory_reserved() / 1024 ** 3, 2)
+            logger.info("Peak GPU memory of training: %.2f GiB allocated, %.2f GiB reserved",
+                        peak_gpu_memory_gb, peak_gpu_memory_reserved_gb)
         except Exception:  # pragma: no cover - driver issues
             pass
 
@@ -1940,13 +2115,19 @@ def _run(cfg: Config, dry_run: bool, history_version: Optional[int], log_files: 
 
     final_metrics: Dict[str, Any] = {}
     if eval_ds is not None:
-        final_metrics = trainer.evaluate()
+        # The final model is the best checkpoint (load_best_model_at_end): its metrics
+        # were logged when it was evaluated, so no extra pass over the validation set.
+        final_metrics = final_eval_metrics(trainer.state)
+        if not final_metrics:
+            final_metrics = trainer.evaluate()
     metrics = {
         "train_loss": train_loss,
         "best_eval_loss": trainer.state.best_metric,
         "final_eval_loss": final_metrics.get("eval_loss"),
         "final_eval_loss_turkish": final_metrics.get("eval_loss_turkish"),
         "final_eval_loss_english": final_metrics.get("eval_loss_english"),
+        "final_eval_step": final_metrics.get("step"),
+        "eval_loss_definition": EVAL_LOSS_DEFINITION,
     }
     duration = time.time() - started
     training_info = {
@@ -1993,7 +2174,11 @@ def _run(cfg: Config, dry_run: bool, history_version: Optional[int], log_files: 
         "max_steps": cfg.max_steps if cfg.max_steps and cfg.max_steps > 0 else None,
         "resumed_from_checkpoint": resume,
         "resumed_at_step": resumed_at_step or None,
+        "data_sha256": fingerprint["sha256"],
         "peak_gpu_memory_gb": peak_gpu_memory_gb,
+        "peak_gpu_memory_reserved_gb": peak_gpu_memory_reserved_gb,
+        "gradient_checkpointing": cfg.gradient_checkpointing,
+        "sort_by_length": cfg.sort_by_length,
         "log_file": Path(log_files["versioned"]).name if log_files.get("versioned") else None,
         "checkpoint_dir": run_dir,
         "model_save_path": str(final_dir),
@@ -2022,6 +2207,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """Main training pipeline. Returns a process exit code."""
     global config
     _load_env()
+    # Micro-batches of changing shapes fragment PyTorch's CUDA cache (reserved memory
+    # up to twice the allocated peak), memory the AI worker on the same GPU then
+    # cannot get. Expandable segments keep the reservation close to what is used.
+    # Read when CUDA initialises (first allocation), i.e. later in this run.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     args = parse_args(argv)
     cfg = build_config(args)
     config = cfg

@@ -1,4 +1,4 @@
-# 🤖 CengBot - AI-Powered University Assistant
+# CengBot - AI-Powered University Assistant
 
 <div align="center">
 
@@ -6,10 +6,10 @@
 
 A fine-tuned open-weight LLM (**currently Llama-3.2-3B + LoRA**) that answers students' questions for the Çukurova University Computer Engineering Department in Telegram, with a review-and-retrain loop.
 
-🤖 **Try the Bot**: [@cu_ceng_v1_bot](https://t.me/cu_ceng_v1_bot)  
-🤗 **HuggingFace**: [Naholav](https://huggingface.co/Naholav)  
-📧 **Contact**: arda.mulayim@outlook.com  
-📅 **Last updated**: November 2026 ([CHANGELOG](CHANGELOG.md))
+**Try the Bot**: [@cu_ceng_v1_bot](https://t.me/cu_ceng_v1_bot)  
+**HuggingFace**: [Naholav](https://huggingface.co/Naholav)  
+**Contact**: arda.mulayim@outlook.com  
+**Last updated**: November 2026 ([CHANGELOG](CHANGELOG.md))
 
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=flat&logo=python&logoColor=white)](https://python.org)
 [![React](https://img.shields.io/badge/React-18-61DAFB?style=flat&logo=react&logoColor=black)](https://react.dev)
@@ -27,14 +27,14 @@ A fine-tuned open-weight LLM (**currently Llama-3.2-3B + LoRA**) that answers st
 
 ---
 
-## 🚀 Overview
+## Overview
 
 CengBot answers questions about courses, internships, graduation, staff and
 the department in a Telegram group, in Turkish or English. The answers come
 from an open-weight base model with a LoRA adapter fine-tuned on department
 Q&A data. The production model is Llama-3.2-3B + LoRA v1.2; any other
 open-weight family (Qwen, Mistral, Gemma, Phi, ...) can be trained and swapped
-in (see [Supported base models](#-supported-base-models)).
+in (see [Supported base models](#supported-base-models)).
 
 Every question and answer is stored. Admins review them in a web panel,
 correct answers and approve good pairs for training. The approved data is
@@ -44,7 +44,7 @@ in with one command. The project started with about 600 English and 600
 Turkish question-answer pairs, which augmentation expanded to more than 22,000
 training pairs.
 
-## ✨ Features
+## Features
 
 - **Telegram bot** (`src/telegram_bot_rabbitmq.py`): answers in one configured
   group (optionally one forum topic), 👍/👎 voting (one vote per user, at most
@@ -74,7 +74,7 @@ training pairs.
 - **Operations**: start/stop/health scripts, systemd units, nginx deployment,
   log rotation, a system monitor, Excel export and backups.
 
-## 🏗️ Architecture
+## Architecture
 
 ```mermaid
 flowchart TB
@@ -137,7 +137,7 @@ second poller with `409 Conflict`.
 
 More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## ⚡ Quick Start
+## Quick Start
 
 **Requirements**: Linux (the scripts target Ubuntu), Python 3.11,
 **Node.js 22.13+ or 24+** for the admin panel (Ubuntu's apt package is too old:
@@ -146,7 +146,7 @@ RabbitMQ, and an NVIDIA GPU with CUDA for inference and training (CPU works but
 is very slow). Access to the gated
 [`meta-llama/Llama-3.2-3B`](https://huggingface.co/meta-llama/Llama-3.2-3B)
 base model is needed once, to download it into `model_cache/` (other base
-models: [Supported base models](#-supported-base-models)).
+models: [Supported base models](#supported-base-models)).
 
 ```bash
 # 1. Clone
@@ -183,13 +183,13 @@ template). It does not install Node.js: install it first.
 **Model files are not in the repository** (`models/`, `model_cache/` and
 `data/` are gitignored). Put a trained model directory into `models/` and
 activate it with `./scripts/switch_model.sh switch <name>`, or train one (see
-[Training](#-training-and-data)). The first start downloads the base model into
+[Training](#training-and-data)). The first start downloads the base model into
 `model_cache/` if `HUGGING_FACE_TOKEN` is set and downloads are allowed.
 
 Once running: admin panel <http://localhost:3000>, API docs
 <http://localhost:8001/docs>, health `./scripts/health_check.sh`.
 
-## 🔐 Configuration
+## Configuration
 
 All settings come from `.env`. **[`.env.example`](.env.example) is the full,
 commented reference**; values already set in the process environment win over
@@ -257,7 +257,7 @@ panel is served from must be listed in `CORS_ORIGINS` unless it shares the
 API's origin (the nginx setup from `deploy_production.sh` builds the panel with
 `REACT_APP_API_URL=/api`).
 
-## 🛠️ Running and Operations
+## Running and Operations
 
 ```bash
 ./scripts/start_system.sh                 # worker, Admin API, bot, Vite dev server (manual mode)
@@ -301,7 +301,7 @@ static panel and `/api/` proxy, health cron, optional firewall); see
 - `.venv/bin/python src/system_monitor.py --check-logs` reports log sizes and
   free disk space (exit code 1 on an alert; `--json`, `--once`).
 
-## 🧠 Supported base models
+## Supported base models
 
 Training, validation, swapping and inference work with any open-weight causal
 LM that the installed transformers supports natively: **Llama 3.x, Qwen2.5 /
@@ -330,7 +330,7 @@ repository's Python code: not recommended. Full family table, gated models and
 the step-by-step sequence:
 **[docs/MODEL_SWAP.md](docs/MODEL_SWAP.md#retrain-on-a-different-base-model)**.
 
-## 🔄 Model Swap
+## Model Swap
 
 `models/active-model` is a symlink and the single source of truth for the model
 the worker loads. Switching restarts only the AI worker; the bot and the API
@@ -352,7 +352,7 @@ questions stay in RabbitMQ and are answered and stored once the model is loaded.
 **Step-by-step runbook (training → validation → switch → verification →
 rollback): [docs/MODEL_SWAP.md](docs/MODEL_SWAP.md).**
 
-## 🎓 Training and Data
+## Training and Data
 
 ```bash
 # Approved database rows -> data/cengbot_qa_augmented.jsonl (merges by default)
@@ -408,7 +408,7 @@ Progress is checkpointed, so a run can be interrupted and resumed.
 exports (`--tables raw_data,user_votes`, `--all-tables`, `--output-dir DIR`,
 `--output FILE [--overwrite]`).
 
-## 📊 Benchmark
+## Benchmark
 
 [`benchmark/`](benchmark/README.md) holds 100 questions (50 Turkish, 50
 English) written from the department's official pages and verified item by
@@ -455,7 +455,7 @@ dead ones. Fix the links in `data/merged_qa_data.jsonl` and in the approved
 answers (editing an answer in the panel also updates its training copy), then
 export, train and benchmark.
 
-## 🧪 Testing
+## Testing
 
 ```bash
 .venv/bin/python -m pip install -r config/requirements-dev.txt
@@ -470,7 +470,7 @@ SHELLCHECK=/path/to/shellcheck .venv/bin/python -m pytest tests/test_shell_scrip
 and dummy tokens, and fails the run if the real `university_bot.db` changes.
 The tests never contact Telegram, RabbitMQ, Hugging Face or the Claude API.
 
-## 🛡️ Security
+## Security
 
 - Secrets live only in `.env` (gitignored, `chmod 600`). No password or token is
   hardcoded, and the scripts never pipe a password into `sudo`.
@@ -492,7 +492,7 @@ The tests never contact Telegram, RabbitMQ, Hugging Face or the Claude API.
 
 Checklist: [PRODUCTION_SECURITY_CHECKLIST.md](PRODUCTION_SECURITY_CHECKLIST.md).
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 cu_ceng_bot/
@@ -540,7 +540,7 @@ backups/, university_bot.db, .pids, admin_frontend/build/
 The demo GIF is rendered by `docs/assets/make_demo_gif.py` from a benchmark
 run's `answers.jsonl`; run it again after a model change.
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 | Problem | Check |
 |---|---|
@@ -553,7 +553,7 @@ run's `answers.jsonl`; run it again after a model change.
 | Admin panel not started | `node --version` must be 22.13+ or 24+ (`start_system.sh` prints a warning otherwise); `logs/frontend.log` |
 | Panel shows network/CORS errors | Panel origin in `CORS_ORIGINS`; `REACT_APP_API_URL` at build time |
 
-## 📚 Documentation
+## Documentation
 
 - [docs/MODEL_SWAP.md](docs/MODEL_SWAP.md): model swap runbook, retraining on another base model
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): components, data flow, database, logging
@@ -566,11 +566,11 @@ run's `answers.jsonl`; run it again after a model change.
 - [CHANGELOG.md](CHANGELOG.md)
 - Interactive API docs: <http://localhost:8001/docs> when the API runs
 
-## 📄 License
+## License
 
 This project is licensed under the **Apache License 2.0** ([LICENSE](LICENSE)).
 
-## 👨‍💻 Author
+## Author
 
 **naholav**
 - **Email**: arda.mulayim@outlook.com
@@ -579,15 +579,8 @@ This project is licensed under the **Apache License 2.0** ([LICENSE](LICENSE)).
 - **HuggingFace**: [Naholav](https://huggingface.co/Naholav)
 - **Bot**: [@cu_ceng_v1_bot](https://t.me/cu_ceng_v1_bot)
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - **Meta AI** for the Llama 3.2 3B base model of the current release
 - **Hugging Face** for the transformers and PEFT libraries
-- **Çukurova University** for domain expertise and support
 - **Open Source Community** for ML tools and frameworks
-
-<div align="center">
-
-**Built with ❤️ for Çukurova University Computer Engineering Department**
-
-</div>

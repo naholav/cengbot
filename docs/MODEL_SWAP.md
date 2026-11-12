@@ -275,7 +275,7 @@ model run it before step 8, while the worker is still stopped, with
 `--model-path models/final-best-model-v2`, which also shows the score before any
 user sees the new model. Before retraining, refresh the links in the training
 data: the v1.2 answers often point to wrong or dead pages
-([README: Benchmark](../README.md#-benchmark), [benchmark/README.md](../benchmark/README.md)).
+([README: Benchmark](../README.md#benchmark), [benchmark/README.md](../benchmark/README.md)).
 
 ### Families
 

@@ -238,7 +238,7 @@ _LEAD_WORDS = {"en": {"yes": "pos", "no": "neg"}, "tr": {"evet": "pos", "hayir":
 # matched, never a bare -ma/-me, so nouns such as "uygulama", "yenileme", "sınav", "zorunlu" stay positive;
 # relative/adverbial forms ("almadığın", "almadan", "almaksızın") are not treated as negation either.
 _TR_NEG_WORD_RE = re.compile(r"^(?:hayir|degil(?:dir|ler|lerdir|se|sen|sin|siniz|im|iz|di|mis)?"
-                             r"|yok(?:tur|sa|ken|tu|mus|lar)?)$")
+                             r"|yok(?:tur|ken|tu|mus|lar)?)$")  # not "yoksa" ("otherwise")
 _TR_NEG_VERB_RE = re.compile(
     r"^(?P<stem>[a-z]{2,}?)(?:"
     r"m[ae]z(?:lar|ler|sa|se|san|sen|sam|sem|sak|sek|saniz|seniz|sin|sun|siniz|sunuz|ken|di|du|dir|mis"
@@ -277,18 +277,24 @@ def _plain(text: str) -> str:
     return _EMAIL_RE.sub(" ", _URL_RE.sub(" ", _INVISIBLE_RE.sub("", text or "")))
 
 
-def _negations(text: str, lang: str) -> List[str]:
-    """One entry per negation marker in ``text``: the stem it applies to ('' if unknown)."""
-    out: List[str] = []
+def _negation_markers(text: str, lang: str) -> List[Tuple[str, Tuple[str, ...]]]:
+    """One (target, scope) pair per negation marker in ``text``: the stem the negation applies to ('' if
+    unknown) and the words around it that it covers (Turkish: the word before, as in "oy hakkı yok" or
+    "oy kullanamaz"; English: the next words, as in "cannot take the final exam")."""
+    out: List[Tuple[str, Tuple[str, ...]]] = []
     if lang == "tr":
         toks = textutil.tokens(_plain(text))
         for i, tok in enumerate(toks):
+            before = tuple(toks[max(0, i - 2):i])
             if _TR_NEG_WORD_RE.match(tok):
-                out.append(toks[i - 1] if tok != "hayir" and i > 0 else "")
+                if tok == "hayir":
+                    out.append(("", ()))
+                else:
+                    out.append((toks[i - 1] if i > 0 else "", before))
             else:
                 stem = _tr_negated_stem(tok)
                 if stem is not None:
-                    out.append(stem)
+                    out.append((stem, (stem,) + before[-1:]))
         return out
     toks = textutil.tokens(_en_expand(_plain(text)))
     for i, tok in enumerate(toks):
@@ -296,19 +302,29 @@ def _negations(text: str, lang: str) -> List[str]:
             continue
         if tok == "no" and i + 1 < len(toks) and toks[i + 1].isdigit():
             continue  # "No. 5"
+        after = tuple(t for t in toks[i + 1:i + 6] if t not in _EN_SKIP and t not in _EN_NEG)
         target = next((t for t in toks[i + 1:i + 4] if t not in _EN_SKIP and t not in _EN_NEG), "")
-        out.append(target)
+        out.append((target, after[:3]))
     return out
+
+
+def _negations(text: str, lang: str) -> List[str]:
+    """One entry per negation marker in ``text``: the stem it applies to ('' if unknown)."""
+    return [target for target, _ in _negation_markers(text, lang)]
 
 
 def _same_stem(a: str, b: str) -> bool:
     n = min(len(a), len(b), 5)
-    return n >= 3 and a[:n] == b[:n]
+    return a == b or (n >= 3 and a[:n] == b[:n])
+
+
+def _given(target: str, question_targets: Sequence[str]) -> bool:
+    return bool(target) and any(_same_stem(target, q) for q in question_targets if q)
 
 
 def _novel_negations(text: str, lang: str, question_targets: Sequence[str]) -> List[str]:
     """Negations of ``text`` that do not just repeat a negation of the question ("katılmazsam ...")."""
-    return [t for t in _negations(text, lang) if not (t and any(_same_stem(t, q) for q in question_targets if q))]
+    return [t for t in _negations(text, lang) if not _given(t, question_targets)]
 
 
 def _lead(text: str, lang: str) -> Optional[str]:
@@ -322,12 +338,12 @@ def _lead(text: str, lang: str) -> Optional[str]:
 
 
 _CLAUSE_SPLIT_RE = re.compile(r"(?<=[.!?;:])\s+|\n+|,\s+"
-                              r"|\s+(?:but|however|whereas|although|ama|ancak|fakat|oysa)\s+", re.IGNORECASE)
+                              r"|\s+(?:and|but|however|whereas|although|ve|ama|ancak|fakat|oysa)\s+", re.IGNORECASE)
 
 
 def _clauses(text: str, lang: str) -> List[str]:
-    """Sentences split further at commas and contrastive conjunctions; a leading bare yes/no is kept with the
-    clause that follows it ("No, teams are assigned" is one negated statement)."""
+    """Sentences split further at commas and conjunctions; a leading bare yes/no is kept with the clause that
+    follows it ("No, teams are assigned" is one negated statement)."""
     parts = [p for p in _CLAUSE_SPLIT_RE.split(text or "") if p and p.strip()]
     if len(parts) > 1 and len(textutil.tokens(parts[0])) == 1 and _lead(parts[0], lang):
         parts = [parts[0] + " " + parts[1]] + parts[2:]
@@ -566,10 +582,18 @@ def _polarity_matches(polarity: Polarity, words: Sequence[str], numbers: Sequenc
     """Does the answer state the fact with the same polarity?
 
     A yes/no fact is compared with the answer's leading yes/no (or with an answer that negates the question's
-    own predicate, which counts as "no") when it has one. Otherwise the answer's clauses
-    that mention the fact (one of its words, numbers or links, or what it negates; a negated verb counts
-    whatever its polarity) decide: for a negated fact one of them must be negated, for a positive one the
-    first of them must not be. Negations that only repeat the question's own negation are ignored."""
+    own predicate, which counts as "no") when it has one. Otherwise the answer's clauses decide:
+
+    * a clause *claims* "negated" when its negation covers what the fact negates or one of the fact's words
+      ("don't need to attend" for "Attendance is not required", "oy kullanamaz" for "oy hakkı yok"), and
+      "positive" when it mentions what the fact negates without any negation ("attendance is required");
+    * for a negated fact, the claiming clause that shares the most words with the fact wins (the first on a
+      tie): "can take the final exam, but cannot take the make-up exam" states the opposite of "cannot take
+      the final exam";
+    * without any claim (a paraphrase), the clause sharing the most with a negated fact must be negated; for
+      a positive fact, the first clause that mentions it must not be.
+
+    Negations that only repeat the question's own negation are ignored."""
     answer_lead = _lead(answer, lang)
     question_targets = _negations(question, lang)
     if polarity.lead and not answer_lead:
@@ -580,19 +604,31 @@ def _polarity_matches(polarity: Polarity, words: Sequence[str], numbers: Sequenc
             answer_lead = "neg"
     if polarity.lead and answer_lead:
         return answer_lead == polarity.lead
-    relevant: List[bool] = []
-    for clause in _clauses(answer, lang):
+    terms = list(dict.fromkeys([t for t in polarity.targets] + [w.rstrip("!") for w in words]))
+    relevant: List[Tuple[int, int, bool]] = []  # (shared with the fact, -position, negated?)
+    claims: List[Tuple[int, int, bool]] = []
+    for position, clause in enumerate(_clauses(answer, lang)):
         tokens = _content_tokens(clause, lang)
         clause_numbers = _numbers(clause)
         clause_urls = extract_urls(clause)
-        if (any(_mentions(w, tokens) if len(w.rstrip("!")) >= 3 else _token_hit(w, tokens) for w in words)
-                or any(_mentions(t, tokens) for t in polarity.targets)
-                or any(_number_found(n, clause_numbers) for n in numbers)
-                or any(_fact_url_found(u, clause, clause_urls) for u in urls)):
-            relevant.append(bool(_novel_negations(clause, lang, question_targets)))
+        shared = (sum(_mentions(w, tokens) if len(w) >= 3 else _token_hit(w, tokens) for w in terms)
+                  + sum(_number_found(n, clause_numbers) for n in numbers)
+                  + sum(_fact_url_found(u, clause, clause_urls) for u in urls))
+        if not shared:
+            continue
+        markers = [(t, scope) for t, scope in _negation_markers(clause, lang) if not _given(t, question_targets)]
+        relevant.append((shared, -position, bool(markers)))
+        if any(_same_stem(w, term) for t, scope in markers for w in (t,) + scope if w for term in terms):
+            claims.append((shared, -position, True))
+        elif not markers and any(_mentions(t, tokens) for t in polarity.targets):
+            claims.append((shared, -position, False))
     if not relevant:
         return False  # the answer never talks about this fact
-    return any(relevant) if polarity.negated else not relevant[0]
+    if polarity.negated and claims:
+        return max(claims)[2]  # the claim sharing the most with the fact (the first on a tie)
+    if polarity.negated:
+        return max(relevant)[2]  # the clause sharing the most with the fact (the first on a tie)
+    return not min(relevant, key=lambda r: -r[1])[2]  # positive fact: the first clause about it
 
 
 def fact_overlap(fact: str, answer: str, question: str = "", lang: Optional[str] = None) -> float:

@@ -146,15 +146,19 @@ Deterministic checks (always run):
   * **E-mail addresses and URLs** in a fact must be in the answer (`url_matches`; a `t.me/<name>` link is also
     matched by `@<name>`).
   * **Polarity.** Negation is not a stop word. Markers: EN *no, not, n't, cannot, never, none, nor*; TR
-    *hayır, değil, yok* and negated verbs (`-maz/-mez`, `-mıyor`, `-mamak` incl. `-mamaktadır`, `-mamış`,
-    `-mayan`, `-mayacak`, `-madı`, `-mamalı`, `-maması`; never a bare `-ma/-me`, so *uygulama*, *yenileme*,
-    *sınav*, *zorunlu* stay positive; relative forms such as *almadığın* are not negations). A fact with a
+    *hayır, değil, yok(tur)* (not *yoksa*) and negated verbs (`-maz/-mez`, `-mıyor`, `-mamak` incl.
+    `-mamaktadır`, `-mamış`, `-mayan`, `-mayacak`, `-madı`, `-mamalı`, `-maması`; never a bare `-ma/-me`, so
+    *uygulama*, *yenileme*, *sınav*, *zorunlu* stay positive; relative forms such as *almadığın* are not
+    negations). A fact with a
     marker scores 0 when the answer's polarity differs: a yes/no fact is compared with the answer's leading
     yes/no (an answer that negates the question's own predicate, e.g. "not mandatory" for "is it
-    mandatory?", counts as "no"); otherwise the answer's clauses that mention the fact decide (for a negated
-    fact one of them must be negated). A negation that only repeats the question's ("katılmazsam ne olur?")
-    is ignored, and a negated Turkish verb only matches a negated verb (*açılmaz* ~ *açılmıyor*, not
-    *açılır*). A matched polarity counts as one more token.
+    mandatory?", counts as "no"); otherwise the answer's clauses decide. For a negated fact, among the clauses
+    that negate what it negates or one of its words ("don't need to attend") and those that state the negated
+    thing positively ("attendance is required"), the one sharing the most words with the fact wins, so an
+    unrelated negated clause ("..., but records are not kept online") cannot rescue an answer that says the
+    opposite. A negation that only repeats the question's ("katılmazsam ne olur?") is ignored, and a negated
+    Turkish verb only matches a negated verb (*açılmaz* ~ *açılmıyor*, not *açılır*). A matched polarity
+    counts as one more token.
 
   History: `det-v1`, a plain overlap, gave full credit to wrong answers that reused the question's words;
   `det-v2` added the novel-token rule, units and exact e-mails, but scored "Evet ... açılır" like

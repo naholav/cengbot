@@ -322,6 +322,31 @@ def test_reversed_polarity_regression_tr_013():
     assert right["score"] == 100.0 and wrong["token_facts_covered"] == [False, True] and wrong["score"] == 65.0
 
 
+@pytest.mark.parametrize("item_id, n, answer", [
+    ("en-046", 0, "Yes, attendance is required for the retaken course, but attendance records are not kept online."),
+    ("en-019", 1, "A student with DZ can take the final exam, but cannot take the make-up exam."),
+    ("tr-043", 0, "Evet, bilgisayar mühendisi çalışması şart, kurum küçük olsa bile mühendis yoksa staj geçersiz."),
+    ("tr-013", 0, "ÇÜ'de yaz öğretimi açılır ama başka üniversitelerden ders alınamaz."),
+    ("tr-035", 0, "Her yarıyıl 30 AKTS alma şartı aranır, ama yıllık 60 AKTS sınırı yoktur."),
+    ("en-002", 1, "Topics can be changed, but teams cannot be chosen."),
+])
+def test_an_unrelated_negated_clause_does_not_rescue_the_opposite_answer(item_id, n, answer):
+    """Review of det-v3: one negated clause that mentions a fact word gave full credit to an answer stating
+    the opposite of a negated fact."""
+    assert not _fact_covered(item_id, answer, n)
+
+
+def test_yoksa_is_not_a_negation():
+    assert grader._negations("Mühendis yoksa staj geçersiz.", "tr") == []
+    assert grader._negations("Mühendis yok.", "tr") == ["muhendis"]
+
+
+def test_paraphrased_negations_still_count():
+    assert _fact_covered("tr-032", "Danışman jüride yer alır ama oy kullanamaz.", 0)  # "oy" is covered
+    assert _fact_covered("en-020", "Below 70 you fail and do not proceed to the oral exam.", 1)
+    assert _fact_covered("en-046", "You don't have to attend again.", 0)
+
+
 def test_negated_turkish_verb_only_matches_a_negated_verb():
     q = "Yaz okulu açıyor mu?"
     assert grader.fact_overlap("Yaz öğretimi açılmaz", "Yaz öğretimi açılmıyor.", q, "tr") == 1.0

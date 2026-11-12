@@ -4,7 +4,7 @@
 - Questions: 100 of 100 (`benchmark/questions.jsonl`, sha256 b85645185fe8)
 - Scoring: **deterministic** (LLM judge off: disabled with --no-llm); deterministic rubric `det-v3`
 - Git: `b5ddce8c64da`
-- Generated: 2026-11-11T14:40:55+00:00, graded: 2026-11-12T13:26:51+00:00 (re-graded from `final-best-model-v1.2_20261111-174055`, same answers)
+- Generated: 2026-11-11T14:40:55+00:00, graded: 2026-11-12T15:13:21+00:00 (re-graded from `final-best-model-v1.2_20261111-174055`, same answers)
 
 ## Scores
 

@@ -1,7 +1,7 @@
 {
   "run": "final-best-model-v1.2_20261111-174055_det-v3",
   "created_at": "2026-11-11T14:40:55+00:00",
-  "graded_at": "2026-11-12T13:26:51+00:00",
+  "graded_at": "2026-11-12T15:13:21+00:00",
   "model_name": "meta-llama/Llama-3.2-3B + final-best-model-v1.2",
   "model": {
     "loaded": true,
